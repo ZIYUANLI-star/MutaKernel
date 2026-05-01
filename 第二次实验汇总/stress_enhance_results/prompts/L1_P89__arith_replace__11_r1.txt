@@ -1,0 +1,529 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (5 dimensions, 138 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for parallel prefix sum
+scan_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename T>
+__global__ void inclusive_scan_kernel(T* data, int n) {
+    extern __shared__ T temp[];
+    
+    int tid = threadIdx.x;
+    int offset = 1;
+    
+    // Load input into shared memory
+    int ai = tid * 2;
+    int bi = tid * 2 + 1;
+    
+    if (ai < n) temp[ai] = data[ai];
+    if (bi < n) temp[bi] = data[bi];
+    
+    __syncthreads();
+    
+    // Up-sweep phase
+    for (int d = n >> 1; d > 0; d >>= 1) {
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            temp[bi] += temp[ai];
+        }
+        offset <<= 1;
+        __syncthreads();
+    }
+    
+    // Down-sweep phase
+    if (tid == 0) {
+        temp[n - 1] = 0;
+    }
+    
+    for (int d = 1; d < n; d <<= 1) {
+        offset >>= 1;
+        __syncthreads();
+        
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            
+            T t = temp[ai];
+            temp[ai] = temp[bi];
+            temp[bi] += t;
+        }
+    }
+    
+    __syncthreads();
+    
+    // Write results back to global memory
+    if (ai < n) data[ai] = temp[ai];
+    if (bi < n) data[bi] = temp[bi];
+}
+
+template<typename T>
+__global__ void row_scan_kernel(const T* input, T* output, int rows, int cols) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (row >= rows) return;
+    
+    extern __shared__ T shared[];
+    
+    // Load row into shared memory
+    for (int i = tid; i < cols; i += blockDim.x) {
+        shared[i] = input[row * cols + i];
+    }
+    __syncthreads();
+    
+    // Perform sequential scan in shared memory
+    if (tid == 0) {
+        for (int i = 1; i < cols; i++) {
+            shared[i] += shared[i - 1];
+        }
+    }
+    __syncthreads();
+    
+    // Store results
+    for (int i = tid; i < cols; i += blockDim.x) {
+        output[row * cols + i] = shared[i];
+    }
+}
+
+torch::Tensor parallel_scan_cuda(torch::Tensor x, int dim) {
+    // Get tensor dimensions
+    auto sizes = x.sizes();
+    int n = sizes[dim];
+    int total_elements = x.numel();
+    int outer_elements = total_elements / n;
+    
+    // Reshape to 2D: (outer_elements, n) for easier processing
+    auto x_reshaped = x.reshape({outer_elements, n}).contiguous();
+    auto out = torch::zeros_like(x_reshaped);
+    
+    // Get data pointers
+    auto x_ptr = x_reshaped.data_ptr<float>();
+    auto out_ptr = out.data_ptr<float>();
+    
+    // Configure kernel launch
+    int threads = 256;
+    int shared_mem_size = n * sizeof(float);
+    
+    // Launch one block per row
+    row_scan_kernel<float><<<outer_elements, threads, shared_mem_size>>>(
+        x_ptr, out_ptr, outer_elements, n
+    );
+    
+    // Reshape back to original shape
+    return out.reshape(sizes);
+}
+"""
+
+scan_cpp_source = """
+torch::Tensor parallel_scan_cuda(torch::Tensor x, int dim);
+"""
+
+# Compile the inline CUDA code
+scan_module = load_inline(
+    name="parallel_scan",
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=["parallel_scan_cuda"],
+    verbose=False,
+    with_cuda=True,
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs cumulative sum using custom CUDA kernels.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the scan operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the optimized Scan model.
+        
+        Args:
+            dim (int): The dimension along which to perform the cumulative sum.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.scan_module = scan_module
+
+    def forward(self, x):
+        """
+        Forward pass using optimized parallel scan.
+        
+        Args:
+            x (torch.Tensor): Input tensor.
+            
+        Returns:
+            torch.Tensor: Tensor after applying cumulative sum along specified dimension.
+        """
+        return self.scan_module.parallel_scan_cuda(x, self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for parallel prefix sum
+scan_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename T>
+__global__ void inclusive_scan_kernel(T* data, int n) {
+    extern __shared__ T temp[];
+    
+    int tid = threadIdx.x;
+    int offset = 1;
+    
+    // Load input into shared memory
+    int ai = tid * 2;
+    int bi = tid * 2 + 1;
+    
+    if (ai < n) temp[ai] = data[ai];
+    if (bi < n) temp[bi] = data[bi];
+    
+    __syncthreads();
+    
+    // Up-sweep phase
+    for (int d = n >> 1; d > 0; d >>= 1) {
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) + 1;
+            temp[bi] += temp[ai];
+        }
+        offset <<= 1;
+        __syncthreads();
+    }
+    
+    // Down-sweep phase
+    if (tid == 0) {
+        temp[n - 1] = 0;
+    }
+    
+    for (int d = 1; d < n; d <<= 1) {
+        offset >>= 1;
+        __syncthreads();
+        
+        if (tid < d) {
+            int ai = offset * (2 * tid + 1) - 1;
+            int bi = offset * (2 * tid + 2) - 1;
+            
+            T t = temp[ai];
+            temp[ai] = temp[bi];
+            temp[bi] += t;
+        }
+    }
+    
+    __syncthreads();
+    
+    // Write results back to global memory
+    if (ai < n) data[ai] = temp[ai];
+    if (bi < n) data[bi] = temp[bi];
+}
+
+template<typename T>
+__global__ void row_scan_kernel(const T* input, T* output, int rows, int cols) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (row >= rows) return;
+    
+    extern __shared__ T shared[];
+    
+    // Load row into shared memory
+    for (int i = tid; i < cols; i += blockDim.x) {
+        shared[i] = input[row * cols + i];
+    }
+    __syncthreads();
+    
+    // Perform sequential scan in shared memory
+    if (tid == 0) {
+        for (int i = 1; i < cols; i++) {
+            shared[i] += shared[i - 1];
+        }
+    }
+    __syncthreads();
+    
+    // Store results
+    for (int i = tid; i < cols; i += blockDim.x) {
+        output[row * cols + i] = shared[i];
+    }
+}
+
+torch::Tensor parallel_scan_cuda(torch::Tensor x, int dim) {
+    // Get tensor dimensions
+    auto sizes = x.sizes();
+    int n = sizes[dim];
+    int total_elements = x.numel();
+    int outer_elements = total_elements / n;
+    
+    // Reshape to 2D: (outer_elements, n) for easier processing
+    auto x_reshaped = x.reshape({outer_elements, n}).contiguous();
+    auto out = torch::zeros_like(x_reshaped);
+    
+    // Get data pointers
+    auto x_ptr = x_reshaped.data_ptr<float>();
+    auto out_ptr = out.data_ptr<float>();
+    
+    // Configure kernel launch
+    int threads = 256;
+    int shared_mem_size = n * sizeof(float);
+    
+    // Launch one block per row
+    row_scan_kernel<float><<<outer_elements, threads, shared_mem_size>>>(
+        x_ptr, out_ptr, outer_elements, n
+    );
+    
+    // Reshape back to original shape
+    return out.reshape(sizes);
+}
+"""
+
+scan_cpp_source = """
+torch::Tensor parallel_scan_cuda(torch::Tensor x, int dim);
+"""
+
+# Compile the inline CUDA code
+scan_module = load_inline(
+    name="parallel_scan",
+    cpp_sources=scan_cpp_source,
+    cuda_sources=scan_source,
+    functions=["parallel_scan_cuda"],
+    verbose=False,
+    with_cuda=True,
+    extra_cuda_cflags=["-O3"],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs cumulative sum using custom CUDA kernels.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the scan operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the optimized Scan model.
+        
+        Args:
+            dim (int): The dimension along which to perform the cumulative sum.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.scan_module = scan_module
+
+    def forward(self, x):
+        """
+        Forward pass using optimized parallel scan.
+        
+        Args:
+            x (torch.Tensor): Input tensor.
+            
+        Returns:
+            torch.Tensor: Tensor after applying cumulative sum along specified dimension.
+        """
+        return self.scan_module.parallel_scan_cuda(x, self.dim)
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 30
+- Original fragment: `-`
+- node_type: cuda_Sub
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 30
+- Original fragment: `-`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - extreme_magnitude: passed
+  - extreme_magnitude: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - near_zero: passed
+  - near_zero: passed
+  - all_negative: passed
+  - all_negative: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [128, 4000], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.637370586395264, 'mean': -0.0007910541025921702, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [128, 4000], 'dtype': 'torch.float32', 'min': -4.169435977935791, 'max': 10000.0, 'mean': 0.01800868846476078, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 0.95
+- Reasoning: The mutation changes the calculation of 'bi' in the up-sweep phase from 'offset * (2 * tid + 2) - 1' to 'offset * (2 * tid + 2) + 1'. However, this kernel is never actually executed in the code path. The host code calls 'row_scan_kernel', not 'inclusive_scan_kernel'. The 'inclusive_scan_kernel' is defined but never invoked in the parallel_scan_cuda function. Since the mutated code is dead code that never runs during forward execution with the fixed input shapes, the mutant is truly equivalent re
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - mixed_extremes seed=42: survived
+  - mixed_extremes seed=43: survived
+  - mixed_extremes seed=44: survived
+  - mixed_extremes seed=45: survived
+  - mixed_extremes seed=46: survived
+  - dense_nonzero seed=47: survived
+  - dense_nonzero seed=48: survived
+  - dense_nonzero seed=49: survived
+  - dense_nonzero seed=50: survived
+  - dense_nonzero seed=51: survived
+  - near_overflow seed=52: survived
+  - near_overflow seed=53: survived
+  - near_overflow seed=54: survived
+  - near_overflow seed=55: survived
+  - near_overflow seed=56: survived
+  - denormals seed=57: survived
+  - denormals seed=58: survived
+  - denormals seed=59: survived
+  - denormals seed=60: survived
+  - denormals seed=61: survived
+  - all_positive seed=62: survived
+  - all_positive seed=63: survived
+  - all_positive seed=64: survived
+  - all_positive seed=65: survived
+  - all_positive seed=66: survived
+  - alternating_sign seed=67: survived
+  - alternating_sign seed=68: survived
+  - alternating_sign seed=69: survived
+  - alternating_sign seed=70: survived
+  - alternating_sign seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+Result: ALL SURVIVED
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- structured_ramp: linearly increasing 0→N, index-visible pattern
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

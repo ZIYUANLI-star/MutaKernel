@@ -1,0 +1,118 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      18|     // Use 256 threads per block (power of 2 for reduction)
+      19|     const int threads = 256;
+      20|     
+      21|     // Shared memory for reduction
+      22|     __shared__ float sdata[256];
+      23|     
+      24|     // Each thread processes multiple elements
+      25|     float thread_sum = 0.0f;
+      26|     
+      27|     // Process elements with stride equal to total threads
+      28|     for (int i = tid; i < dim; i += threads) {
+      29|         int idx = batch_idx * dim + i;
+>>>   30|         float val = static_cast<float>(input[idx]);
+      31|         thread_sum += val * val;
+      32|     }
+      33|     
+      34|     // Parallel reduction
+      35|     sdata[tid] = thread_sum;
+      36|     __syncthreads();
+      37|     
+      38|     // Tree reduction
+      39|     for (int stride = threads / 2; stride > 0; stride >>= 1) {
+      40|         if (tid < stride) {
+      41|             sdata[tid] += sdata[tid + stride];
+      42|         }
+```
+
+## Mutated Code (around mutation site)
+```
+      18|     // Use 256 threads per block (power of 2 for reduction)
+      19|     const int threads = 256;
+      20|     
+      21|     // Shared memory for reduction
+      22|     __shared__ float sdata[256];
+      23|     
+      24|     // Each thread processes multiple elements
+      25|     float thread_sum = 0.0f;
+      26|     
+      27|     // Process elements with stride equal to total threads
+      28|     for (int i = tid; i < dim; i += threads) {
+      29|         int idx = batch_idx * dim + i;
+>>>   30|         float val = input[idx];
+      31|         thread_sum += val * val;
+      32|     }
+      33|     
+      34|     // Parallel reduction
+      35|     sdata[tid] = thread_sum;
+      36|     __syncthreads();
+      37|     
+      38|     // Tree reduction
+      39|     for (int stride = threads / 2; stride > 0; stride >>= 1) {
+      40|         if (tid < stride) {
+      41|             sdata[tid] += sdata[tid + stride];
+      42|         }
+```
+
+## Mutation Details
+- Operator: cast_remove — Remove an explicit type cast (static_cast, .float(), etc.)
+- Location: line 30
+- Original fragment: `static_cast<float>(input[idx])`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by changing the input dtype to something other than float32 that requires explicit conversion. For example, using torch.float16 (half precision) would cause different behavior: the original code explicitly promotes half to float before squaring, avoiding precision loss and overflow/underflow issues, while the mutant would keep the value as half during the `val * val` operation (due to C++ implicit conversion rules), potentially causing different rounding or overflow. Similarly, integer dtypes would convert differently.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Create float16 tensor with carefully chosen values
+    # Mix large values (near float16 max) and small values to cause overflow/underflow differences
+    t = torch.empty((16, 16384), dtype=torch.float16, device=device)
+    # Fill first half with large values near float16 max
+    t[:, :8192] = 60000.0  # This will overflow if squared in float16 but not in float32
+    # Fill second half with small values that underflow when squared in float16
+    t[:, 8192:] = 0.01  # Squaring gives 0.0001, which has precision loss in float16
+    # Add some special values
+    t[0, 0] = 65504.0  # Maximum positive finite value in float16
+    t[0, 1] = 1e-4     # Small value that loses precision when squared
+    return [t]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

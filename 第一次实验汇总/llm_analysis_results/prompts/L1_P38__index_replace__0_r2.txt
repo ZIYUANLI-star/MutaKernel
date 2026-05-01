@@ -1,0 +1,114 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+       6| l1_norm_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| 
+      10| template<typename scalar_t>
+      11| __global__ void l1_normalize_kernel_optimized(
+      12|     const scalar_t* __restrict__ input,
+      13|     scalar_t* __restrict__ output,
+      14|     const int batch_size,
+      15|     const int dim
+      16| ) {
+      17|     // Use 2D grid: x for batch, y for elements
+>>>   18|     const int batch_idx = blockIdx.x;
+      19|     const int tid = threadIdx.x;
+      20|     const int warp_id = tid / 32;
+      21|     const int lane_id = tid % 32;
+      22|     
+      23|     // Shared memory for warp-level reduction results
+      24|     __shared__ float warp_sums[32];  // 32 warps max for 1024 threads
+      25|     
+      26|     // Each thread processes multiple elements with vectorized loads
+      27|     float thread_sum = 0.0f;
+      28|     
+      29|     // Process 4 elements at a time for better memory throughput
+      30|     const int stride = blockDim.x * 4;
+```
+
+## Mutated Code (around mutation site)
+```
+       6| l1_norm_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| 
+      10| template<typename scalar_t>
+      11| __global__ void l1_normalize_kernel_optimized(
+      12|     const scalar_t* __restrict__ input,
+      13|     scalar_t* __restrict__ output,
+      14|     const int batch_size,
+      15|     const int dim
+      16| ) {
+      17|     // Use 2D grid: x for batch, y for elements
+>>>   18|     const int batch_idx = blockIdx.y;
+      19|     const int tid = threadIdx.x;
+      20|     const int warp_id = tid / 32;
+      21|     const int lane_id = tid % 32;
+      22|     
+      23|     // Shared memory for warp-level reduction results
+      24|     __shared__ float warp_sums[32];  // 32 warps max for 1024 threads
+      25|     
+      26|     // Each thread processes multiple elements with vectorized loads
+      27|     float thread_sum = 0.0f;
+      28|     
+      29|     // Process 4 elements at a time for better memory throughput
+      30|     const int stride = blockDim.x * 4;
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 18
+- Original fragment: `blockIdx.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use input where different batches have distinct data distributions, causing the L1 normalization results to differ across batches. The mutant will normalize only batch 0 and replicate it to all batches, while the original normalizes each batch independently. A pattern with alternating increasing and decreasing ramps per batch ensures normalized outputs differ between batches.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    batch_size = 16
+    dim = 16384
+    tensor = torch.empty((batch_size, dim), dtype=torch.float32, device=device)
+    for i in range(batch_size):
+        if i % 2 == 0:
+            tensor[i] = torch.arange(dim, dtype=torch.float32, device=device)
+        else:
+            tensor[i] = torch.arange(dim, dtype=torch.float32, device=device).flip(0)
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

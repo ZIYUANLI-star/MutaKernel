@@ -1,0 +1,135 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+     184|         """
+     185|         Initializes the optimized LayerNorm layer.
+     186| 
+     187|         Args:
+     188|             normalized_shape (tuple): Shape of the input tensor to be normalized.
+     189|         """
+     190|         super(ModelNew, self).__init__()
+     191|         self.normalized_shape = normalized_shape
+     192|         
+     193|         # Learnable parameters
+     194|         self.gamma = nn.Parameter(torch.ones(normalized_shape))
+     195|         self.beta = nn.Parameter(torch.zeros(normalized_shape))
+>>>  196|         self.eps = 1e-5
+     197|         
+     198|         # Custom CUDA operator
+     199|         self.layernorm_fused = layernorm_fused
+     200| 
+     201|     def forward(self, x: torch.Tensor) -> torch.Tensor:
+     202|         """
+     203|         Applies optimized Layer Normalization to the input tensor using custom CUDA kernel.
+     204| 
+     205|         Args:
+     206|             x (torch.Tensor): Input tensor of shape (*, normalized_shape).
+     207| 
+     208|         Returns:
+```
+
+## Mutated Code (around mutation site)
+```
+     184|         """
+     185|         Initializes the optimized LayerNorm layer.
+     186| 
+     187|         Args:
+     188|             normalized_shape (tuple): Shape of the input tensor to be normalized.
+     189|         """
+     190|         super(ModelNew, self).__init__()
+     191|         self.normalized_shape = normalized_shape
+     192|         
+     193|         # Learnable parameters
+     194|         self.gamma = nn.Parameter(torch.ones(normalized_shape))
+     195|         self.beta = nn.Parameter(torch.zeros(normalized_shape))
+>>>  196|         self.eps = 1.01e-05
+     197|         
+     198|         # Custom CUDA operator
+     199|         self.layernorm_fused = layernorm_fused
+     200| 
+     201|     def forward(self, x: torch.Tensor) -> torch.Tensor:
+     202|         """
+     203|         Applies optimized Layer Normalization to the input tensor using custom CUDA kernel.
+     204| 
+     205|         Args:
+     206|             x (torch.Tensor): Input tensor of shape (*, normalized_shape).
+     207| 
+     208|         Returns:
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 196
+- Original fragment: `1e-5`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Craft inputs where the variance across the normalized dimension (last dim of size 256) is on the order of epsilon (∼1e-7). This ensures the perturbation in epsilon (1e-7) significantly alters the denominator relative to the variance. Specifically, create tensors where 255 of the 256 elements are zero and the last element is set to δ ≈ 0.005069, making the computed variance exactly 1e-7. This magnifies the relative difference in the normalized outputs between original and mutant to ≈0.5–0.6%, which should be detectable even with single-precision arithmetic.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    # shape must match forward() input: [16, 64, 256, 256]
+    shape = (16, 64, 256, 256)
+    N = shape[-1]  # 256
+    # Compute δ such that variance = 1e-7
+    # variance = δ² * (N-1) / N² => δ = sqrt(1e-7 * N² / (N-1))
+    delta = (1e-7 * N * N / (N - 1)) ** 0.5  # ≈ 0.005069
+    tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+    # Set the last element of each 256-element group to delta
+    tensor[..., -1] = delta
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Maximize the absolute change in normalized output by setting the variance to an optimal value (5e-6) that amplifies the effect of the epsilon perturbation. This yields a larger absolute difference (~0.03) in the normalized output for the non-zero elements, which should be detectable even with single-precision arithmetic and typical tolerances.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    shape = (16, 64, 256, 256)
+    N = shape[-1]  # 256
+    target_variance = 5e-6  # optimal variance
+    # Compute 'a' such that variance = target_variance
+    a = math.sqrt(target_variance * N * N / (N - 1))  # ~0.03585
+    tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+    tensor[..., -1] = a  # set last element of each 256-dim vector
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

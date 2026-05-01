@@ -1,0 +1,527 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (5 dimensions, 138 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized SELU activation
+selu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+// Constants for SELU
+constexpr float ALPHA = 1.6732632423543772848170429916717f;
+constexpr float SCALE = 1.0507009873554804934193349852946f;
+constexpr float LAMBDA = 1.0507009873554804934193349852946f;
+constexpr float NEG_ALPHA_LAMBDA = -1.7580993408473768599402175208123f;
+
+template<typename T>
+__device__ __forceinline__ T selu_compute(T x) {
+    return (x >= 0) ? (SCALE * x) : (LAMBDA * (ALPHA * expf(x) - ALPHA));
+}
+
+template<>
+__device__ __forceinline__ half selu_compute(half x) {
+    float fx = __half2float(x);
+    float result = (fx >= 0) ? (SCALE * fx) : (LAMBDA * (ALPHA * expf(fx) - ALPHA));
+    return __float2half(result);
+}
+
+template<typename T>
+__global__ void selu_kernel_optimized(const T* __restrict__ input, T* __restrict__ output, int64_t size) {
+    // Process 8 elements per thread for better occupancy
+    const int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int64_t element_idx = idx + i;
+        if (element_idx < size) {
+            T x = input[element_idx];
+            output[element_idx] = selu_compute(x);
+        }
+    }
+}
+
+// Specialized kernel for float32 with warp-level optimization
+__global__ void selu_kernel_float32(const float* __restrict__ input, float* __restrict__ output, int64_t size) {
+    const int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x);
+    
+    // Process 4 elements per thread with vectorized loads/stores
+    if (idx * 4 + 3 < size) {
+        // Load 4 floats at once
+        float4 in = *reinterpret_cast<const float4*>(&input[idx * 4]);
+        
+        // Compute SELU
+        float4 out;
+        out.x = (in.x >= 0) ? (SCALE * in.x) : (LAMBDA * (ALPHA * expf(in.x) - ALPHA));
+        out.y = (in.y >= 0) ? (SCALE * in.y) : (LAMBDA * (ALPHA * expf(in.y) - ALPHA));
+        out.z = (in.z >= 0) ? (SCALE * in.z) : (LAMBDA * (ALPHA * expf(in.z) - ALPHA));
+        out.w = (in.w >= 0) ? (SCALE * in.w) : (LAMBDA * (ALPHA * expf(in.w) - ALPHA));
+        
+        // Store 4 floats at once
+        *reinterpret_cast<float4*>(&output[idx * 4]) = out;
+    } else {
+        // Handle remaining elements
+        for (int64_t i = idx * 4; i < size; i++) {
+            float x = input[i];
+            output[i] = (x >= 0) ? (SCALE * x) : (LAMBDA * (ALPHA * expf(x) - ALPHA));
+        }
+    }
+}
+
+torch::Tensor selu_cuda_optimized(torch::Tensor input) {
+    auto output = torch::empty_like(input);
+    int64_t size = input.numel();
+    
+    // Optimized launch configuration based on tensor size
+    if (input.scalar_type() == torch::kFloat32) {
+        // Use vectorized kernel for float32
+        const int block_size = 256;
+        int grid_size = (size / 4 + block_size - 1) / block_size;
+        
+        // Ensure sufficient occupancy
+        if (grid_size < 32) grid_size = 32;
+        
+        selu_kernel_float32<<<grid_size, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            size
+        );
+    } else {
+        // Generic kernel for other types
+        const int block_size = 256;
+        int grid_size = (size / 8 + block_size - 1) / block_size;
+        
+        if (grid_size < 32) grid_size = 32;
+        
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "selu_cuda_optimized", [&] {
+            if (input.scalar_type() == torch::kFloat16) {
+                selu_kernel_optimized<half><<<grid_size, block_size>>>(
+                    reinterpret_cast<half*>(input.data_ptr<torch::Half>()),
+                    reinterpret_cast<half*>(output.data_ptr<torch::Half>()),
+                    size
+                );
+            } else if (input.scalar_type() == torch::kBFloat16) {
+                // For BF16, convert to float, process, convert back
+                auto input_float = input.to(torch::kFloat32);
+                auto output_float = torch::empty_like(input_float);
+                
+                const int block_size_f = 256;
+                int grid_size_f = (size / 4 + block_size_f - 1) / block_size_f;
+                if (grid_size_f < 32) grid_size_f = 32;
+                
+                selu_kernel_float32<<<grid_size_f, block_size_f>>>(
+                    input_float.data_ptr<float>(),
+                    output_float.data_ptr<float>(),
+                    size
+                );
+                
+                output = output_float.to(torch::kBFloat16);
+            }
+        });
+    }
+    
+    return output;
+}
+"""
+
+selu_cpp_source = "torch::Tensor selu_cuda_optimized(torch::Tensor input);"
+
+# Compile the inline CUDA code for optimized SELU
+selu_extension = load_inline(
+    name="selu_extension_optimized",
+    cpp_sources=selu_cpp_source,
+    cuda_sources=selu_source,
+    functions=["selu_cuda_optimized"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas=-v"],
+    extra_cflags=["-O3", "-march=native"],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs SELU activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.selu_cuda = selu_extension.selu_cuda_optimized
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized SELU activation to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with SELU applied, same shape as input.
+        """
+        # Only use custom kernel if tensor is on CUDA
+        if x.is_cuda:
+            return self.selu_cuda(x)
+        else:
+            # Fallback to PyTorch's implementation for CPU
+            return torch.selu(x)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized SELU activation
+selu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+// Constants for SELU
+constexpr float ALPHA = 1.6732632423543772848170429916717f;
+constexpr float SCALE = 1.0507009873554804934193349852946f;
+constexpr float LAMBDA = 1.0507009873554804934193349852946f;
+constexpr float NEG_ALPHA_LAMBDA = -1.7580993408473768599402175208123f;
+
+template<typename T>
+__device__ __forceinline__ T selu_compute(T x) {
+    return (x >= 0) ? (SCALE * x) : (LAMBDA * (ALPHA * expf(x) - ALPHA));
+}
+
+template<>
+__device__ __forceinline__ half selu_compute(half x) {
+    float fx = __half2float(x);
+    float result = (fx >= 0) ? (SCALE * fx) : (LAMBDA * (ALPHA * expf(fx) - ALPHA));
+    return __float2half(result);
+}
+
+template<typename T>
+__global__ void selu_kernel_optimized(const T* __restrict__ input, T* __restrict__ output, int64_t size) {
+    // Process 8 elements per thread for better occupancy
+    const int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * 8;
+    
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        int64_t element_idx = idx + i;
+        if (element_idx < size) {
+            T x = input[element_idx];
+            output[element_idx] = selu_compute(x);
+        }
+    }
+}
+
+// Specialized kernel for float32 with warp-level optimization
+__global__ void selu_kernel_float32(const float* __restrict__ input, float* __restrict__ output, int64_t size) {
+    const int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x);
+    
+    // Process 4 elements per thread with vectorized loads/stores
+    if (idx * 4 + 3 < size) {
+        // Load 4 floats at once
+        float4 in = *reinterpret_cast<const float4*>(&input[idx * 4]);
+        
+        // Compute SELU
+        float4 out;
+        out.x = (in.x >= 0) ? (SCALE * in.x) : (LAMBDA * (ALPHA * expf(in.x) - ALPHA));
+        out.y = (in.y >= 0) ? (SCALE * in.y) : (LAMBDA * (ALPHA * expf(in.y) - ALPHA));
+        out.z = (in.z >= 0) ? (SCALE * in.z) : (LAMBDA * (ALPHA * expf(in.z) - ALPHA));
+        out.w = (in.w >= 0) ? (SCALE * in.w) : (LAMBDA * (ALPHA * expf(in.w) - ALPHA));
+        
+        // Store 4 floats at once
+        *reinterpret_cast<float4*>(&output[idx * 4]) = out;
+    } else {
+        // Handle remaining elements
+        for (int64_t i = idx * 4; i < size; i++) {
+            float x = input[i];
+            output[i] = (x >= 0) ? (SCALE * x) : (LAMBDA * (ALPHA * expf(x) - ALPHA));
+        }
+    }
+}
+
+torch::Tensor selu_cuda_optimized(torch::Tensor input) {
+    auto output = torch::empty_like(input);
+    int64_t size = input.numel();
+    
+    // Optimized launch configuration based on tensor size
+    if (input.scalar_type() == torch::kFloat32) {
+        // Use vectorized kernel for float32
+        const int block_size = 256;
+        int grid_size = (size / 4 + block_size - 1) / block_size;
+        
+        // Ensure sufficient occupancy
+        if (grid_size < 32) grid_size = 32;
+        
+        selu_kernel_float32<<<grid_size, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            size
+        );
+    } else {
+        // Generic kernel for other types
+        const int block_size = 256;
+        int grid_size = (size / 8 + block_size - 1) / block_size;
+        
+        if (grid_size < 32) grid_size = 32;
+        
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "selu_cuda_optimized", [&] {
+            if (input.scalar_type() == torch::kFloat16) {
+                selu_kernel_optimized<half><<<grid_size, block_size>>>(
+                    reinterpret_cast<half*>(input.data_ptr<torch::Half>()),
+                    reinterpret_cast<half*>(output.data_ptr<torch::Half>()),
+                    size
+                );
+            } else if (input.scalar_type() == torch::kBFloat16) {
+                // For BF16, convert to float, process, convert back
+                auto input_float = input.to(torch::kFloat32);
+                auto output_float = torch::empty_like(input_float);
+                
+                const int block_size_f = 256;
+                int grid_size_f = (size / 4 + block_size_f - 1) / block_size_f;
+                if (grid_size_f < 31) grid_size_f = 32;
+                
+                selu_kernel_float32<<<grid_size_f, block_size_f>>>(
+                    input_float.data_ptr<float>(),
+                    output_float.data_ptr<float>(),
+                    size
+                );
+                
+                output = output_float.to(torch::kBFloat16);
+            }
+        });
+    }
+    
+    return output;
+}
+"""
+
+selu_cpp_source = "torch::Tensor selu_cuda_optimized(torch::Tensor input);"
+
+# Compile the inline CUDA code for optimized SELU
+selu_extension = load_inline(
+    name="selu_extension_optimized",
+    cpp_sources=selu_cpp_source,
+    cuda_sources=selu_source,
+    functions=["selu_cuda_optimized"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas=-v"],
+    extra_cflags=["-O3", "-march=native"],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs SELU activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.selu_cuda = selu_extension.selu_cuda_optimized
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized SELU activation to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with SELU applied, same shape as input.
+        """
+        # Only use custom kernel if tensor is on CUDA
+        if x.is_cuda:
+            return self.selu_cuda(x)
+        else:
+            # Fallback to PyTorch's implementation for CPU
+            return torch.selu(x)
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 111
+- Original fragment: `32`
+- node_type: const:int-1
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 111
+- Original fragment: `32`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - near_zero: passed
+  - near_zero: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - all_negative: passed
+  - all_negative: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.515127182006836, 'mean': -0.0012394363293424249, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_all_negative_1', 'seed': 10101, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -514.0972900390625, 'max': -0.00043383942102082074, 'mean': -79.78519439697266, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes the threshold from 32 to 31 in the condition 'if (grid_size_f < 31) grid_size_f = 32;'. This condition is only relevant when grid_size_f is less than 31, but the grid_size_f is computed as (size / 4 + block_size_f - 1) / block_size_f. With the fixed input shape [16, 16384], size = 262144, so grid_size_f = (262144 / 4 + 255) / 256 = (65536 + 255) / 256 = 65791 / 256 = 257 (integer division). Since 257 is not less than 31 or 32, the condition is never true, and the grid_size_f
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - near_overflow seed=42: survived
+  - near_overflow seed=43: survived
+  - near_overflow seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - denormals seed=47: survived
+  - denormals seed=48: survived
+  - denormals seed=49: survived
+  - denormals seed=50: survived
+  - denormals seed=51: survived
+  - all_positive seed=52: survived
+  - all_positive seed=53: survived
+  - all_positive seed=54: survived
+  - all_positive seed=55: survived
+  - all_positive seed=56: survived
+  - mixed_extremes seed=57: survived
+  - mixed_extremes seed=58: survived
+  - mixed_extremes seed=59: survived
+  - mixed_extremes seed=60: survived
+  - mixed_extremes seed=61: survived
+  - alternating_sign seed=62: survived
+  - alternating_sign seed=63: survived
+  - alternating_sign seed=64: survived
+  - alternating_sign seed=65: survived
+  - alternating_sign seed=66: survived
+  - uniform_constant seed=67: survived
+  - uniform_constant seed=68: survived
+  - uniform_constant seed=69: survived
+  - uniform_constant seed=70: survived
+  - uniform_constant seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+Result: ALL SURVIVED
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

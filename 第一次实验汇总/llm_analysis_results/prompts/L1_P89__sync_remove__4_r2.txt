@@ -1,0 +1,135 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      64| __global__ void row_scan_kernel(const T* input, T* output, int rows, int cols) {
+      65|     int row = blockIdx.x;
+      66|     int tid = threadIdx.x;
+      67|     
+      68|     if (row >= rows) return;
+      69|     
+      70|     extern __shared__ T shared[];
+      71|     
+      72|     // Load row into shared memory
+      73|     for (int i = tid; i < cols; i += blockDim.x) {
+      74|         shared[i] = input[row * cols + i];
+      75|     }
+>>>   76|     __syncthreads();
+      77|     
+      78|     // Perform sequential scan in shared memory
+      79|     if (tid == 0) {
+      80|         for (int i = 1; i < cols; i++) {
+      81|             shared[i] += shared[i - 1];
+      82|         }
+      83|     }
+      84|     __syncthreads();
+      85|     
+      86|     // Store results
+      87|     for (int i = tid; i < cols; i += blockDim.x) {
+      88|         output[row * cols + i] = shared[i];
+```
+
+## Mutated Code (around mutation site)
+```
+      64| __global__ void row_scan_kernel(const T* input, T* output, int rows, int cols) {
+      65|     int row = blockIdx.x;
+      66|     int tid = threadIdx.x;
+      67|     
+      68|     if (row >= rows) return;
+      69|     
+      70|     extern __shared__ T shared[];
+      71|     
+      72|     // Load row into shared memory
+      73|     for (int i = tid; i < cols; i += blockDim.x) {
+      74|         shared[i] = input[row * cols + i];
+      75|     }
+>>>   76|     
+      77|     // Perform sequential scan in shared memory
+      78|     if (tid == 0) {
+      79|         for (int i = 1; i < cols; i++) {
+      80|             shared[i] += shared[i - 1];
+      81|         }
+      82|     }
+      83|     __syncthreads();
+      84|     
+      85|     // Store results
+      86|     for (int i = tid; i < cols; i += blockDim.x) {
+      87|         output[row * cols + i] = shared[i];
+      88|     }
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 76
+- Original fragment: `__syncthreads();`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[128, 4000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To expose the race, we need thread 0 to read a shared memory location that (1) is loaded by a thread in a different warp, and (2) the read occurs before that other warp has executed its store. This can be forced by making the loading loop take significantly longer for warps other than warp 0, while thread 0 proceeds quickly. This is achieved by having thread 0's loaded indices be quick to compute (e.g., contiguous) while other threads' indices require expensive address calculations or dependencies, increasing the latency divergence between warps.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    rows, cols = 128, 4000
+    # Use a typical block size of 256 (assuming kernel launch uses this).
+    block_dim = 256
+    # Create a tensor where:
+    # - Elements at columns that are multiples of block_dim are 1.0 (loaded by thread 0)
+    # - Elements at columns (block_dim + 1) are also 1.0 (loaded by thread 1)
+    # - All others are 0.0
+    t = torch.zeros((rows, cols), dtype=torch.float32, device=device)
+    # Thread 0's loaded indices: 0, block_dim, 2*block_dim, ...
+    for start in range(0, cols, block_dim):
+        t[:, start] = 1.0
+    # Thread 1's loaded indices: 1, 1+block_dim, 1+2*block_dim, ...
+    # But we only set the first few to create a divergence: set only the first occurrence.
+    # This forces thread 1 to compute a more complex address (via the loop) while thread 0's are contiguous.
+    # Additionally, we make the values large to amplify any floating‑point differences.
+    if 1 < cols:
+        t[:, 1] = 1000.0
+    # To increase divergence further, we add a pattern that forces thread 1 to perform more loop iterations
+    # by making its stride appear larger via an implicit dependency: set values at indices that are
+    # 1 + k*block_dim for k such that index < cols. Actually, the loop already does this.
+    # The key is that thread 1's indices are non‑contiguous and may cause more cache misses.
+    # We'll also set a few more to increase the chance of a race.
+    for k in range(1, cols // block_dim):
+        idx = 1 + k * block_dim
+        if idx < cols:
+            t[:, idx] = 1000.0
+    return [t]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

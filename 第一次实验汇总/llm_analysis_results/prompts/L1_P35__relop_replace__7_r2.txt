@@ -1,0 +1,132 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      37|     const float* __restrict__ bias,
+      38|     const int batch_size,
+      39|     const int num_channels,
+      40|     const int num_groups,
+      41|     const int channels_per_group,
+      42|     const int spatial_size,
+      43|     const float eps
+      44| ) {
+      45|     // Each block handles one group in one sample
+      46|     const int group_idx = blockIdx.x % num_groups;
+      47|     const int sample_idx = blockIdx.x / num_groups;
+      48|     
+>>>   49|     if (sample_idx >= batch_size || group_idx >= num_groups) return;
+      50|     
+      51|     const int group_start = group_idx * channels_per_group;
+      52|     const int group_elements = channels_per_group * spatial_size;
+      53|     
+      54|     // Shared memory for reductions
+      55|     __shared__ float shared_data[256];
+      56|     
+      57|     // First pass: compute mean
+      58|     float thread_sum = 0.0f;
+      59|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+      60|         int c = group_start + (idx / spatial_size);
+      61|         int s = idx % spatial_size;
+```
+
+## Mutated Code (around mutation site)
+```
+      37|     const float* __restrict__ bias,
+      38|     const int batch_size,
+      39|     const int num_channels,
+      40|     const int num_groups,
+      41|     const int channels_per_group,
+      42|     const int spatial_size,
+      43|     const float eps
+      44| ) {
+      45|     // Each block handles one group in one sample
+      46|     const int group_idx = blockIdx.x % num_groups;
+      47|     const int sample_idx = blockIdx.x / num_groups;
+      48|     
+>>>   49|     if (sample_idx > batch_size || group_idx >= num_groups) return;
+      50|     
+      51|     const int group_start = group_idx * channels_per_group;
+      52|     const int group_elements = channels_per_group * spatial_size;
+      53|     
+      54|     // Shared memory for reductions
+      55|     __shared__ float shared_data[256];
+      56|     
+      57|     // First pass: compute mean
+      58|     float thread_sum = 0.0f;
+      59|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+      60|         int c = group_start + (idx / spatial_size);
+      61|         int s = idx % spatial_size;
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 49
+- Original fragment: `>=`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To kill this mutant, the kernel must be launched with MORE thread blocks than batch_size * num_groups, creating blocks where sample_idx == batch_size. This can be achieved by modifying the launch configuration (grid size) rather than just input values. Specifically, launching with grid size = batch_size * num_groups + 1 would create one extra block where sample_idx == batch_size, causing the original kernel to early-return while the mutant continues execution and accesses out-of-bounds memory.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use small dimensions to keep kernel launch manageable
+    batch_size = 2
+    num_channels = 8
+    num_groups = 2  # Must divide num_channels
+    spatial_height = 4
+    spatial_width = 4
+    
+    # Create input tensor with random values
+    x = torch.randn(
+        batch_size, num_channels, spatial_height, spatial_width,
+        device=device, dtype=torch.float32
+    )
+    
+    # Also generate weight and bias for GroupNorm (if kernel uses them)
+    weight = torch.randn(num_channels, device=device, dtype=torch.float32)
+    bias = torch.randn(num_channels, device=device, dtype=torch.float32)
+    
+    # Return list matching forward() arguments
+    # Assuming forward(self, x, weight, bias, num_groups, eps)
+    # Adjust based on actual kernel interface
+    return [x, weight, bias, num_groups, 1e-5]
+
+# Note: The test runner must be modified to launch kernel with oversized grid.
+# This code only generates inputs; the actual kernel launch configuration
+# must be changed separately in the testing framework.
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

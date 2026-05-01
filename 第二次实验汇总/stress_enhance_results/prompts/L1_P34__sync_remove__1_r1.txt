@@ -1,0 +1,767 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 45 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fused InstanceNorm2d
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename T>
+__global__ void instance_norm_forward_kernel(
+    const T* input,
+    T* output,
+    const int batch_size,
+    const int num_features,
+    const int height,
+    const int width,
+    const float eps
+) {
+    const int feature_idx = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    const int spatial_size = height * width;
+    const int feature_offset = feature_idx * spatial_size;
+    const int batch_offset = batch_idx * num_features * spatial_size;
+    const int start_idx = batch_offset + feature_offset;
+    
+    // Shared memory for reduction
+    __shared__ float shared_sum[256];
+    __shared__ float shared_sq_sum[256];
+    
+    // First pass: compute mean
+    float sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        sum += static_cast<float>(input[idx]);
+    }
+    
+    shared_sum[tid] = sum;
+    __syncthreads();
+    
+    // Reduction to compute mean
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float mean = shared_sum[0] / spatial_size;
+    __syncthreads();
+    
+    // Second pass: compute variance
+    float sq_sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float diff = static_cast<float>(input[idx]) - mean;
+        sq_sum += diff * diff;
+    }
+    
+    shared_sq_sum[tid] = sq_sum;
+    __syncthreads();
+    
+    // Reduction to compute variance
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sq_sum[tid] += shared_sq_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float variance = shared_sq_sum[0] / spatial_size;
+    float inv_std = rsqrtf(variance + eps);
+    
+    // Third pass: normalize
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float normalized = (static_cast<float>(input[idx]) - mean) * inv_std;
+        output[idx] = static_cast<T>(normalized);
+    }
+}
+
+template<typename T>
+__global__ void instance_norm_forward_kernel_with_affine(
+    const T* input,
+    T* output,
+    const T* weight,
+    const T* bias,
+    const int batch_size,
+    const int num_features,
+    const int height,
+    const int width,
+    const float eps
+) {
+    const int feature_idx = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    const int spatial_size = height * width;
+    const int feature_offset = feature_idx * spatial_size;
+    const int batch_offset = batch_idx * num_features * spatial_size;
+    const int start_idx = batch_offset + feature_offset;
+    
+    // Shared memory for reduction
+    __shared__ float shared_sum[256];
+    __shared__ float shared_sq_sum[256];
+    
+    // First pass: compute mean
+    float sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        sum += static_cast<float>(input[idx]);
+    }
+    
+    shared_sum[tid] = sum;
+    __syncthreads();
+    
+    // Reduction to compute mean
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float mean = shared_sum[0] / spatial_size;
+    __syncthreads();
+    
+    // Second pass: compute variance
+    float sq_sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float diff = static_cast<float>(input[idx]) - mean;
+        sq_sum += diff * diff;
+    }
+    
+    shared_sq_sum[tid] = sq_sum;
+    __syncthreads();
+    
+    // Reduction to compute variance
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sq_sum[tid] += shared_sq_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float variance = shared_sq_sum[0] / spatial_size;
+    float inv_std = rsqrtf(variance + eps);
+    
+    // Apply affine transformation parameters
+    float w = static_cast<float>(weight[feature_idx]);
+    float b = static_cast<float>(bias[feature_idx]);
+    
+    // Third pass: normalize and apply affine transform
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float normalized = (static_cast<float>(input[idx]) - mean) * inv_std;
+        output[idx] = static_cast<T>(normalized * w + b);
+    }
+}
+
+torch::Tensor instance_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps
+) {
+    auto output = torch::empty_like(input);
+    
+    const int batch_size = input.size(0);
+    const int num_features = input.size(1);
+    const int height = input.size(2);
+    const int width = input.size(3);
+    
+    const int threads_per_block = 256;
+    dim3 grid_size(num_features, batch_size);
+    
+    if (input.scalar_type() == torch::kFloat32) {
+        if (weight.defined() && bias.defined()) {
+            instance_norm_forward_kernel_with_affine<float><<<grid_size, threads_per_block>>>(
+                input.data_ptr<float>(),
+                output.data_ptr<float>(),
+                weight.data_ptr<float>(),
+                bias.data_ptr<float>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        } else {
+            instance_norm_forward_kernel<float><<<grid_size, threads_per_block>>>(
+                input.data_ptr<float>(),
+                output.data_ptr<float>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        }
+    } else if (input.scalar_type() == torch::kFloat16) {
+        if (weight.defined() && bias.defined()) {
+            instance_norm_forward_kernel_with_affine<at::Half><<<grid_size, threads_per_block>>>(
+                input.data_ptr<at::Half>(),
+                output.data_ptr<at::Half>(),
+                weight.data_ptr<at::Half>(),
+                bias.data_ptr<at::Half>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        } else {
+            instance_norm_forward_kernel<at::Half><<<grid_size, threads_per_block>>>(
+                input.data_ptr<at::Half>(),
+                output.data_ptr<at::Half>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        }
+    }
+    
+    return output;
+}
+"""
+
+instance_norm_cpp_source = """
+torch::Tensor instance_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps
+);
+"""
+
+# Compile the inline CUDA code
+instance_norm_cuda = load_inline(
+    name="instance_norm_cuda",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class InstanceNorm2dCustom(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
+        super(InstanceNorm2dCustom, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.affine = affine
+        
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return instance_norm_cuda.instance_norm_forward_cuda(
+            x,
+            self.weight if self.affine else torch.Tensor(),
+            self.bias if self.affine else torch.Tensor(),
+            self.eps
+        )
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.inorm = InstanceNorm2dCustom(num_features=num_features)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.inorm(x)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fused InstanceNorm2d
+instance_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename T>
+__global__ void instance_norm_forward_kernel(
+    const T* input,
+    T* output,
+    const int batch_size,
+    const int num_features,
+    const int height,
+    const int width,
+    const float eps
+) {
+    const int feature_idx = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    const int spatial_size = height * width;
+    const int feature_offset = feature_idx * spatial_size;
+    const int batch_offset = batch_idx * num_features * spatial_size;
+    const int start_idx = batch_offset + feature_offset;
+    
+    // Shared memory for reduction
+    __shared__ float shared_sum[256];
+    __shared__ float shared_sq_sum[256];
+    
+    // First pass: compute mean
+    float sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        sum += static_cast<float>(input[idx]);
+    }
+    
+    shared_sum[tid] = sum;
+    __syncthreads();
+    
+    // Reduction to compute mean
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+    }
+    
+    float mean = shared_sum[0] / spatial_size;
+    __syncthreads();
+    
+    // Second pass: compute variance
+    float sq_sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float diff = static_cast<float>(input[idx]) - mean;
+        sq_sum += diff * diff;
+    }
+    
+    shared_sq_sum[tid] = sq_sum;
+    __syncthreads();
+    
+    // Reduction to compute variance
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sq_sum[tid] += shared_sq_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float variance = shared_sq_sum[0] / spatial_size;
+    float inv_std = rsqrtf(variance + eps);
+    
+    // Third pass: normalize
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float normalized = (static_cast<float>(input[idx]) - mean) * inv_std;
+        output[idx] = static_cast<T>(normalized);
+    }
+}
+
+template<typename T>
+__global__ void instance_norm_forward_kernel_with_affine(
+    const T* input,
+    T* output,
+    const T* weight,
+    const T* bias,
+    const int batch_size,
+    const int num_features,
+    const int height,
+    const int width,
+    const float eps
+) {
+    const int feature_idx = blockIdx.x;
+    const int batch_idx = blockIdx.y;
+    const int tid = threadIdx.x;
+    
+    const int spatial_size = height * width;
+    const int feature_offset = feature_idx * spatial_size;
+    const int batch_offset = batch_idx * num_features * spatial_size;
+    const int start_idx = batch_offset + feature_offset;
+    
+    // Shared memory for reduction
+    __shared__ float shared_sum[256];
+    __shared__ float shared_sq_sum[256];
+    
+    // First pass: compute mean
+    float sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        sum += static_cast<float>(input[idx]);
+    }
+    
+    shared_sum[tid] = sum;
+    __syncthreads();
+    
+    // Reduction to compute mean
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float mean = shared_sum[0] / spatial_size;
+    __syncthreads();
+    
+    // Second pass: compute variance
+    float sq_sum = 0.0f;
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float diff = static_cast<float>(input[idx]) - mean;
+        sq_sum += diff * diff;
+    }
+    
+    shared_sq_sum[tid] = sq_sum;
+    __syncthreads();
+    
+    // Reduction to compute variance
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sq_sum[tid] += shared_sq_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    float variance = shared_sq_sum[0] / spatial_size;
+    float inv_std = rsqrtf(variance + eps);
+    
+    // Apply affine transformation parameters
+    float w = static_cast<float>(weight[feature_idx]);
+    float b = static_cast<float>(bias[feature_idx]);
+    
+    // Third pass: normalize and apply affine transform
+    for (int i = tid; i < spatial_size; i += blockDim.x) {
+        int idx = start_idx + i;
+        float normalized = (static_cast<float>(input[idx]) - mean) * inv_std;
+        output[idx] = static_cast<T>(normalized * w + b);
+    }
+}
+
+torch::Tensor instance_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps
+) {
+    auto output = torch::empty_like(input);
+    
+    const int batch_size = input.size(0);
+    const int num_features = input.size(1);
+    const int height = input.size(2);
+    const int width = input.size(3);
+    
+    const int threads_per_block = 256;
+    dim3 grid_size(num_features, batch_size);
+    
+    if (input.scalar_type() == torch::kFloat32) {
+        if (weight.defined() && bias.defined()) {
+            instance_norm_forward_kernel_with_affine<float><<<grid_size, threads_per_block>>>(
+                input.data_ptr<float>(),
+                output.data_ptr<float>(),
+                weight.data_ptr<float>(),
+                bias.data_ptr<float>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        } else {
+            instance_norm_forward_kernel<float><<<grid_size, threads_per_block>>>(
+                input.data_ptr<float>(),
+                output.data_ptr<float>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        }
+    } else if (input.scalar_type() == torch::kFloat16) {
+        if (weight.defined() && bias.defined()) {
+            instance_norm_forward_kernel_with_affine<at::Half><<<grid_size, threads_per_block>>>(
+                input.data_ptr<at::Half>(),
+                output.data_ptr<at::Half>(),
+                weight.data_ptr<at::Half>(),
+                bias.data_ptr<at::Half>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        } else {
+            instance_norm_forward_kernel<at::Half><<<grid_size, threads_per_block>>>(
+                input.data_ptr<at::Half>(),
+                output.data_ptr<at::Half>(),
+                batch_size,
+                num_features,
+                height,
+                width,
+                eps
+            );
+        }
+    }
+    
+    return output;
+}
+"""
+
+instance_norm_cpp_source = """
+torch::Tensor instance_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps
+);
+"""
+
+# Compile the inline CUDA code
+instance_norm_cuda = load_inline(
+    name="instance_norm_cuda",
+    cpp_sources=instance_norm_cpp_source,
+    cuda_sources=instance_norm_source,
+    functions=["instance_norm_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class InstanceNorm2dCustom(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
+        super(InstanceNorm2dCustom, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.affine = affine
+        
+        if self.affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_parameter('weight', None)
+            self.register_parameter('bias', None)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return instance_norm_cuda.instance_norm_forward_cuda(
+            x,
+            self.weight if self.affine else torch.Tensor(),
+            self.bias if self.affine else torch.Tensor(),
+            self.eps
+        )
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.inorm = InstanceNorm2dCustom(num_features=num_features)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.inorm(x)
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 50
+- Original fragment: `__syncthreads();`
+- node_type: cuda_syncthreads
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 64, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 50
+- Original fragment: `__syncthreads();`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 64, 256, 256], 'dtype': 'torch.float32', 'min': -5.274710178375244, 'max': 5.644289970397949, 'mean': 0.00011265418288530782, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [16, 64, 256, 256], 'dtype': 'torch.float32', 'min': -5.683104515075684, 'max': 10000.0, 'mean': 0.00025104478118009865, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: possibly_killable
+- Confidence: 0.95
+- Reasoning: The mutation removes a critical __syncthreads() barrier in the mean reduction loop. While Layer 2's 100 random tests showed bitwise equivalence, this is likely due to the specific warp scheduling behavior on modern GPUs. The reduction algorithm depends on proper synchronization between iterations: after threads with tid < stride write to shared_sum[tid], all threads must synchronize before the next iteration reads from potentially updated locations. Without synchronization, threads in later warp
+- Kill strategy: Create inputs that maximize the probability of warp divergence and timing variations. Use alternating patterns of very large and very small values to create data dependencies that expose the race condition. Specifically, use values that cause different warps to complete at different times, increasing the chance that some threads read stale shared memory values.
+- Suggested test: Alternating extreme values pattern: Use alternating very large (1e10) and very small (1e-10) values in a checkerboard pattern across spatial dimensions. This creates data dependencies where different 
+- Had executable code: True
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 45 / 45 rounds. Result: ALL SURVIVED (bitwise identical)
+  - mixed_extremes seed=42: survived
+  - mixed_extremes seed=43: survived
+  - mixed_extremes seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - near_overflow seed=47: survived
+  - near_zero seed=48: survived
+  - near_zero seed=49: survived
+  - near_zero seed=50: survived
+  - denormals seed=51: survived
+  - denormals seed=52: survived
+  - denormals seed=53: survived
+  - all_negative seed=54: survived
+  - all_negative seed=55: survived
+  - all_negative seed=56: survived
+  - all_positive seed=57: survived
+  - all_positive seed=58: survived
+  - all_positive seed=59: survived
+  - alternating_sign seed=60: survived
+  - alternating_sign seed=61: survived
+  - alternating_sign seed=62: survived
+  - uniform_constant seed=63: survived
+  - uniform_constant seed=64: survived
+  - uniform_constant seed=65: survived
+  - relop_boundary_hit seed=66: survived
+  - relop_boundary_hit seed=67: survived
+  - relop_boundary_hit seed=68: survived
+  - extreme_magnitude seed=69: survived
+  - extreme_magnitude seed=70: survived
+  - extreme_magnitude seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- near_zero: values ~1e-7, tests near-zero sensitivity
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

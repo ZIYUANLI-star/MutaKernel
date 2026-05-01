@@ -1,0 +1,129 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      48|     if (tid == 0) {
+      49|         float norm = sqrtf(sdata[0] + 1e-8f);
+      50|         scale = 1.0f / norm;
+      51|         sdata[0] = scale;
+      52|     }
+      53|     __syncthreads();
+      54|     
+      55|     scale = sdata[0];
+      56|     
+      57|     // Normalize elements
+      58|     for (int i = tid; i < dim; i += threads) {
+      59|         int idx = batch_idx * dim + i;
+>>>   60|         float val = static_cast<float>(input[idx]);
+      61|         output[idx] = static_cast<T>(val * scale);
+      62|     }
+      63| }
+      64| 
+      65| torch::Tensor l2_norm_cuda(torch::Tensor input) {
+      66|     auto batch_size = input.size(0);
+      67|     auto dim = input.size(1);
+      68|     auto output = torch::empty_like(input);
+      69|     
+      70|     const int threads = 256;
+      71|     const int blocks = batch_size;
+      72|     
+```
+
+## Mutated Code (around mutation site)
+```
+      48|     if (tid == 0) {
+      49|         float norm = sqrtf(sdata[0] + 1e-8f);
+      50|         scale = 1.0f / norm;
+      51|         sdata[0] = scale;
+      52|     }
+      53|     __syncthreads();
+      54|     
+      55|     scale = sdata[0];
+      56|     
+      57|     // Normalize elements
+      58|     for (int i = tid; i < dim; i += threads) {
+      59|         int idx = batch_idx * dim + i;
+>>>   60|         float val = input[idx];
+      61|         output[idx] = static_cast<T>(val * scale);
+      62|     }
+      63| }
+      64| 
+      65| torch::Tensor l2_norm_cuda(torch::Tensor input) {
+      66|     auto batch_size = input.size(0);
+      67|     auto dim = input.size(1);
+      68|     auto output = torch::empty_like(input);
+      69|     
+      70|     const int threads = 256;
+      71|     const int blocks = batch_size;
+      72|     
+```
+
+## Mutation Details
+- Operator: cast_remove — Remove an explicit type cast (static_cast, .float(), etc.)
+- Location: line 60
+- Original fragment: `static_cast<float>(input[idx])`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use a non-float32 dtype where the cast matters. Specifically, use torch.float16 (half precision) with values that overflow/underflow or lose precision when converted to float. Since the kernel computes `val * scale` where `scale` is float32, removing the explicit cast from half to float changes: original does `half → float → multiply → cast_to_half`, mutant does `half → multiply_with_float (implicit half→float) → cast_to_half`. The implicit conversion in multiplication might differ from explicit cast due to intermediate rounding. Choose extreme half values that saturate (e.g., 65504 or subnormals) or values where half→float rounding changes the lower bits.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Return exactly one tensor matching the original shape [16, 16384] but with float16 dtype
+    shape = (16, 16384)
+    # Create a tensor with mix of: max half, min positive subnormal, and values that round differently
+    tensor = torch.zeros(shape, dtype=torch.float16, device=device)
+    
+    # Fill with patterns:
+    # 1. First row: max half positive (65504)
+    tensor[0, :] = 65504.0
+    # 2. Second row: min positive subnormal half (5.96e-8)
+    tensor[1, :] = torch.tensor(2**-24, dtype=torch.float16)  # 5.96e-8
+    # 3. Third row: values that have rounding differences when converted to float
+    #    Example: 1.0009765625 (exact half representation) -> float may round slightly
+    for i in range(16384):
+        # Alternate between exact half values and ones that accumulate rounding error
+        val = 1.0009765625 if (i % 2 == 0) else 1.00048828125
+        tensor[2, i] = torch.tensor(val, dtype=torch.float16)
+    # 4. Remaining rows: random half values in range that includes subnormals
+    tensor[3:, :] = torch.randn((13, 16384), dtype=torch.float16, device=device) * 100
+    # Ensure some subnormals by scaling down
+    tensor[3:, ::100] *= 1e-7
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

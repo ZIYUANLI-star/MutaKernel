@@ -1,0 +1,125 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+     133|         inner_size *= sizes[i];
+     134|     }
+     135|     
+     136|     // Choose kernel based on reduction size
+     137|     const int64_t block_size = 256;
+     138|     const int64_t grid_x = outer_size;
+     139|     const int64_t grid_y = (inner_size + block_size - 1) / block_size;
+     140|     
+     141|     dim3 grid(grid_x, grid_y);
+     142|     dim3 block(block_size);
+     143|     
+     144|     AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "prod_reduction_cuda", [&] {
+>>>  145|         if (reduction_size <= 32) {
+     146|             // Use simple kernel for small reductions
+     147|             prod_reduction_kernel_small<scalar_t><<<grid, block>>>(
+     148|                 input.data_ptr<scalar_t>(),
+     149|                 output.data_ptr<scalar_t>(),
+     150|                 outer_size,
+     151|                 reduction_size,
+     152|                 inner_size
+     153|             );
+     154|         } else {
+     155|             // Use optimized kernel with warp reduction for larger reductions
+     156|             size_t shared_mem_size = ((block_size + 31) / 32) * sizeof(scalar_t);
+     157|             prod_reduction_kernel_optimized<scalar_t><<<grid, block, shared_mem_size>>>(
+```
+
+## Mutated Code (around mutation site)
+```
+     133|         inner_size *= sizes[i];
+     134|     }
+     135|     
+     136|     // Choose kernel based on reduction size
+     137|     const int64_t block_size = 256;
+     138|     const int64_t grid_x = outer_size;
+     139|     const int64_t grid_y = (inner_size + block_size - 1) / block_size;
+     140|     
+     141|     dim3 grid(grid_x, grid_y);
+     142|     dim3 block(block_size);
+     143|     
+     144|     AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "prod_reduction_cuda", [&] {
+>>>  145|         if (reduction_size <= 31) {
+     146|             // Use simple kernel for small reductions
+     147|             prod_reduction_kernel_small<scalar_t><<<grid, block>>>(
+     148|                 input.data_ptr<scalar_t>(),
+     149|                 output.data_ptr<scalar_t>(),
+     150|                 outer_size,
+     151|                 reduction_size,
+     152|                 inner_size
+     153|             );
+     154|         } else {
+     155|             // Use optimized kernel with warp reduction for larger reductions
+     156|             size_t shared_mem_size = ((block_size + 31) / 32) * sizeof(scalar_t);
+     157|             prod_reduction_kernel_optimized<scalar_t><<<grid, block, shared_mem_size>>>(
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 145
+- Original fragment: `32`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Design an input where the reduction dimension size equals exactly 32, making the original code use the simple kernel (since 32 ≤ 32) and the mutant use the optimized kernel (since 32 > 31). Then use numerical values sensitive to implementation differences between the two kernels - specifically, use extreme magnitude values that could cause different overflow/underflow behavior or precision differences due to the different reduction algorithms.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Create input where reduction dimension = 32
+    # Shape: [16, 32, 256] - keeping other dimensions from original but changing middle dimension to 32
+    # Fill with alternating extreme values: 1e38 and 1e-38
+    # Product of 32 such values = (1e38 * 1e-38)^16 = (1)^16 = 1.0 ideally
+    # But floating point rounding and overflow behavior may differ between kernels
+    
+    shape = [16, 32, 256]  # reduction_dim (dim=1) = 32
+    tensor = torch.zeros(shape, device=device, dtype=torch.float32)
+    
+    # Create pattern: alternating 1e38 and 1e-38 along reduction dimension
+    pattern = torch.tensor([1e38, 1e-38] * 16, device=device, dtype=torch.float32)  # 32 elements
+    
+    # Broadcast pattern across all outer and inner dimensions
+    for i in range(shape[0]):
+        for k in range(shape[2]):
+            tensor[i, :, k] = pattern
+    
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

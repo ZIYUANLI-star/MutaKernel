@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P50__mask_boundary__2",
+  "kernel_name": "L1_P50",
+  "operator_name": "mask_boundary",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survived because the original kernel's memory access pattern does not include the last element (index reduction_size-1) in its iteration space. The loop strides by elements_per_thread * blockDim.x, and the inner loop increments by blockDim.x. For the given input shape and launch configuration, the index reduction_size-1 is not accessed by any thread due to the combination of blockDim.x and reduction_size. Hence, tightening the boundary condition from idx < reduction_size to idx < reduction_size - 1 has no effect because the last element was never processed in the original kernel.",
+  "killable": true,
+  "kill_strategy": "The mutant can be killed by ensuring the last element of the reduction dimension is actually accessed in the original kernel. This requires changing the input shape so that the reduction dimension size is not a multiple of the stride (elements_per_thread * blockDim.x), forcing the last element to be within the loop's iteration space. Alternatively, if the reduction dimension is one of the tensor dimensions, we can set the last element along that dimension to a distinctive non-1 value (e.g., 0.5) while setting all other elements to 1.0, making the product sensitive to the presence of that last element.",
+  "recommendations": "Improve the test suite by varying input shapes and kernel launch parameters (e.g., blockDim.x) to expose boundary condition mutations. Additionally, the kernel code should be reviewed to ensure all elements are covered by the loop pattern, possibly by adjusting the loop stride or using a tail loop for remaining elements.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the original kernel's memory access pattern does not include the last element (index reduction_size-1) in its iteration space. The loop strides by elements_per_thread * blockDim.x, and the inner loop increments by blockDim.x. For the given input shape and launch configuration, the index reduction_size-1 is not accessed by any thread due to the combination of blockDim.x and reduction_size. Hence, tightening the boundary condition from idx < reduction_size to idx < reduction_size - 1 has no effect because the last element was never processed in the original kernel.",
+      "kill_strategy": "The mutant can be killed by ensuring the last element of the reduction dimension is actually accessed in the original kernel. This requires changing the input shape so that the reduction dimension size is not a multiple of the stride (elements_per_thread * blockDim.x), forcing the last element to be within the loop's iteration space. Alternatively, if the reduction dimension is one of the tensor dimensions, we can set the last element along that dimension to a distinctive non-1 value (e.g., 0.5) while setting all other elements to 1.0, making the product sensitive to the presence of that last element.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    x = torch.ones([16, 256, 256], device=device, dtype=torch.float32)\n    x[-1, :, :] = 0.5  # last element of first dimension\n    x[:, -1, :] = 0.5  # last element of second dimension\n    x[:, :, -1] = 0.5  # last element of third dimension\n    return [x]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=5.000000e-01, mean_diff=1.831055e-03, ref_range=[0.0000e+00,5.0000e-01], mut_range=[0.0000e+00,1.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "last_element_non_identity_per_dim",
+    "rule_description": "Creates inputs where the last element along each dimension is set to a non-identity value for common reduction operations (like 0.5 for product, non-zero for sum), while all other elements are set to the identity value. This exposes boundary condition mutations that skip the last element by making its inclusion/exclusion affect the computation result.",
+    "applicable_operators": [
+      "mask_boundary",
+      "guard_removal",
+      "loop_boundary_adjust"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    # Create tensor with identity values (1 for multiplicative reductions, 0 for additive)\n    # Use 1.0 as default since it's identity for multiplication and doesn't affect addition\n    tensor = torch.ones(shape, dtype=dtype, device=device)\n    \n    # Set last element along each dimension to non-identity value\n    # For floating point: use 0.5 (affects product, mean, etc.)\n    # For integer: use 2 (affects sum, product)\n    non_identity = torch.tensor(0.5 if torch.is_floating_point(tensor) else 2,\n                                 dtype=dtype, device=device)\n    \n    for dim in range(len(shape)):\n        # Build index to select last element along current dimension\n        idx = [slice(None)] * len(shape)\n        idx[dim] = -1\n        tensor[idx] = non_identity\n    \n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\ndef generate_inputs(device):\n    x = torch.ones([16, 256, 256], device=device, dtype=torch.float32)\n    x[-1, :, :] = 0.5  # last element of first dimension\n    x[:, -1, :] = 0.5  # last element of second dimension\n    x[:, :, -1] = 0.5  # last element of third dimension\n    return [x]"
+}

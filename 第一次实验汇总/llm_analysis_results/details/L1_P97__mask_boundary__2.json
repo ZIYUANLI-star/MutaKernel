@@ -1,0 +1,44 @@
+{
+  "mutant_id": "L1_P97__mask_boundary__2",
+  "kernel_name": "L1_P97",
+  "operator_name": "mask_boundary",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survived because all stress tests kept the input shape fixed at [128, 4096], where feature_size=4096 is likely divisible by the vectorization stride (THREADS_PER_BLOCK * ELEMENTS_PER_THREAD). This means the boundary condition only affects the final iteration when element_idx equals feature_size-1 (the very last element). Since the tests only varied values and not shapes, the mutant skips processing just one element per vector out of 4096. The difference in outputs (dot_product, norm_pred, norm_target) was too small relative to the total magnitude across all elements to be detected by floating-point comparisons. The 'boundary_last_element' test only set the last tensor element to extreme values, but didn't ensure the skipped element (the last of each vector) was non-zero across all 128 vectors.",
+  "killable": true,
+  "kill_strategy": "Change the input shape so that feature_size is NOT a multiple of the vectorization stride. This causes multiple threads to hit the boundary condition in the final loop iteration, skipping more than just the single last element. The exact number depends on the kernel's THREADS_PER_BLOCK and ELEMENTS_PER_THREAD parameters. For maximum effect, choose a shape where feature_size ≡ 1 mod (THREADS_PER_BLOCK * ELEMENTS_PER_THREAD), making ALL threads in the final iteration skip their elements except one. Fill only the skipped elements with large values (like 1e6) while others are zero.",
+  "recommendations": "1. The test suite should vary input shapes/dimensions, not just values, to catch boundary-condition mutants. 2. Add shape-aware edge-case tests where feature_size mod (THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) = 1. 3. The kernel could be made more robust by using a separate cleanup loop for the last partial chunk instead of conditional inside unrolled loop. 4. Add explicit tests for non-divisible feature sizes to the test suite.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because all stress tests kept the input shape fixed at [128, 4096], where feature_size=4096 is likely divisible by the vectorization stride (THREADS_PER_BLOCK * ELEMENTS_PER_THREAD). This means the boundary condition only affects the final iteration when element_idx equals feature_size-1 (the very last element). Since the tests only varied values and not shapes, the mutant skips processing just one element per vector out of 4096. The difference in outputs (dot_product, norm_pred, norm_target) was too small relative to the total magnitude across all elements to be detected by floating-point comparisons. The 'boundary_last_element' test only set the last tensor element to extreme values, but didn't ensure the skipped element (the last of each vector) was non-zero across all 128 vectors.",
+      "kill_strategy": "Change the input shape so that feature_size is NOT a multiple of the vectorization stride. This causes multiple threads to hit the boundary condition in the final loop iteration, skipping more than just the single last element. The exact number depends on the kernel's THREADS_PER_BLOCK and ELEMENTS_PER_THREAD parameters. For maximum effect, choose a shape where feature_size ≡ 1 mod (THREADS_PER_BLOCK * ELEMENTS_PER_THREAD), making ALL threads in the final iteration skip their elements except one. Fill only the skipped elements with large values (like 1e6) while others are zero.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use feature_size = 4097 instead of 4096\n    # This ensures the last vectorized chunk processes only 1 valid element\n    batch_size = 128\n    feature_size = 4097  # Changed from 4096 to expose boundary\n    \n    # Initialize all zeros\n    predictions = torch.zeros((batch_size, feature_size), \n                              device=device, dtype=torch.float32)\n    targets = torch.zeros((batch_size, feature_size),\n                          device=device, dtype=torch.float32)\n    \n    # Set ONLY the last element (index 4096) to large non-zero values\n    # This element will be processed in original but skipped in mutant\n    predictions[:, -1] = 1e6\n    targets[:, -1] = 1e6\n    \n    return [predictions, targets]\n",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.000000e+00, mean_diff=1.000000e+00, ref_range=[0.0000e+00,0.0000e+00], mut_range=[1.0000e+00,1.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "non_divisible_shape_boundary_exposure",
+    "rule_description": "Generates input shapes where dimension sizes are not multiples of common vectorization strides (e.g., 1024). Sets extreme values exclusively at boundary positions that would be processed in the original kernel but skipped in boundary-tightening mutants. This forces divergence in final outputs by making boundary elements dominate the computation.",
+    "applicable_operators": [
+      "mask_boundary",
+      "relax_boundary",
+      "shift_boundary",
+      "wrap_boundary"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Use original shape but modify the last dimension to be non-divisible by common strides\n    # Common vectorization strides: 256*4=1024, 128*4=512, 256*2=512\n    common_strides = [1024, 512, 256]\n    \n    modified_shape = list(shape)\n    if len(modified_shape) >= 2:\n        last_dim = modified_shape[-1]\n        # Find a non-divisible size slightly larger than original\n        for stride in common_strides:\n            if last_dim % stride == 0:\n                # Make non-divisible by adding 1 (or small prime)\n                modified_shape[-1] = last_dim + 1\n                break\n        # If already non-divisible, keep as is\n    \n    # Create zero tensors\n    predictions = torch.zeros(modified_shape, device=device, dtype=dtype)\n    targets = torch.zeros(modified_shape, device=device, dtype=dtype)\n    \n    # Set only boundary elements to extreme values\n    # For boundary-tightening mutants: set elements at idx = N-1 (last valid)\n    predictions.view(-1, modified_shape[-1])[:, -1] = 1e6\n    targets.view(-1, modified_shape[-1])[:, -1] = 1e6\n    \n    # For boundary-relaxing mutants: also set idx = N (first out-of-bounds if any)\n    # This covers multiple boundary mutation types\n    \n    return [predictions, targets]"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use feature_size = 4097 instead of 4096\n    # This ensures the last vectorized chunk processes only 1 valid element\n    batch_size = 128\n    feature_size = 4097  # Changed from 4096 to expose boundary\n    \n    # Initialize all zeros\n    predictions = torch.zeros((batch_size, feature_size), \n                              device=device, dtype=torch.float32)\n    targets = torch.zeros((batch_size, feature_size),\n                          device=device, dtype=torch.float32)\n    \n    # Set ONLY the last element (index 4096) to large non-zero values\n    # This element will be processed in original but skipped in mutant\n    predictions[:, -1] = 1e6\n    targets[:, -1] = 1e6\n    \n    return [predictions, targets]\n"
+}

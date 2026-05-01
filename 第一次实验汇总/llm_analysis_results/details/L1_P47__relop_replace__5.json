@@ -1,0 +1,63 @@
+{
+  "mutant_id": "L1_P47__relop_replace__5",
+  "kernel_name": "L1_P47",
+  "operator_name": "relop_replace",
+  "status": "survived",
+  "survival_reason": "The mutant survives because when dim == ndim, the condition `dim > ndim` is false, so validation passes and execution continues. However, on line 54, `sizes[dim]` attempts to access out-of-bounds memory (since valid indices are 0 to ndim-1). The previous attempts failed because: 1) Using a 0D tensor resulted in both original and mutant crashing (mutant_ok=False), 2) Using a 1x1x1 tensor allowed the out-of-bounds read to coincidentally return 1 (the same as valid reduction size), so the mutant computed the correct sum. The key issue is that the out-of-bounds read behavior is undefined and can produce arbitrary values, sometimes matching valid reduction sizes and avoiding crashes.",
+  "killable": true,
+  "kill_strategy": "Force the out-of-bounds memory read to return a value that causes observable incorrect behavior. Use a tensor shape where the product of dimensions is large (e.g., [2, 3, 4]), making it likely that the garbage value read from `sizes[ndim]` is not a small integer like 0 or 1. This increases the chance of either a crash (if the value is huge) or a wrong reduction result (if the value is a moderate integer but different from any valid reduction size). Additionally, use non-constant tensor values to detect incorrect summation.",
+  "recommendations": "Consider adding bounds checking before array accesses in the host code, or using at() for safer indexing. The mutation could also be killed by constructing tensors where the memory after `sizes` contains known sentinel values (e.g., via custom allocator), but that is framework-dependent. For robustness, the validation should reject dim == ndim explicitly.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant changes the boundary condition in dimension validation from `dim >= ndim` to `dim > ndim`. This only affects cases where `dim == ndim`, i.e., an invalid reduction dimension exactly equal to the tensor's rank. The stress tests used a fixed tensor shape [16, 256, 256] (ndim=3) and presumably a valid reduction dimension (0, 1, or 2). Since the validation was never triggered with `dim == 3`, the mutant's behavior remained identical to the original for all tested value distributions. The kernel proceeded with normal reduction, producing correct results for valid dimensions.",
+      "kill_strategy": "Trigger the dimension validation by setting the reduction dimension to an invalid value equal to the tensor's rank (e.g., `dim = 3` for a 3D tensor). This causes the original kernel to throw an exception, while the mutant passes validation and leads to an out-of-bounds memory access (e.g., accessing `sizes[3]` on line 54), resulting in a crash or undefined behavior. Alternatively, use a tensor with a different rank (e.g., 0D) where the only valid dimension is 0, and set `dim = 0` (which is invalid for a 0D tensor).",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # Create a 0D tensor (scalar) with the same dtype as original (float32).\n    # This forces the dimension validation to be triggered if the reduction dimension is set to 0.\n    scalar_tensor = torch.tensor(3.14, dtype=torch.float32, device=device)\n    return [scalar_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref crash: Dimension out of range (expected to be in range of [-1, 0], but got 1)"
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survives because previous tests triggered immediate crashes in both original and mutant code paths, not differential behavior. With the mutation `dim > ndim` instead of `dim >= ndim`, the only difference occurs when `dim == ndim`. However, accessing `sizes[dim]` on line 54 with `dim == ndim` causes an out-of-bounds access in both the original and mutant - the original throws a validation exception earlier, while the mutant crashes later with undefined behavior. This leads to both failing tests. To kill the mutant, we need an input where the mutant produces a valid but incorrect numerical result, not just a different type of failure.",
+      "kill_strategy": "Use a tensor with dynamic shape where dimension values can be zero, combined with a reduction dimension that equals ndim but doesn't immediately crash. The key insight is that while `sizes[dim]` with `dim == ndim` is undefined behavior, in practice it might read memory beyond the sizes array. If this memory happens to contain a small value (like 0 or 1), the kernel might execute without crashing but produce wrong results. We need to craft memory layout to make this likely.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # Create a 3D tensor with shape [1, 1, 1] to minimize memory usage\n    # and increase chance that memory after sizes array contains zeros\n    tensor = torch.ones((1, 1, 1), dtype=torch.float32, device=device)\n    return [tensor]\n    # Note: The test harness must also set dim=3 (equal to ndim) for this input\n    # This is assumed to be controlled by the mutation testing framework",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutant survives because when dim == ndim, the condition `dim > ndim` is false, so validation passes and execution continues. However, on line 54, `sizes[dim]` attempts to access out-of-bounds memory (since valid indices are 0 to ndim-1). The previous attempts failed because: 1) Using a 0D tensor resulted in both original and mutant crashing (mutant_ok=False), 2) Using a 1x1x1 tensor allowed the out-of-bounds read to coincidentally return 1 (the same as valid reduction size), so the mutant computed the correct sum. The key issue is that the out-of-bounds read behavior is undefined and can produce arbitrary values, sometimes matching valid reduction sizes and avoiding crashes.",
+      "kill_strategy": "Force the out-of-bounds memory read to return a value that causes observable incorrect behavior. Use a tensor shape where the product of dimensions is large (e.g., [2, 3, 4]), making it likely that the garbage value read from `sizes[ndim]` is not a small integer like 0 or 1. This increases the chance of either a crash (if the value is huge) or a wrong reduction result (if the value is a moderate integer but different from any valid reduction size). Additionally, use non-constant tensor values to detect incorrect summation.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # Create a 3D tensor with non-uniform dimensions and random values\n    tensor = torch.randn((2, 3, 4), dtype=torch.float32, device=device)\n    return [tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel lacks proper validation of dimension indices after negative dimension adjustment. When `dim < 0`, the code adds `ndim` to make it positive, but doesn't verify the resulting value falls within the valid range [0, ndim-1]. This allows out-of-bounds memory access in `sizes[dim]`. The fix is to add a second validation check after the negative dimension adjustment to ensure the final dimension index is valid. Additionally, using PyTorch's built-in bounds-checking methods like `input.size(dim)` would provide safer access patterns.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate and adjust dimension\n    if (dim < 0) dim += ndim;\n    // SECOND VALIDATION: Ensure adjusted dim is within valid range\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension (after adjustment)\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Out-of-Bounds Access Non-Observability"
+}

@@ -1,0 +1,110 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      10| #include <stdio.h>
+      11| 
+      12| template<typename scalar_t>
+      13| __global__ void sum_reduction_kernel(
+      14|     const scalar_t* input,
+      15|     scalar_t* output,
+      16|     const int outer_size,
+      17|     const int reduce_size,
+      18|     const int inner_size
+      19| ) {
+      20|     // Each thread handles one element in the output
+      21|     const int outer_idx = blockIdx.x;
+>>>   22|     const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+      23|     
+      24|     if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+      25|     
+      26|     const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;
+      27|     scalar_t sum = 0;
+      28|     
+      29|     // Sequential reduction across reduce dimension
+      30|     for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {
+      31|         sum += input_ptr[reduce_idx * inner_size];
+      32|     }
+      33|     
+      34|     output[outer_idx * inner_size + inner_idx] = sum;
+```
+
+## Mutated Code (around mutation site)
+```
+      10| #include <stdio.h>
+      11| 
+      12| template<typename scalar_t>
+      13| __global__ void sum_reduction_kernel(
+      14|     const scalar_t* input,
+      15|     scalar_t* output,
+      16|     const int outer_size,
+      17|     const int reduce_size,
+      18|     const int inner_size
+      19| ) {
+      20|     // Each thread handles one element in the output
+      21|     const int outer_idx = blockIdx.x;
+>>>   22|     const int inner_idx = blockIdx.z * blockDim.x + threadIdx.x;
+      23|     
+      24|     if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+      25|     
+      26|     const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;
+      27|     scalar_t sum = 0;
+      28|     
+      29|     // Sequential reduction across reduce dimension
+      30|     for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {
+      31|         sum += input_ptr[reduce_idx * inner_size];
+      32|     }
+      33|     
+      34|     output[outer_idx * inner_size + inner_idx] = sum;
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 22
+- Original fragment: `blockIdx.y`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input shape to require multiple blocks in the y-dimension by increasing `inner_size` beyond the block's x-dimension (typically 256). The original kernel will use `blockIdx.y` to cover the full inner range, while the mutant's `blockIdx.z` remains 0, causing it to compute only the first block's worth of inner indices and leave the rest uninitialized (or zero if output is zero-initialized). Using an `inner_size` not divisible by the block size ensures the last block is partially filled, making the missing computations detectable.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    outer_size = 16
+    reduce_size = 256
+    inner_size = 257  # > typical blockDim.x (256)
+    input_tensor = torch.ones(outer_size, reduce_size, inner_size, device=device, dtype=torch.float32)
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

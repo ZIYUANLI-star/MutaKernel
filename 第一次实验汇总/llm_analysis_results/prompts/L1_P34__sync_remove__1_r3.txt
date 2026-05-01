@@ -1,0 +1,128 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      38|         int idx = start_idx + i;
+      39|         sum += static_cast<float>(input[idx]);
+      40|     }
+      41|     
+      42|     shared_sum[tid] = sum;
+      43|     __syncthreads();
+      44|     
+      45|     // Reduction to compute mean
+      46|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      47|         if (tid < stride) {
+      48|             shared_sum[tid] += shared_sum[tid + stride];
+      49|         }
+>>>   50|         __syncthreads();
+      51|     }
+      52|     
+      53|     float mean = shared_sum[0] / spatial_size;
+      54|     __syncthreads();
+      55|     
+      56|     // Second pass: compute variance
+      57|     float sq_sum = 0.0f;
+      58|     for (int i = tid; i < spatial_size; i += blockDim.x) {
+      59|         int idx = start_idx + i;
+      60|         float diff = static_cast<float>(input[idx]) - mean;
+      61|         sq_sum += diff * diff;
+      62|     }
+```
+
+## Mutated Code (around mutation site)
+```
+      38|         int idx = start_idx + i;
+      39|         sum += static_cast<float>(input[idx]);
+      40|     }
+      41|     
+      42|     shared_sum[tid] = sum;
+      43|     __syncthreads();
+      44|     
+      45|     // Reduction to compute mean
+      46|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      47|         if (tid < stride) {
+      48|             shared_sum[tid] += shared_sum[tid + stride];
+      49|         }
+>>>   50|     }
+      51|     
+      52|     float mean = shared_sum[0] / spatial_size;
+      53|     __syncthreads();
+      54|     
+      55|     // Second pass: compute variance
+      56|     float sq_sum = 0.0f;
+      57|     for (int i = tid; i < spatial_size; i += blockDim.x) {
+      58|         int idx = start_idx + i;
+      59|         float diff = static_cast<float>(input[idx]) - mean;
+      60|         sq_sum += diff * diff;
+      61|     }
+      62|     
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 50
+- Original fragment: `__syncthreads();`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use a small spatial size (e.g., 4) to force a small block size (e.g., 4) where the race condition becomes deterministic and severe due to catastrophic cancellation. Choose values with extreme magnitudes and alternating signs so that the order of addition drastically changes the sum due to floating-point non-associativity and cancellation.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    # Shape: [batch, channels, height, width] = [1, 1, 2, 2] (spatial size = 4)
+    tensor = torch.tensor([[[[1e10, 1.0], [-1e10, 0.0]]]], dtype=torch.float32, device=device)
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Force a large block size (>32) by using the full spatial dimensions and create input values where floating-point non-associativity combined with race conditions produces a significantly different mean. Use alternating large-magnitude values with opposite signs across spatial dimensions so that the sum is zero in exact arithmetic, but race conditions cause non-deterministic cancellation errors.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    shape = [16, 64, 256, 256]
+    tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+    height, width = shape[2], shape[3]
+    for h in range(height):
+        for w in range(width):
+            if (h * width + w) % 2 == 0:
+                tensor[:, :, h, w] = 1e10
+            else:
+                tensor[:, :, h, w] = -1e10
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

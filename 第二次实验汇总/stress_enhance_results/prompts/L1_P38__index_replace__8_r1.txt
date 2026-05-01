@@ -1,0 +1,565 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for L1 normalization with warp-level reduction
+l1_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void l1_normalize_kernel_optimized(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim
+) {
+    // Use 2D grid: x for batch, y for elements
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    
+    // Shared memory for warp-level reduction results
+    __shared__ float warp_sums[32];  // 32 warps max for 1024 threads
+    
+    // Each thread processes multiple elements with vectorized loads
+    float thread_sum = 0.0f;
+    
+    // Process 4 elements at a time for better memory throughput
+    const int stride = blockDim.x * 4;
+    int idx = batch_idx * dim + tid * 4;
+    
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            // Load 4 elements at once
+            scalar_t val0 = input[idx];
+            scalar_t val1 = input[idx + 1];
+            scalar_t val2 = input[idx + 2];
+            scalar_t val3 = input[idx + 3];
+            
+            thread_sum += fabsf((float)val0) + fabsf((float)val1) + 
+                         fabsf((float)val2) + fabsf((float)val3);
+            idx += stride;
+        }
+    }
+    
+    // Warp-level reduction using shuffle instructions
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    }
+    
+    // First thread in each warp stores the warp sum
+    if (lane_id == 0) {
+        warp_sums[warp_id] = thread_sum;
+    }
+    __syncthreads();
+    
+    // Final reduction across warps (only first warp does this)
+    if (warp_id == 0) {
+        float warp_sum = lane_id < (blockDim.x / 32) ? warp_sums[lane_id] : 0.0f;
+        
+        // Reduce across warps
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+        
+        // Broadcast final sum to all threads
+        if (lane_id == 0) {
+            warp_sums[0] = warp_sum;
+        }
+    }
+    __syncthreads();
+    
+    // All threads get the final sum
+    float batch_sum = warp_sums[0];
+    batch_sum = batch_sum == 0.0f ? 1.0f : batch_sum;
+    float inv_batch_sum = 1.0f / batch_sum;
+    
+    // Normalize and write output with vectorized stores
+    idx = batch_idx * dim + tid * 4;
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            output[idx] = input[idx] * inv_batch_sum;
+            output[idx + 1] = input[idx + 1] * inv_batch_sum;
+            output[idx + 2] = input[idx + 2] * inv_batch_sum;
+            output[idx + 3] = input[idx + 3] * inv_batch_sum;
+            idx += stride;
+        }
+    }
+    
+    // Handle remaining elements
+    for (int i = tid; i < dim; i += blockDim.x) {
+        int pos = batch_idx * dim + i;
+        output[pos] = input[pos] * inv_batch_sum;
+    }
+}
+
+torch::Tensor l1_normalize_cuda(torch::Tensor input) {
+    // Check input dimensions
+    TORCH_CHECK(input.dim() >= 2, "Input must have at least 2 dimensions");
+    
+    // Make sure tensor is contiguous
+    auto input_contig = input.contiguous();
+    
+    auto sizes = input_contig.sizes();
+    auto batch_size = sizes[0];
+    auto dim = sizes[1];
+    
+    // Create output tensor
+    auto output = torch::empty_like(input_contig);
+    
+    // Optimized configuration - use 256 threads for good occupancy
+    const int block_size = 256;
+    const int grid_size = batch_size;
+    
+    // Launch kernel
+    AT_DISPATCH_FLOATING_TYPES(
+        input_contig.scalar_type(),
+        "l1_normalize_kernel_optimized",
+        [&] {
+            l1_normalize_kernel_optimized<scalar_t><<<grid_size, block_size>>>(
+                input_contig.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+l1_norm_cpp_source = "torch::Tensor l1_normalize_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code
+l1_normalize = load_inline(
+    name="l1_normalize",
+    cpp_sources=l1_norm_cpp_source,
+    cuda_sources=l1_norm_source,
+    functions=["l1_normalize_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-DNDEBUG"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs L1 normalization using custom CUDA kernel.
+    """
+    def __init__(self):
+        """
+        Initializes the optimized L1 normalization layer.
+        """
+        super(ModelNew, self).__init__()
+        self.l1_normalize = l1_normalize
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L1 normalization to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor with L1 normalization applied, same shape as input.
+        """
+        # Ensure tensor is on GPU
+        if not x.is_cuda:
+            x = x.cuda()
+        
+        # Apply fused L1 normalization kernel
+        return self.l1_normalize.l1_normalize_cuda(x)
+
+batch_size = 16
+dim = 16384
+
+def get_inputs():
+    x = torch.randn(batch_size, dim).cuda()
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for L1 normalization with warp-level reduction
+l1_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void l1_normalize_kernel_optimized(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim
+) {
+    // Use 2D grid: x for batch, y for elements
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    
+    // Shared memory for warp-level reduction results
+    __shared__ float warp_sums[32];  // 32 warps max for 1024 threads
+    
+    // Each thread processes multiple elements with vectorized loads
+    float thread_sum = 0.0f;
+    
+    // Process 4 elements at a time for better memory throughput
+    const int stride = blockDim.x * 4;
+    int idx = batch_idx * dim + tid * 4;
+    
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            // Load 4 elements at once
+            scalar_t val0 = input[idx];
+            scalar_t val1 = input[idx + 1];
+            scalar_t val2 = input[idx + 2];
+            scalar_t val3 = input[idx + 3];
+            
+            thread_sum += fabsf((float)val0) + fabsf((float)val1) + 
+                         fabsf((float)val2) + fabsf((float)val3);
+            idx += stride;
+        }
+    }
+    
+    // Warp-level reduction using shuffle instructions
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    }
+    
+    // First thread in each warp stores the warp sum
+    if (lane_id == 0) {
+        warp_sums[warp_id] = thread_sum;
+    }
+    __syncthreads();
+    
+    // Final reduction across warps (only first warp does this)
+    if (warp_id == 0) {
+        float warp_sum = lane_id < (blockDim.x / 32) ? warp_sums[lane_id] : 0.0f;
+        
+        // Reduce across warps
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+        
+        // Broadcast final sum to all threads
+        if (lane_id == 0) {
+            warp_sums[0] = warp_sum;
+        }
+    }
+    __syncthreads();
+    
+    // All threads get the final sum
+    float batch_sum = warp_sums[0];
+    batch_sum = batch_sum == 0.0f ? 1.0f : batch_sum;
+    float inv_batch_sum = 1.0f / batch_sum;
+    
+    // Normalize and write output with vectorized stores
+    idx = batch_idx * dim + tid * 4;
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            output[idx] = input[idx] * inv_batch_sum;
+            output[idx + 1] = input[idx + 1] * inv_batch_sum;
+            output[idx + 2] = input[idx + 2] * inv_batch_sum;
+            output[idx + 3] = input[idx + 3] * inv_batch_sum;
+            idx += stride;
+        }
+    }
+    
+    // Handle remaining elements
+    for (int i = tid; i < dim; i += blockDim.y) {
+        int pos = batch_idx * dim + i;
+        output[pos] = input[pos] * inv_batch_sum;
+    }
+}
+
+torch::Tensor l1_normalize_cuda(torch::Tensor input) {
+    // Check input dimensions
+    TORCH_CHECK(input.dim() >= 2, "Input must have at least 2 dimensions");
+    
+    // Make sure tensor is contiguous
+    auto input_contig = input.contiguous();
+    
+    auto sizes = input_contig.sizes();
+    auto batch_size = sizes[0];
+    auto dim = sizes[1];
+    
+    // Create output tensor
+    auto output = torch::empty_like(input_contig);
+    
+    // Optimized configuration - use 256 threads for good occupancy
+    const int block_size = 256;
+    const int grid_size = batch_size;
+    
+    // Launch kernel
+    AT_DISPATCH_FLOATING_TYPES(
+        input_contig.scalar_type(),
+        "l1_normalize_kernel_optimized",
+        [&] {
+            l1_normalize_kernel_optimized<scalar_t><<<grid_size, block_size>>>(
+                input_contig.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+l1_norm_cpp_source = "torch::Tensor l1_normalize_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code
+l1_normalize = load_inline(
+    name="l1_normalize",
+    cpp_sources=l1_norm_cpp_source,
+    cuda_sources=l1_norm_source,
+    functions=["l1_normalize_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-DNDEBUG"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs L1 normalization using custom CUDA kernel.
+    """
+    def __init__(self):
+        """
+        Initializes the optimized L1 normalization layer.
+        """
+        super(ModelNew, self).__init__()
+        self.l1_normalize = l1_normalize
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L1 normalization to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor with L1 normalization applied, same shape as input.
+        """
+        # Ensure tensor is on GPU
+        if not x.is_cuda:
+            x = x.cuda()
+        
+        # Apply fused L1 normalization kernel
+        return self.l1_normalize.l1_normalize_cuda(x)
+
+batch_size = 16
+dim = 16384
+
+def get_inputs():
+    x = torch.randn(batch_size, dim).cuda()
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 92
+- Original fragment: `blockDim.x`
+- node_type: cuda_dim|y
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 92
+- Original fragment: `blockDim.x`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.515127182006836, 'mean': -0.0012394363293424249, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.131533622741699, 'max': 10000.0, 'mean': 0.0353255495429039, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 0.99
+- Reasoning: The mutation changes `blockDim.x` to `blockDim.y` in the second loop that handles remaining elements. However, this kernel is launched with a 1D block configuration (`<<<grid_size, block_size>>>` where `block_size=256`). In CUDA, when using 1D blocks, `blockDim.y` is always 1. The loop `for (int i = tid; i < dim; i += blockDim.y)` becomes `i += 1`, which means each thread processes consecutive elements starting from its thread ID. This is actually the same behavior as the original when `blockDim
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - near_overflow seed=42: survived
+  - near_overflow seed=43: survived
+  - near_overflow seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - near_zero seed=47: survived
+  - near_zero seed=48: survived
+  - near_zero seed=49: survived
+  - near_zero seed=50: survived
+  - near_zero seed=51: survived
+  - denormals seed=52: survived
+  - denormals seed=53: survived
+  - denormals seed=54: survived
+  - denormals seed=55: survived
+  - denormals seed=56: survived
+  - all_negative seed=57: survived
+  - all_negative seed=58: survived
+  - all_negative seed=59: survived
+  - all_negative seed=60: survived
+  - all_negative seed=61: survived
+  - all_positive seed=62: survived
+  - all_positive seed=63: survived
+  - all_positive seed=64: survived
+  - all_positive seed=65: survived
+  - all_positive seed=66: survived
+  - mixed_extremes seed=67: survived
+  - mixed_extremes seed=68: survived
+  - mixed_extremes seed=69: survived
+  - mixed_extremes seed=70: survived
+  - mixed_extremes seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- near_zero: values ~1e-7, tests near-zero sensitivity
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

@@ -1,0 +1,119 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+     126|     Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
+     127|     """
+     128|     def __init__(self):
+     129|         super(ModelNew, self).__init__()
+     130|         self.fused_kl_div = fused_kl_div
+     131|         
+     132|     def forward(self, predictions, targets):
+     133|         # Input validation and preprocessing
+     134|         predictions = predictions.contiguous()
+     135|         targets = targets.contiguous()
+     136|         
+     137|         # Ensure numerical stability (matching PyTorch's behavior)
+>>>  138|         predictions = torch.clamp(predictions, min=1e-12)
+     139|         targets = torch.clamp(targets, min=1e-12)
+     140|         
+     141|         # Normalize to probability distributions
+     142|         predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+     143|         targets = targets / targets.sum(dim=-1, keepdim=True)
+     144|         
+     145|         # Use fused CUDA kernel
+     146|         return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+```
+
+## Mutated Code (around mutation site)
+```
+     126|     Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
+     127|     """
+     128|     def __init__(self):
+     129|         super(ModelNew, self).__init__()
+     130|         self.fused_kl_div = fused_kl_div
+     131|         
+     132|     def forward(self, predictions, targets):
+     133|         # Input validation and preprocessing
+     134|         predictions = predictions.contiguous()
+     135|         targets = targets.contiguous()
+     136|         
+     137|         # Ensure numerical stability (matching PyTorch's behavior)
+>>>  138|         predictions = torch.clamp(predictions, min=1e-13)
+     139|         targets = torch.clamp(targets, min=1e-12)
+     140|         
+     141|         # Normalize to probability distributions
+     142|         predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+     143|         targets = targets / targets.sum(dim=-1, keepdim=True)
+     144|         
+     145|         # Use fused CUDA kernel
+     146|         return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 138
+- Original fragment: `12`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Create inputs where predictions contain values between 1e-13 and 1e-12 exclusively, while targets have much larger magnitudes. This prevents normalization from masking the clamp difference, as predictions will be scaled differently between original and mutant. Specifically, use predictions with all elements = 5e-13 (just above mutant's clamp but below original's clamp) and targets with large values (e.g., 1e6). The normalized predictions will differ significantly between original (clamped to 1e-12) and mutant (remains 5e-13), leading to different KL divergence outputs.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    predictions = torch.full((128, 4096), 5e-13, dtype=torch.float32, device=device)
+    targets = torch.full((128, 4096), 1e6, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=1.726041e+11, mean_diff=1.726041e+11, ref_range=[1.7260e+11,1.7260e+11], mut_range=[6.6104e-07,6.6104e-07]
+
+### Round 2
+- Strategy: Create non-uniform predictions where some elements are below the original clamp threshold (1e-12) but above the mutant threshold (1e-13), while other elements are significantly larger. This ensures the normalized distributions differ between original and mutant because the relative proportions change after clamping. Specifically, use predictions with two distinct magnitude regimes: most elements at 1e-11 (above both thresholds), but a strategic subset at 5e-13 (between thresholds).
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    predictions = torch.full((128, 4096), 1e-11, dtype=torch.float32, device=device)
+    # Set every 100th element to 5e-13 (~1% of elements)
+    mask = torch.arange(0, 4096, device=device) % 100 == 0
+    predictions[:, mask] = 5e-13
+    targets = torch.full((128, 4096), 1.0, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=1.038681e+05, mean_diff=1.038681e+05, ref_range=[1.0387e+05,1.0387e+05], mut_range=[2.0432e-02,2.0432e-02]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

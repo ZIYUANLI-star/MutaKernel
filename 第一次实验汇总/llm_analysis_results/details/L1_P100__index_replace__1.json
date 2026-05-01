@@ -1,0 +1,44 @@
+{
+  "mutant_id": "L1_P100__index_replace__1",
+  "kernel_name": "L1_P100",
+  "operator_name": "index_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survived because the original input shape [128, 1] (128 elements) fits within a single CUDA block (256 threads). With blockIdx.z always 0 in a 1D grid launch, the mutated calculation 'blockIdx.z * blockDim.x + threadIdx.x' equals 'threadIdx.x', which for block 0 is identical to the original 'blockIdx.x * blockDim.x + threadIdx.x' (since blockIdx.x=0). For inputs ≤256 elements, only one block is launched, making the mutant mathematically equivalent to the original. All stress tests varied only values, not shapes, so they never triggered the scenario where multiple blocks are needed.",
+  "killable": true,
+  "kill_strategy": "Use input sizes larger than the thread block dimension (256) to force multiple blocks. The mutant will incorrectly compute indices for blocks beyond the first, causing data access patterns to wrap around within the first block's range. Specifically, set the input size >256 so blockIdx.x > 0, making blockIdx.z (always 0) diverge from blockIdx.x.",
+  "recommendations": "The kernel should validate grid dimension usage or use canonical 1D indexing. The test suite must include shape/dimension variation (especially sizes crossing block boundaries) as a core testing layer, not just value distribution changes. For mutation testing of GPU kernels, systematically vary problem sizes relative to hardware parameters like blockDim and gridDim.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the original input shape [128, 1] (128 elements) fits within a single CUDA block (256 threads). With blockIdx.z always 0 in a 1D grid launch, the mutated calculation 'blockIdx.z * blockDim.x + threadIdx.x' equals 'threadIdx.x', which for block 0 is identical to the original 'blockIdx.x * blockDim.x + threadIdx.x' (since blockIdx.x=0). For inputs ≤256 elements, only one block is launched, making the mutant mathematically equivalent to the original. All stress tests varied only values, not shapes, so they never triggered the scenario where multiple blocks are needed.",
+      "kill_strategy": "Use input sizes larger than the thread block dimension (256) to force multiple blocks. The mutant will incorrectly compute indices for blocks beyond the first, causing data access patterns to wrap around within the first block's range. Specifically, set the input size >256 so blockIdx.x > 0, making blockIdx.z (always 0) diverge from blockIdx.x.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Create tensors with 512 elements (exceeding block size 256)\n    # Shape [512, 1] maintains the same rank as original spec\n    predictions = torch.zeros(512, 1, dtype=torch.float32, device=device)\n    targets = torch.zeros(512, 1, dtype=torch.float32, device=device)\n    \n    # First 256 elements: margin = 1 - 1*1 = 0 → zero loss\n    predictions[:256] = 1.0\n    targets[:256] = 1.0\n    \n    # Elements 257-512: margin = 1 - (-1)*1 = 2 → positive loss\n    predictions[256:] = -1.0\n    targets[256:] = 1.0\n    \n    return [predictions, targets]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.000000e+00, mean_diff=1.000000e+00, ref_range=[1.0000e+00,1.0000e+00], mut_range=[0.0000e+00,0.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "force_multiple_blocks",
+    "rule_description": "Generates inputs that exceed a single thread block's capacity, requiring multiple CUDA blocks for full processing. This exposes mutations that affect block/thread indexing by creating scenarios where incorrect index calculations access wrong memory regions. The input ensures different behavior between first and subsequent blocks by setting distinct values in different block regions.",
+    "applicable_operators": [
+      "index_replace",
+      "thread_replace",
+      "block_replace",
+      "grid_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Target at least 2 blocks worth of data (assuming typical 256-thread blocks)\n    # Keep original tensor rank but expand first dimension\n    base_elements = 512  # Enough for 2 blocks of 256 threads\n    \n    # Calculate expanded shape: replace first dimension with at least base_elements\n    if shape[0] < base_elements:\n        expanded_shape = (base_elements,) + shape[1:]\n    else:\n        # If already large, keep original shape but ensure it's multiple of block size\n        expanded_shape = shape\n    \n    # Create two tensors for typical loss function inputs\n    # First tensor: predictions\n    predictions = torch.zeros(expanded_shape, dtype=dtype, device=device)\n    targets = torch.zeros(expanded_shape, dtype=dtype, device=device)\n    \n    # Block size assumption: typical 256 threads/block\n    # Adjust if kernel metadata indicates different block size\n    block_size = 256  # Conservative default\n    \n    # First block region: set to produce zero contribution\n    # (e.g., identical values for loss functions)\n    first_block_end = min(block_size, expanded_shape[0])\n    predictions[:first_block_end] = 1.0\n    targets[:first_block_end] = 1.0\n    \n    # Second block region: set to produce non-zero contribution\n    if expanded_shape[0] > block_size:\n        second_block_start = block_size\n        second_block_end = min(2 * block_size, expanded_shape[0])\n        predictions[second_block_start:second_block_end] = -1.0\n        targets[second_block_start:second_block_end] = 1.0\n        \n        # Fill any remaining elements beyond 2 blocks with non-zero values\n        if expanded_shape[0] > 2 * block_size:\n            predictions[2 * block_size:] = -1.0\n            targets[2 * block_size:] = 1.0\n    \n    return [predictions, targets]"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    # Create tensors with 512 elements (exceeding block size 256)\n    # Shape [512, 1] maintains the same rank as original spec\n    predictions = torch.zeros(512, 1, dtype=torch.float32, device=device)\n    targets = torch.zeros(512, 1, dtype=torch.float32, device=device)\n    \n    # First 256 elements: margin = 1 - 1*1 = 0 → zero loss\n    predictions[:256] = 1.0\n    targets[:256] = 1.0\n    \n    # Elements 257-512: margin = 1 - (-1)*1 = 2 → positive loss\n    predictions[256:] = -1.0\n    targets[256:] = 1.0\n    \n    return [predictions, targets]"
+}

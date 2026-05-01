@@ -1,0 +1,42 @@
+{
+  "mutant_id": "L1_P2__relop_replace__3",
+  "kernel_name": "L1_P2",
+  "operator_name": "relop_replace",
+  "status": "survived",
+  "survival_reason": "The mutant survives because the out-of-bounds access at B_row=K is always multiplied by a zero value from the corresponding As tile. When B_row = K, the corresponding A_col = t*BLOCK_SIZE + threadCol will also equal K (since B_row = t*BLOCK_SIZE + threadRow = K, and threadRow = threadCol in the inner product loop). At A_col = K, the condition A_col < K fails, so As[threadRow][threadCol] = 0.0f. Therefore, in the inner product sum += As[threadRow][k] * Bs[k][threadCol], when k = threadRow such that B_row = K, the term is 0 * (out-of-bounds value) = 0. The out-of-bounds read might cause undefined behavior or garbage values, but they're always multiplied by zero, making the mutant semantically equivalent.",
+  "killable": false,
+  "kill_strategy": "",
+  "recommendations": "This is an equivalent mutant - the mutation doesn't affect program output despite changing boundary checks. The mutant should be marked as 'equivalent' rather than trying to kill it. Consider analyzing other mutation sites or adding runtime bounds-checking instrumentation to detect actual out-of-bounds accesses that might cause crashes.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the original input shape uses K=4096, which is typically a multiple of the kernel's BLOCK_SIZE (common values like 16, 32, 64). When K is exactly divisible by BLOCK_SIZE, the last tile in the K dimension is fully occupied, and B_row never equals K. The condition change from `<` to `<=` only matters when B_row == K, which occurs only in partial tiles (when K % BLOCK_SIZE != 0). Since stress tests only varied input values but not shapes, the mutant behaved identically to the original.",
+      "kill_strategy": "Change input shapes so K is not a multiple of BLOCK_SIZE, causing a partial tile in the K dimension. Specifically, set K small enough (e.g., 1) so that the first tile is partial, and the thread with threadRow = K attempts to load B[K, ...], which is out-of-bounds. This will cause a GPU memory access violation or produce garbage values, distinguishing the mutant.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    M, K, N = 16, 1, 16\n    A = torch.randn(M, K, device=device, dtype=torch.float32)\n    B = torch.randn(K, N, device=device, dtype=torch.float32)\n    return [A, B]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survives because the out-of-bounds access at B_row=K is always multiplied by a zero value from the corresponding As tile. When B_row = K, the corresponding A_col = t*BLOCK_SIZE + threadCol will also equal K (since B_row = t*BLOCK_SIZE + threadRow = K, and threadRow = threadCol in the inner product loop). At A_col = K, the condition A_col < K fails, so As[threadRow][threadCol] = 0.0f. Therefore, in the inner product sum += As[threadRow][k] * Bs[k][threadCol], when k = threadRow such that B_row = K, the term is 0 * (out-of-bounds value) = 0. The out-of-bounds read might cause undefined behavior or garbage values, but they're always multiplied by zero, making the mutant semantically equivalent.",
+      "kill_strategy": "",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel lacks proper bounds checking during shared memory tile loading. While the current condition prevents out-of-bounds writes, it still allows out-of-bounds reads when the condition is mutated, leading to undefined behavior. A robust kernel should explicitly separate the bounds-checking logic from the data loading operation, ensuring that no memory access occurs outside the tensor boundaries. Additionally, defensive programming practices recommend using separate, well-named helper functions for bounds-checked loads, making the code more maintainable and less prone to subtle equivalence mutations.",
+  "robustness_code": "#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n#define BLOCK_SIZE 16\n\n__device__ __forceinline__ float load_A_safe(const float* A, int row, int col, int M, int K) {\n    return (row < M && col < K) ? A[row * K + col] : 0.0f;\n}\n\n__device__ __forceinline__ float load_B_safe(const float* B, int row, int col, int K, int N) {\n    return (row < K && col < N) ? B[row * N + col] : 0.0f;\n}\n\n__global__ void matmul_optimized_kernel(\n    const float* __restrict__ A, \n    const float* __restrict__ B, \n    float* __restrict__ C, \n    int M, \n    int N, \n    int K\n) {\n    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];\n    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];\n    \n    int blockRow = blockIdx.y;\n    int blockCol = blockIdx.x;\n    int threadRow = threadIdx.y;\n    int threadCol = threadIdx.x;\n    \n    int row = blockRow * BLOCK_SIZE + threadRow;\n    int col = blockCol * BLOCK_SIZE + threadCol;\n    \n    float sum = 0.0f;\n    \n    for (int t = 0; t < (K + BLOCK_SIZE - 1) / BLOCK_SIZE; ++t) {\n        int A_row = row;\n        int A_col = t * BLOCK_SIZE + threadCol;\n        As[threadRow][threadCol] = load_A_safe(A, A_row, A_col, M, K);\n        \n        int B_row = t * BLOCK_SIZE + threadRow;\n        int B_col = col;\n        Bs[threadRow][threadCol] = load_B_safe(B, B_row, B_col, K, N);\n        \n        __syncthreads();\n        \n        for (int k = 0; k < BLOCK_SIZE; ++k) {\n            sum += As[threadRow][k] * Bs[k][threadCol];\n        }\n        __syncthreads();\n    }\n    \n    if (row < M && col < N) {\n        C[row * N + col] = sum;\n    }\n}\n\ntorch::Tensor matmul_optimized_cuda(torch::Tensor A, torch::Tensor B) {\n    int M = A.size(0);\n    int K = A.size(1);\n    int N = B.size(1);\n    \n    auto C = torch::zeros({M, N}, A.options());\n    \n    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);\n    dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);\n    \n    matmul_optimized_kernel<<<gridDim, blockDim>>>(\n        A.data_ptr<float>(),\n        B.data_ptr<float>(),\n        C.data_ptr<float>(),\n        M, N, K\n    );\n    \n    return C;\n}",
+  "test_construction_rule": null,
+  "cluster_label": "Kernel Design Resilience"
+}

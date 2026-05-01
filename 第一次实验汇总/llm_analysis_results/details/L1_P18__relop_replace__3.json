@@ -1,0 +1,42 @@
+{
+  "mutant_id": "L1_P18__relop_replace__3",
+  "kernel_name": "L1_P18",
+  "operator_name": "relop_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survived because the kernel launch parameters (grid/block dimensions) are set to exactly cover the matrix dimensions with no over-provisioning. Specifically, the input shape used in stress tests (N=2048) is a multiple of the typical block size (16), so gridDim.y = N/blockDim.y = 128 exactly. Thus, the maximum thread idy is N-1, making the condition `idy <= N` equivalent to `idy < N` (since idy never reaches N). No out-of-bounds access occurs, so the mutant behaves identically to the original.",
+  "killable": true,
+  "kill_strategy": "Change the input shape so that N (first dimension of B) is not a multiple of the thread block size in the y-dimension (likely 16). This causes the grid to be over-provisioned, creating threads with idy = N. The original condition (`idy < N`) rejects these threads, but the mutant (`idy <= N`) accepts them, leading to out-of-bounds writes in B_T and out-of-bounds reads from B.",
+  "recommendations": "The test suite should include shape variations (especially dimensions not multiples of typical block sizes like 16, 32, 64) to catch mutants that depend on grid over-provisioning. The kernel code is already robust with bounds checking, but the mutant exposes a subtle flaw that only appears with specific launch parameters. Ensure stress tests vary both values and shapes.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the kernel launch parameters (grid/block dimensions) are set to exactly cover the matrix dimensions with no over-provisioning. Specifically, the input shape used in stress tests (N=2048) is a multiple of the typical block size (16), so gridDim.y = N/blockDim.y = 128 exactly. Thus, the maximum thread idy is N-1, making the condition `idy <= N` equivalent to `idy < N` (since idy never reaches N). No out-of-bounds access occurs, so the mutant behaves identically to the original.",
+      "kill_strategy": "Change the input shape so that N (first dimension of B) is not a multiple of the thread block size in the y-dimension (likely 16). This causes the grid to be over-provisioned, creating threads with idy = N. The original condition (`idy < N`) rejects these threads, but the mutant (`idy <= N`) accepts them, leading to out-of-bounds writes in B_T and out-of-bounds reads from B.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # Keep inner dimension K=4096 consistent with original, but change N to 2049 (not multiple of 16)\n    K = 4096\n    M = 1024  # unchanged\n    N = 2049  # 2048 + 1 to cause over-provisioning\n    A = torch.randn(K, M, device=device, dtype=torch.float32)\n    B = torch.randn(N, K, device=device, dtype=torch.float32)\n    return [A, B]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.304568e+02, mean_diff=2.481521e-02, ref_range=[-3.4798e+02,3.1339e+02], mut_range=[-3.4798e+02,3.1339e+02]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "non_multiple_block_shape_dimension",
+    "rule_description": "This rule creates inputs where matrix dimensions are NOT multiples of typical GPU block sizes (e.g., 16, 32). This triggers grid over-provisioning where extra threads are launched beyond the actual data boundaries. This exposes boundary-condition mutations by allowing threads with indices equal to the dimension size to execute, which would cause out-of-bounds access when relational operators are mutated.",
+    "applicable_operators": [
+      "relop_replace",
+      "boundary_condition"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import numpy as np\n    \n    # Common GPU block sizes to avoid multiples of\n    common_block_sizes = [16, 32, 64, 128, 256]\n    target_block_size = common_block_sizes[rng.randint(0, len(common_block_sizes))]\n    \n    # For matrix multiplication kernels like L1_P18, we expect shapes:\n    # A: [K, M], B: [N, K]\n    if len(shape) == 2:\n        # If this is likely the B matrix (N, K)\n        N, K = shape\n        # Make N not a multiple of target_block_size\n        # Choose a prime-ish offset (1, 3, 5, 7, 11) to avoid multiples of other block sizes too\n        offsets = [1, 3, 5, 7, 11]\n        offset = offsets[rng.randint(0, len(offsets))]\n        new_N = N + offset\n        \n        # Generate random data with the new shape\n        return torch.randn(new_N, K, device=device, dtype=dtype)\n    else:\n        # For other tensors, return original shape with random data\n        return torch.randn(*shape, device=device, dtype=dtype)"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\ndef generate_inputs(device):\n    # Keep inner dimension K=4096 consistent with original, but change N to 2049 (not multiple of 16)\n    K = 4096\n    M = 1024  # unchanged\n    N = 2049  # 2048 + 1 to cause over-provisioning\n    A = torch.randn(K, M, device=device, dtype=torch.float32)\n    B = torch.randn(N, K, device=device, dtype=torch.float32)\n    return [A, B]"
+}

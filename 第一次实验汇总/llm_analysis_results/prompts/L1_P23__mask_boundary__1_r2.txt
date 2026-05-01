@@ -1,0 +1,122 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      11| template<typename T>
+      12| __global__ void softmax_kernel(
+      13|     const T* input,
+      14|     T* output,
+      15|     const int batch_size,
+      16|     const int num_features
+      17| ) {
+      18|     // Each block processes one batch element
+      19|     const int batch_idx = blockIdx.x;
+      20|     const int tid = threadIdx.x;
+      21|     const int stride = blockDim.x;
+      22|     
+>>>   23|     if (batch_idx >= batch_size) return;
+      24|     
+      25|     const T* batch_input = input + batch_idx * num_features;
+      26|     T* batch_output = output + batch_idx * num_features;
+      27|     
+      28|     // Shared memory for max and sum reductions
+      29|     extern __shared__ float shared_mem[];
+      30|     float* shared_max = shared_mem;
+      31|     float* shared_sum = shared_mem + blockDim.x;
+      32|     
+      33|     // First pass: find max value in the row
+      34|     float thread_max = -INFINITY;
+      35|     for (int i = tid; i < num_features; i += stride) {
+```
+
+## Mutated Code (around mutation site)
+```
+      11| template<typename T>
+      12| __global__ void softmax_kernel(
+      13|     const T* input,
+      14|     T* output,
+      15|     const int batch_size,
+      16|     const int num_features
+      17| ) {
+      18|     // Each block processes one batch element
+      19|     const int batch_idx = blockIdx.x;
+      20|     const int tid = threadIdx.x;
+      21|     const int stride = blockDim.x;
+      22|     
+>>>   23|     if (batch_idx >= batch_size + 1) return;
+      24|     
+      25|     const T* batch_input = input + batch_idx * num_features;
+      26|     T* batch_output = output + batch_idx * num_features;
+      27|     
+      28|     // Shared memory for max and sum reductions
+      29|     extern __shared__ float shared_mem[];
+      30|     float* shared_max = shared_mem;
+      31|     float* shared_sum = shared_mem + blockDim.x;
+      32|     
+      33|     // First pass: find max value in the row
+      34|     float thread_max = -INFINITY;
+      35|     for (int i = tid; i < num_features; i += stride) {
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 23
+- Original fragment: `batch_idx >= batch_size`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Launch the kernel with a grid size larger than batch_size (e.g., 17 blocks for batch_size=16) while ensuring the output buffer is sized to capture writes from the extra block. The mutant will allow block with batch_idx=16 to execute, computing softmax on out-of-bounds input and writing to out-of-bounds output. This can cause detectable differences: either a crash (if memory is protected) or observable differences in the output buffer beyond the first batch_size elements.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    batch_size = 16
+    num_features = 16384
+    # Input tensor with shape [batch_size, num_features]
+    input_tensor = torch.randn(batch_size, num_features, device=device, dtype=torch.float32)
+    # We'll manually handle kernel launch with larger grid
+    # Return tensors as required by forward()
+    return [input_tensor]
+
+# Note: The actual test requires modifying the kernel launch configuration,
+# which is not shown here. This code only provides the input tensor.
+# To kill the mutant, the test harness must:
+# 1. Allocate output tensor of size [batch_size + 1, num_features]
+# 2. Initialize output with sentinel values (e.g., torch.full((batch_size+1, num_features), float('nan'), ...))
+# 3. Launch kernel with gridDim.x = batch_size + 1
+# 4. Check if output[batch_size, :] contains non-sentinel values (mutant) or remains NaN (original)
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

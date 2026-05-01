@@ -1,0 +1,59 @@
+{
+  "mutant_id": "L1_P29__arith_replace__19",
+  "kernel_name": "L1_P29",
+  "operator_name": "arith_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survived previous tests because the kernel likely uses a grid-stride loop (common in CUDA for robustness and performance). In such a design, each thread processes multiple vectors in a loop, so even if the grid size is smaller (due to mutation), the kernel still processes all elements, making the mutation functionally harmless. The previous test with size=2049 failed because the grid-stride loop still covered the entire array. The mutation alters the grid size calculation but does not affect correctness because the kernel compensates by having each thread handle more work.",
+  "killable": true,
+  "kill_strategy": "Use a half tensor with size so small (1 element) that the mutant's grid size becomes zero. This causes the kernel launch to be skipped (0 blocks), leaving output uninitialized, while the original launches one block and computes softplus. Unlike the previous attempt (size=2049), this size is below the threshold where the mutant grid size rounds to zero, exploiting a different boundary condition.",
+  "recommendations": "If this test also fails to kill, the mutant is likely unkillable because the kernel may have a fallback (e.g., minimum grid size of 1) or the output tensor is zero-initialized in tests. Consider reviewing the kernel code to confirm grid-stride loop usage. If confirmed, the mutation is harmless and can be ignored.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutation changes the grid size calculation for float16 from `(size + block_size * VEC_SIZE - 1)` to `(size + block_size / VEC_SIZE - 1)`. For the original input shape [16, 16384] with size=262144, both expressions evaluate to the same grid size when VEC_SIZE=8 and block_size=256. Since the denominator is `block_size * VEC_SIZE = 2048`, the original numerator adds 2047 while the mutant adds 31. However, because 262144 is exactly divisible by 2048, both `(262144 + 2047) // 2048 = 129` and `(262144 + 31) // 2048 = 129` due to integer division truncation. Thus, the kernel launches identical grid dimensions, producing identical outputs.",
+      "kill_strategy": "Use a tensor size where `size % (block_size * VEC_SIZE)` is non-zero and specifically where the remainder causes the mutant's grid size to be one less than the original. This happens when `size = N*2048 + r` with `1 ≤ r ≤ 2016`. At r=2017, both would round up again. Choose r=1 (size=2049) to maximize the difference: original grid=2 blocks, mutant grid=1 block. The mutant will under-launch blocks, leaving the last 1 element unprocessed in output.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Create float16 tensor with size 2049 elements\n    # Shape [1, 2049] gives total size 2049\n    size = 2049\n    x = torch.randn(size, device=device, dtype=torch.float16).reshape(1, -1)\n    # Set last element to a distinctive value for easy detection\n    x[0, -1] = 1000.0  # Large value for clear softplus difference\n    return [x]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survived previous tests because the kernel likely uses a grid-stride loop (common in CUDA for robustness and performance). In such a design, each thread processes multiple vectors in a loop, so even if the grid size is smaller (due to mutation), the kernel still processes all elements, making the mutation functionally harmless. The previous test with size=2049 failed because the grid-stride loop still covered the entire array. The mutation alters the grid size calculation but does not affect correctness because the kernel compensates by having each thread handle more work.",
+      "kill_strategy": "Use a half tensor with size so small (1 element) that the mutant's grid size becomes zero. This causes the kernel launch to be skipped (0 blocks), leaving output uninitialized, while the original launches one block and computes softplus. Unlike the previous attempt (size=2049), this size is below the threshold where the mutant grid size rounds to zero, exploiting a different boundary condition.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Single-element half tensor; mutant grid size = (1 + 32 - 1) / 2048 = 0\n    x = torch.tensor([1000.0], device=device, dtype=torch.float16)\n    return [x]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.040000e+02, mean_diff=1.040000e+02, ref_range=[1.0000e+03,1.0000e+03], mut_range=[8.9600e+02,8.9600e+02]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 2,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "minimum_data_volume_grid_stride",
+    "rule_description": "Tests kernels with the smallest possible input size (1 element) to expose mutations in grid/block calculations. Particularly effective for grid-stride loop implementations where larger inputs might mask mutations by having threads process multiple elements. The minimum input size ensures any miscalculation in thread/block counts becomes immediately visible.",
+    "applicable_operators": [
+      "arith_replace",
+      "constant_replacement",
+      "conditionals_boundary",
+      "negate_conditionals"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Create tensor with exactly 1 element regardless of requested shape\n    # but preserve the rank/dimensions if important for kernel validation\n    single_element_shape = (1,) * len(shape) if shape else (1,)\n    \n    # Use a non-zero, non-trivial value to ensure computation occurs\n    # and produce detectable output difference\n    value = 1000.0 if torch.is_floating_point(torch.tensor(0, dtype=dtype)) else 42\n    \n    return torch.full(single_element_shape, value, device=device, dtype=dtype)"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    # Single-element half tensor; mutant grid size = (1 + 32 - 1) / 2048 = 0\n    x = torch.tensor([1000.0], device=device, dtype=torch.float16)\n    return [x]"
+}

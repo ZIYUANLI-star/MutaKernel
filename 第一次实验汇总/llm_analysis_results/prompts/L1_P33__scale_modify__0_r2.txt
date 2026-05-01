@@ -1,0 +1,119 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      24|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      25|     if (idx >= total_elements) return;
+      26|     
+      27|     int spatial_idx = idx % spatial_size;
+      28|     int feature_idx = (idx / spatial_size) % num_features;
+      29|     int batch_idx = idx / (spatial_size * num_features);
+      30|     
+      31|     scalar_t mean = running_mean[feature_idx];
+      32|     scalar_t var = running_var[feature_idx];
+      33|     scalar_t gamma = weight ? weight[feature_idx] : scalar_t(1.0);
+      34|     scalar_t beta = bias ? bias[feature_idx] : scalar_t(0.0);
+      35|     
+>>>   36|     scalar_t inv_std = rsqrt(var + eps);
+      37|     scalar_t scale = gamma * inv_std;
+      38|     scalar_t shift = beta - mean * scale;
+      39|     
+      40|     int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+      41|     output[input_idx] = input[input_idx] * scale + shift;
+      42| }
+      43| 
+      44| template<typename scalar_t>
+      45| __global__ void compute_mean_var_kernel(
+      46|     const scalar_t* __restrict__ input,
+      47|     scalar_t* __restrict__ batch_mean,
+      48|     scalar_t* __restrict__ batch_var,
+```
+
+## Mutated Code (around mutation site)
+```
+      24|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      25|     if (idx >= total_elements) return;
+      26|     
+      27|     int spatial_idx = idx % spatial_size;
+      28|     int feature_idx = (idx / spatial_size) % num_features;
+      29|     int batch_idx = idx / (spatial_size * num_features);
+      30|     
+      31|     scalar_t mean = running_mean[feature_idx];
+      32|     scalar_t var = running_var[feature_idx];
+      33|     scalar_t gamma = weight ? weight[feature_idx] : scalar_t(1.0);
+      34|     scalar_t beta = bias ? bias[feature_idx] : scalar_t(0.0);
+      35|     
+>>>   36|     scalar_t inv_std = var + eps;
+      37|     scalar_t scale = gamma * inv_std;
+      38|     scalar_t shift = beta - mean * scale;
+      39|     
+      40|     int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+      41|     output[input_idx] = input[input_idx] * scale + shift;
+      42| }
+      43| 
+      44| template<typename scalar_t>
+      45| __global__ void compute_mean_var_kernel(
+      46|     const scalar_t* __restrict__ input,
+      47|     scalar_t* __restrict__ batch_mean,
+      48|     scalar_t* __restrict__ batch_var,
+```
+
+## Mutation Details
+- Operator: scale_modify — Alter scaling factors (e.g., 1/sqrt(d) in attention)
+- Location: line 36
+- Original fragment: `rsqrt(var + eps)`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by using running statistics where `var + eps ≠ 1`. Specifically, we need a regime where `(var + eps)` deviates significantly from 1, causing the scale factor to differ between `1/sqrt(var + eps)` and `(var + eps)`. The most effective approach is to set `running_var` to extreme values (e.g., very small or very large) while ensuring `running_mean` is non-zero to amplify the shift difference. Since the stress tests only varied input values, we must modify the module's internal parameters (running_mean, running_var, weight, bias) via direct assignment.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Input shape: [batch, features, height, width] = [16, 64, 256, 256]
+    input_tensor = torch.randn(16, 64, 256, 256, device=device) * 0.5 + 2.0  # non-zero mean
+    # Note: In practice, we must also modify the module's running_mean/running_var.
+    # This code returns only the input; the test harness must override module parameters.
+    return [input_tensor]
+
+# IMPORTANT: The test must override the module's parameters before calling forward:
+# module.running_mean.fill_(1.0)
+# module.running_var.fill_(1e-6)
+# module.weight.data.fill_(1.0)
+# module.bias.data.fill_(0.0)
+# module.eps = 1e-5
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

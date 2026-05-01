@@ -1,0 +1,119 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      21| ) {
+      22|     const int feature_idx = blockIdx.x;
+      23|     const int batch_idx = blockIdx.y;
+      24|     const int tid = threadIdx.x;
+      25|     
+      26|     const int spatial_size = height * width;
+      27|     const int feature_offset = feature_idx * spatial_size;
+      28|     const int batch_offset = batch_idx * num_features * spatial_size;
+      29|     const int start_idx = batch_offset + feature_offset;
+      30|     
+      31|     // Shared memory for reduction
+      32|     __shared__ float shared_sum[256];
+>>>   33|     __shared__ float shared_sq_sum[256];
+      34|     
+      35|     // First pass: compute mean
+      36|     float sum = 0.0f;
+      37|     for (int i = tid; i < spatial_size; i += blockDim.x) {
+      38|         int idx = start_idx + i;
+      39|         sum += static_cast<float>(input[idx]);
+      40|     }
+      41|     
+      42|     shared_sum[tid] = sum;
+      43|     __syncthreads();
+      44|     
+      45|     // Reduction to compute mean
+```
+
+## Mutated Code (around mutation site)
+```
+      21| ) {
+      22|     const int feature_idx = blockIdx.x;
+      23|     const int batch_idx = blockIdx.y;
+      24|     const int tid = threadIdx.x;
+      25|     
+      26|     const int spatial_size = height * width;
+      27|     const int feature_offset = feature_idx * spatial_size;
+      28|     const int batch_offset = batch_idx * num_features * spatial_size;
+      29|     const int start_idx = batch_offset + feature_offset;
+      30|     
+      31|     // Shared memory for reduction
+      32|     __shared__ float shared_sum[256];
+>>>   33|     __shared__ float shared_sq_sum[255];
+      34|     
+      35|     // First pass: compute mean
+      36|     float sum = 0.0f;
+      37|     for (int i = tid; i < spatial_size; i += blockDim.x) {
+      38|         int idx = start_idx + i;
+      39|         sum += static_cast<float>(input[idx]);
+      40|     }
+      41|     
+      42|     shared_sum[tid] = sum;
+      43|     __syncthreads();
+      44|     
+      45|     // Reduction to compute mean
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 33
+- Original fragment: `256`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the kernel launch configuration so that the number of active threads is exactly 255, not 256. This can be achieved by setting `spatial_size` (height*width) to a value where the loop `for (int i = tid; i < spatial_size; i += blockDim.x)` causes thread 255 to be inactive (i.e., when `spatial_size <= 255`). In that case, thread 255 would still write its initial `sum` (which is 0.0f) to `shared_sum[255]` and `shared_sq_sum[255]`, but in the mutant the write to `shared_sq_sum[255]` would be out-of-bounds. If the reduction algorithm later reads all 256 shared memory locations, the original would read a valid 0.0f from thread 255, while the mutant would read uninitialized/garbage data from the out-of-bounds location, leading to a different reduction result.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Keep batch=16, features=64, but change height and width so that
+    # spatial_size = height * width = 255 (less than block size 256)
+    # Example: height=15, width=17 (15*17=255)
+    batch = 16
+    num_features = 64
+    height = 15
+    width = 17
+    
+    # Create tensor with random values to avoid cancellation effects
+    input_tensor = torch.randn(batch, num_features, height, width, 
+                              device=device, dtype=torch.float32)
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

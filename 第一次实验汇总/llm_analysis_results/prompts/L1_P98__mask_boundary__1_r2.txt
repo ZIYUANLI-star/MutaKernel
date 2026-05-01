@@ -1,0 +1,125 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      12| namespace cg = cooperative_groups;
+      13| 
+      14| template<typename scalar_t>
+      15| __global__ void fused_kl_div_kernel(
+      16|     const scalar_t* __restrict__ predictions,
+      17|     const scalar_t* __restrict__ targets,
+      18|     scalar_t* __restrict__ output,
+      19|     int batch_size,
+      20|     int seq_len
+      21| ) {
+      22|     // Each block processes one batch element
+      23|     int batch_idx = blockIdx.x;
+>>>   24|     if (batch_idx >= batch_size) return;
+      25|     
+      26|     const scalar_t* pred_batch = predictions + batch_idx * seq_len;
+      27|     const scalar_t* target_batch = targets + batch_idx * seq_len;
+      28|     
+      29|     // Thread block and warp setup
+      30|     cg::thread_block block = cg::this_thread_block();
+      31|     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+      32|     
+      33|     float thread_sum = 0.0f;
+      34|     
+      35|     // Process elements with stride equal to total threads in block
+      36|     int tid = threadIdx.x;
+```
+
+## Mutated Code (around mutation site)
+```
+      12| namespace cg = cooperative_groups;
+      13| 
+      14| template<typename scalar_t>
+      15| __global__ void fused_kl_div_kernel(
+      16|     const scalar_t* __restrict__ predictions,
+      17|     const scalar_t* __restrict__ targets,
+      18|     scalar_t* __restrict__ output,
+      19|     int batch_size,
+      20|     int seq_len
+      21| ) {
+      22|     // Each block processes one batch element
+      23|     int batch_idx = blockIdx.x;
+>>>   24|     if (batch_idx >= batch_size + 1) return;
+      25|     
+      26|     const scalar_t* pred_batch = predictions + batch_idx * seq_len;
+      27|     const scalar_t* target_batch = targets + batch_idx * seq_len;
+      28|     
+      29|     // Thread block and warp setup
+      30|     cg::thread_block block = cg::this_thread_block();
+      31|     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+      32|     
+      33|     float thread_sum = 0.0f;
+      34|     
+      35|     // Process elements with stride equal to total threads in block
+      36|     int tid = threadIdx.x;
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 24
+- Original fragment: `batch_idx >= batch_size`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To kill the mutant, we must change the kernel launch configuration to launch MORE blocks than batch_size. This can be done by calling the kernel with gridDim.x > batch_size. The test suite must allow varying the grid size, not just input tensors. The extra block will then access out-of-bounds memory, which could cause a crash or produce detectable differences if: a) The memory after the allocated tensors is poisoned with special values (NaN, inf) or guarded pages, or b) The output array is allocated with exact size batch_size, causing out-of-bounds write that may be caught by memory checkers.
+- Suggested code:
+```python
+def generate_inputs(device):
+    import torch
+    import math
+    
+    # Original shape
+    batch_size = 128
+    seq_len = 4096
+    
+    # Allocate tensors as usual - but we cannot directly add guard pages in Python.
+    # Instead, we can allocate larger tensors and slice to create 'poisoned' memory after valid region.
+    # However, CUDA doesn't expose guard pages easily. Alternative: use NaN poisoning.
+    # We'll create tensors with an extra element, fill it with NaN, and pass pointers to the start.
+    # This requires modifying the kernel call, which we cannot do via inputs alone.
+    # Since the test framework only allows changing input tensors (not launch config),
+    # we cannot kill the mutant via input alone.
+    # Therefore, this test is illustrative but may not be feasible in current framework.
+    
+    # Return standard tensors (mutant cannot be killed without launch config change)
+    predictions = torch.randn(batch_size, seq_len, dtype=torch.float32, device=device)
+    targets = torch.randn(batch_size, seq_len, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

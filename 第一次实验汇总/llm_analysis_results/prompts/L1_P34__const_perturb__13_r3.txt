@@ -1,0 +1,142 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+     245| # Compile the inline CUDA code
+     246| instance_norm_cuda = load_inline(
+     247|     name="instance_norm_cuda",
+     248|     cpp_sources=instance_norm_cpp_source,
+     249|     cuda_sources=instance_norm_source,
+     250|     functions=["instance_norm_forward_cuda"],
+     251|     verbose=False,
+     252|     extra_cflags=["-O3"],
+     253|     extra_ldflags=[""],
+     254| )
+     255| 
+     256| class InstanceNorm2dCustom(nn.Module):
+>>>  257|     def __init__(self, num_features: int, eps: float = 1e-5, affine: bool = True):
+     258|         super(InstanceNorm2dCustom, self).__init__()
+     259|         self.num_features = num_features
+     260|         self.eps = eps
+     261|         self.affine = affine
+     262|         
+     263|         if self.affine:
+     264|             self.weight = nn.Parameter(torch.ones(num_features))
+     265|             self.bias = nn.Parameter(torch.zeros(num_features))
+     266|         else:
+     267|             self.register_parameter('weight', None)
+     268|             self.register_parameter('bias', None)
+     269|     
+```
+
+## Mutated Code (around mutation site)
+```
+     245| # Compile the inline CUDA code
+     246| instance_norm_cuda = load_inline(
+     247|     name="instance_norm_cuda",
+     248|     cpp_sources=instance_norm_cpp_source,
+     249|     cuda_sources=instance_norm_source,
+     250|     functions=["instance_norm_forward_cuda"],
+     251|     verbose=False,
+     252|     extra_cflags=["-O3"],
+     253|     extra_ldflags=[""],
+     254| )
+     255| 
+     256| class InstanceNorm2dCustom(nn.Module):
+>>>  257|     def __init__(self, num_features: int, eps: float = 1.01e-05, affine: bool = True):
+     258|         super(InstanceNorm2dCustom, self).__init__()
+     259|         self.num_features = num_features
+     260|         self.eps = eps
+     261|         self.affine = affine
+     262|         
+     263|         if self.affine:
+     264|             self.weight = nn.Parameter(torch.ones(num_features))
+     265|             self.bias = nn.Parameter(torch.zeros(num_features))
+     266|         else:
+     267|             self.register_parameter('weight', None)
+     268|             self.register_parameter('bias', None)
+     269|     
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 257
+- Original fragment: `1e-5`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Design an input where each channel has variance exactly equal to the original epsilon (1e-5). This forces the denominator sqrt(var + eps) to be sensitive to the change in eps, producing a detectable difference in the normalized output. Achieve this by setting one spatial element per channel to a carefully chosen value (≈0.80955) and the rest to zero, yielding a per-channel variance of 1e-5.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Shape: [batch, channels, height, width]
+    x = torch.zeros(16, 64, 256, 256, device=device, dtype=torch.float32)
+    # Set one spatial element per channel to achieve variance = 1e-5
+    n = 256 * 256  # 65536 elements per channel
+    # Compute exact value: variance = d^2 * (1 - 1/n) / n = 1e-5
+    d = (1e-5 * n / (1 - 1/n)) ** 0.5  # ≈ 0.80955
+    x[:, :, 0, 0] = d
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Exploit the additive nature of epsilon in the denominator by driving channel variance to near-zero (much smaller than eps). This amplifies the relative impact of epsilon changes. Specifically, set each channel to have variance = 0 (all identical values), making the denominator sqrt(0 + eps) = sqrt(eps). Then the normalized output becomes (x - μ)/sqrt(eps). Since x - μ = 0, the output is 0 regardless of eps. Therefore, we must break perfect uniformity slightly: use two distinct values per channel to create minimal non-zero variance while keeping mean exactly 0, maximizing sensitivity to epsilon in the normalization scaling factor.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Shape: [batch, channels, height, width]
+    B, C, H, W = 16, 64, 256, 256
+    x = torch.zeros(B, C, H, W, device=device, dtype=torch.float32)
+    
+    # For each channel in each sample, set two pixels to +v and -v
+    # Variance per channel = (v² + v²) / (H*W) ≈ 2*v² / (65536)
+    # We want variance ≪ eps, e.g., var = 1e-12
+    # Solve: 2*v² / 65536 = 1e-12  => v² = 1e-12 * 32768 = 3.2768e-8
+    v = torch.sqrt(torch.tensor(3.2768e-8, device=device, dtype=torch.float32))  # ≈ 0.000181
+    
+    # Set positions (0,0) to +v and (0,1) to -v for every channel in every batch
+    x[:, :, 0, 0] = v
+    x[:, :, 0, 1] = -v
+    # All other values remain 0, so mean = 0, variance ≈ 1e-12
+    
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

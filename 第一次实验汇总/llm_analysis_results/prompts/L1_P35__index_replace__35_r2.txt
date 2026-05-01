@@ -1,0 +1,123 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      97|     // Block reduction for variance
+      98|     shared_data[threadIdx.x] = thread_sqsum;
+      99|     __syncthreads();
+     100|     
+     101|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+     102|         if (threadIdx.x < stride) {
+     103|             shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
+     104|         }
+     105|         __syncthreads();
+     106|     }
+     107|     
+     108|     float inv_std = 0.0f;
+>>>  109|     if (threadIdx.x == 0) {
+     110|         float var = shared_data[0] / group_elements;
+     111|         inv_std = rsqrtf(var + eps);
+     112|         shared_data[0] = inv_std;
+     113|     }
+     114|     __syncthreads();
+     115|     
+     116|     inv_std = shared_data[0];
+     117|     
+     118|     // Apply normalization with affine transformation
+     119|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+     120|         int c = group_start + (idx / spatial_size);
+     121|         int s = idx % spatial_size;
+```
+
+## Mutated Code (around mutation site)
+```
+      97|     // Block reduction for variance
+      98|     shared_data[threadIdx.x] = thread_sqsum;
+      99|     __syncthreads();
+     100|     
+     101|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+     102|         if (threadIdx.x < stride) {
+     103|             shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
+     104|         }
+     105|         __syncthreads();
+     106|     }
+     107|     
+     108|     float inv_std = 0.0f;
+>>>  109|     if (threadIdx.z == 0) {
+     110|         float var = shared_data[0] / group_elements;
+     111|         inv_std = rsqrtf(var + eps);
+     112|         shared_data[0] = inv_std;
+     113|     }
+     114|     __syncthreads();
+     115|     
+     116|     inv_std = shared_data[0];
+     117|     
+     118|     // Apply normalization with affine transformation
+     119|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+     120|         int c = group_start + (idx / spatial_size);
+     121|         int s = idx % spatial_size;
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 109
+- Original fragment: `threadIdx.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by launching the kernel with a 3D block where blockDim.z > 1. In such a configuration, only threads with threadIdx.z == 0 execute the variance computation, while others skip it. This changes which threads participate in the write to shared_data[0]. While the written value remains the same, the execution timing and warp synchronization may differ. However, the more critical difference is that with a 3D block, the reduction loop (lines 101-106) still uses threadIdx.x, but the loop at line 119 also uses threadIdx.x. If blockDim.z > 1, the total number of threads increases, altering the parallelization pattern of the normalization loop (line 119). This can lead to incorrect indexing because the loop stride blockDim.x may now be part of a larger thread count, causing some threads to skip elements or compute out-of-bounds. To kill the mutant, we must force a launch configuration with blockDim.z > 1 while keeping the total number of threads within hardware limits and ensuring the kernel logic breaks.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Original shape: [16, 64, 256, 256]
+    # We modify spatial dimensions to be 1x1 to force small blockDim.x.
+    # This may cause the kernel to use 3D blocks to achieve sufficient parallelism.
+    # The group normalization kernel likely divides work based on group_elements.
+    # With spatial_size=1, group_elements = channels_per_group * 1.
+    # We set groups=16, so channels_per_group=4.
+    # This yields group_elements=4, which is small, potentially leading to blockDim.z > 1.
+    batch = 16
+    channels = 64
+    height = 1
+    width = 1
+    shape = [batch, channels, height, width]
+    # Use random values to expose any numerical differences.
+    tensor = torch.randn(shape, device=device, dtype=torch.float32)
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

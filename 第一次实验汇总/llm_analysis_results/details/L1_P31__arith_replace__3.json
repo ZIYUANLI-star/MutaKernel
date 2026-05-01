@@ -1,0 +1,44 @@
+{
+  "mutant_id": "L1_P31__arith_replace__3",
+  "kernel_name": "L1_P31",
+  "operator_name": "arith_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survived because the grid-stride loop's initial offset (tid) and stride (blockDim.x * gridDim.x) work together to eventually cover the same set of indices, just in a different permutation. When using the original `tid = blockIdx.x * blockDim.x + threadIdx.x`, threads start at consecutive offsets within each block. With the mutant `tid = blockIdx.x * blockDim.x - threadIdx.x`, threads start at decreasing offsets within each block, but the grid-stride loop (i += stride) still ensures all threads collectively iterate over the entire [0, size) range. Since the ELU operation is elementwise and independent, the output is identical regardless of which thread processes which element, as long as every element is processed exactly once. The stress tests used fixed input shape [16, 16384] = 262144 elements, which is likely a multiple of the stride, ensuring complete coverage.",
+  "killable": true,
+  "kill_strategy": "The mutant can be killed by using an input size that is NOT a multiple of the stride, causing some elements to be processed multiple times or missed entirely due to the inverted thread mapping. Specifically, we need a size where the grid-stride loop with the mutant's negative starting offsets leads to either: 1) duplicate processing of some indices, 2) missing some indices, or 3) out-of-bounds access. This requires choosing a size that is not a multiple of (blockDim.x * gridDim.x) and is smaller than the maximum initial offset.",
+  "recommendations": "The kernel implementation should be more robust by ensuring thread indexing cannot produce negative offsets (use unsigned types or clamp). The test suite should include varying input sizes (not just values) to catch stride/coverage bugs. Specifically, test with sizes that are: 1) smaller than typical grid*block, 2) not multiples of block size, 3) prime numbers to stress grid-stride loops. Additionally, consider adding bounds checking in debug builds or using assertions on thread indices.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the grid-stride loop's initial offset (tid) and stride (blockDim.x * gridDim.x) work together to eventually cover the same set of indices, just in a different permutation. When using the original `tid = blockIdx.x * blockDim.x + threadIdx.x`, threads start at consecutive offsets within each block. With the mutant `tid = blockIdx.x * blockDim.x - threadIdx.x`, threads start at decreasing offsets within each block, but the grid-stride loop (i += stride) still ensures all threads collectively iterate over the entire [0, size) range. Since the ELU operation is elementwise and independent, the output is identical regardless of which thread processes which element, as long as every element is processed exactly once. The stress tests used fixed input shape [16, 16384] = 262144 elements, which is likely a multiple of the stride, ensuring complete coverage.",
+      "kill_strategy": "The mutant can be killed by using an input size that is NOT a multiple of the stride, causing some elements to be processed multiple times or missed entirely due to the inverted thread mapping. Specifically, we need a size where the grid-stride loop with the mutant's negative starting offsets leads to either: 1) duplicate processing of some indices, 2) missing some indices, or 3) out-of-bounds access. This requires choosing a size that is not a multiple of (blockDim.x * gridDim.x) and is smaller than the maximum initial offset.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Small size that is prime and not a multiple of common block sizes (256, 512, etc.)\n    # This ensures the grid-stride loop behavior differs between original and mutant\n    size = 17  # Prime number, ensures non-uniform coverage\n    \n    # Create alternating positive and negative values to exercise both branches of ELU\n    input_tensor = torch.zeros(size, device=device, dtype=torch.float32)\n    for i in range(size):\n        input_tensor[i] = 1.0 if (i % 2 == 0) else -1.0\n    \n    # Reshape to match original input specification [16, 16384] -> we use [1, 17]\n    # The kernel only cares about total size, not dimensions\n    input_tensor = input_tensor.view(1, 17)\n    return [input_tensor]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.264241e+00, mean_diff=5.949369e-01, ref_range=[-6.3212e-01,1.0000e+00], mut_range=[6.3212e-01,1.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "small_prime_size_alternating_sign",
+    "rule_description": "Generates tensors with small prime total sizes (e.g., 17, 19, 23) and alternating positive/negative values. This breaks stride/coverage assumptions in grid-stride loops, exposing indexing arithmetic mutants when the stride exceeds the size. The alternating pattern ensures any duplicate/missing element processing becomes observable in elementwise operations with different branches.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "index_replace",
+      "boundary_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    # List of small primes that are not multiples of common block sizes (256, 512, 1024)\n    small_primes = [17, 19, 23, 29, 31, 37, 41, 43, 47, 53]\n    # Randomly select a prime size\n    p = small_primes[rng.randint(len(small_primes))]\n    # Create a 1D tensor of alternating 1.0 and -1.0 values to exercise different branches\n    data = [1.0 if i % 2 == 0 else -1.0 for i in range(p)]\n    tensor = torch.tensor(data, device=device, dtype=dtype)\n    # Reshape to match the original rank but with the prime size in the last dimension\n    new_shape = [1] * len(shape)  # Preserve rank\n    new_shape[-1] = p             # Set last dimension to prime size\n    return tensor.view(new_shape)"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Small size that is prime and not a multiple of common block sizes (256, 512, etc.)\n    # This ensures the grid-stride loop behavior differs between original and mutant\n    size = 17  # Prime number, ensures non-uniform coverage\n    \n    # Create alternating positive and negative values to exercise both branches of ELU\n    input_tensor = torch.zeros(size, device=device, dtype=torch.float32)\n    for i in range(size):\n        input_tensor[i] = 1.0 if (i % 2 == 0) else -1.0\n    \n    # Reshape to match original input specification [16, 16384] -> we use [1, 17]\n    # The kernel only cares about total size, not dimensions\n    input_tensor = input_tensor.view(1, 17)\n    return [input_tensor]"
+}

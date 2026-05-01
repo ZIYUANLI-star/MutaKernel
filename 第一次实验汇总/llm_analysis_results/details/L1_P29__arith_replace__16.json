@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P29__arith_replace__16",
+  "kernel_name": "L1_P29",
+  "operator_name": "arith_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutation changes grid size calculation from division to multiplication, dramatically increasing grid_size (from ~size/1024 to size*1024). However, the kernel likely uses a grid-stride loop with bounds checking or modulo arithmetic, making it robust to oversized grid launches. The kernel's internal index calculation (like `idx = blockIdx.x * blockDim.x + threadIdx.x`) combined with size-based early returns ensures only valid threads process data. This means both original and mutant produce identical outputs regardless of input values because the kernel's internal logic compensates for incorrect grid sizing.",
+  "killable": true,
+  "kill_strategy": "Use an input size that causes integer overflow in grid_size calculation. The mutant's multiplication `(size + block_size*VEC_SIZE - 1) * (block_size*VEC_SIZE)` with size=262144 produces ~269M, but if size is large enough to overflow 32-bit signed int (2^31-1), the grid_size becomes negative, causing CUDA launch failure or wrap-around to small positive number. The original's division cannot overflow. Target size > ~2M elements to trigger overflow.",
+  "recommendations": "Kernel should validate grid_size doesn't exceed CUDA limits or use 64-bit grid computation. Test suite should include extreme tensor sizes (very small/large) to catch grid-calculation bugs. Mutation testing should vary tensor dimensions, not just values.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutation changes grid size calculation from division to multiplication, dramatically increasing grid_size (from ~size/1024 to size*1024). However, the kernel likely uses a grid-stride loop with bounds checking or modulo arithmetic, making it robust to oversized grid launches. The kernel's internal index calculation (like `idx = blockIdx.x * blockDim.x + threadIdx.x`) combined with size-based early returns ensures only valid threads process data. This means both original and mutant produce identical outputs regardless of input values because the kernel's internal logic compensates for incorrect grid sizing.",
+      "kill_strategy": "Use an input size that causes integer overflow in grid_size calculation. The mutant's multiplication `(size + block_size*VEC_SIZE - 1) * (block_size*VEC_SIZE)` with size=262144 produces ~269M, but if size is large enough to overflow 32-bit signed int (2^31-1), the grid_size becomes negative, causing CUDA launch failure or wrap-around to small positive number. The original's division cannot overflow. Target size > ~2M elements to trigger overflow.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # Target just above overflow threshold: (2^31 // 1024) + 1 = 2,097,152 + 1\n    overflow_size = 2097153  # Slightly above threshold\n    # Create 1D tensor to exactly control size (total elements = overflow_size)\n    # Kernel only cares about numel(), shape is irrelevant\n    tensor = torch.randn(overflow_size, dtype=torch.float32, device=device)\n    return [tensor]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=4.768372e-07, mean_diff=1.093743e-08, ref_range=[4.8026e-03,4.9415e+00], mut_range=[4.8026e-03,4.9415e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "int_overflow_grid_calculation",
+    "rule_description": "Targets kernels where grid size calculations use integer arithmetic that could overflow when operators are mutated (e.g., division→multiplication). Generates inputs where total elements slightly exceed (2^31 / typical_block_size) to cause 32-bit signed integer overflow in the mutant's grid calculation while keeping the original kernel's grid size valid.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "expr_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Calculate total elements needed to overflow grid calculation\n    # Assumes typical block size of 1024, adjust if specific kernel info available\n    typical_block_size = 1024\n    overflow_threshold = (2**31) // typical_block_size\n    \n    # Add small margin above threshold to ensure overflow\n    target_elements = overflow_threshold + 1\n    \n    # Create tensor with target number of elements\n    # If requested shape already has more elements, keep it (already problematic)\n    # Otherwise create 1D tensor of required size\n    shape_elements = math.prod(shape) if shape else 1\n    if shape_elements < target_elements:\n        # Create minimal 1D tensor meeting overflow requirement\n        tensor = torch.randn(target_elements, dtype=dtype, device=device)\n    else:\n        # Use requested shape if it already has enough elements\n        tensor = torch.randn(shape, dtype=dtype, device=device)\n    \n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\ndef generate_inputs(device):\n    # Target just above overflow threshold: (2^31 // 1024) + 1 = 2,097,152 + 1\n    overflow_size = 2097153  # Slightly above threshold\n    # Create 1D tensor to exactly control size (total elements = overflow_size)\n    # Kernel only cares about numel(), shape is irrelevant\n    tensor = torch.randn(overflow_size, dtype=torch.float32, device=device)\n    return [tensor]"
+}

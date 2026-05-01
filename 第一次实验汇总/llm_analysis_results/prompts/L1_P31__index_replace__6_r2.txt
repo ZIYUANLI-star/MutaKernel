@@ -1,0 +1,117 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      12| __device__ __forceinline__ scalar_t elu_activation(scalar_t x, scalar_t alpha) {
+      13|     return x >= scalar_t(0) ? x : alpha * (expf(x) - scalar_t(1));
+      14| }
+      15| 
+      16| template<typename scalar_t>
+      17| __global__ void elu_kernel_fast(
+      18|     const scalar_t* __restrict__ input,
+      19|     scalar_t* __restrict__ output,
+      20|     scalar_t alpha,
+      21|     int64_t size) {
+      22|     
+      23|     const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+>>>   24|     const int64_t stride = blockDim.x * gridDim.x;
+      25|     
+      26|     // Grid-stride loop for better occupancy
+      27|     for (int64_t i = tid; i < size; i += stride) {
+      28|         scalar_t val = input[i];
+      29|         output[i] = elu_activation<scalar_t>(val, alpha);
+      30|     }
+      31| }
+      32| 
+      33| template<typename scalar_t>
+      34| __global__ void elu_kernel_vectorized4(
+      35|     const scalar_t* __restrict__ input,
+      36|     scalar_t* __restrict__ output,
+```
+
+## Mutated Code (around mutation site)
+```
+      12| __device__ __forceinline__ scalar_t elu_activation(scalar_t x, scalar_t alpha) {
+      13|     return x >= scalar_t(0) ? x : alpha * (expf(x) - scalar_t(1));
+      14| }
+      15| 
+      16| template<typename scalar_t>
+      17| __global__ void elu_kernel_fast(
+      18|     const scalar_t* __restrict__ input,
+      19|     scalar_t* __restrict__ output,
+      20|     scalar_t alpha,
+      21|     int64_t size) {
+      22|     
+      23|     const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+>>>   24|     const int64_t stride = blockDim.y * gridDim.x;
+      25|     
+      26|     // Grid-stride loop for better occupancy
+      27|     for (int64_t i = tid; i < size; i += stride) {
+      28|         scalar_t val = input[i];
+      29|         output[i] = elu_activation<scalar_t>(val, alpha);
+      30|     }
+      31| }
+      32| 
+      33| template<typename scalar_t>
+      34| __global__ void elu_kernel_vectorized4(
+      35|     const scalar_t* __restrict__ input,
+      36|     scalar_t* __restrict__ output,
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 24
+- Original fragment: `blockDim.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input size to break the equality size = blockDim.x * gridDim.x. Specifically, choose a size where size % total_threads != 0 and size % gridDim.x != 0. This causes the original kernel (stride=total_threads) to process all elements with grid-striding, while the mutant (stride=gridDim.x) may skip elements or cause thread divergence. For example, a prime size like 262147 would expose the difference because threads in the mutant may not cover all indices, leaving some output elements uninitialized.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Choose a prime size slightly larger than original
+    # Original: 16*16384 = 262144
+    # Prime: 262147 (cannot be evenly divided by typical block/thread counts)
+    prime_size = 262147
+    # Create input with distinct values so any skipped element is detectable
+    input_tensor = torch.arange(prime_size, dtype=torch.float32, device=device).view(1, prime_size)
+    # Scale to avoid extreme values
+    input_tensor = (input_tensor - prime_size/2) / 1000.0
+    return [input_tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

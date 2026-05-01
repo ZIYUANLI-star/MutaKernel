@@ -1,0 +1,57 @@
+{
+  "mutant_id": "L1_P16__relop_replace__1",
+  "kernel_name": "L1_P16",
+  "operator_name": "relop_replace",
+  "status": "survived",
+  "survival_reason": "The mutant survives because while it allows reading one extra element beyond valid indices (A_row == K), the corresponding B tile loading condition (line 45) remains strict (B_row < K). Therefore, in the last tile when A_row == K, the mutant reads one extra value from A's memory, but Bs is zero-filled at that position. Since matrix multiplication is a dot product over K, the extra term becomes A[K][col] * 0 = 0, leaving the final sum unchanged. The previous attempts failed because they didn't account for B's conditional zeroing. Additionally, GPU memory may have padding preventing crashes, and numerical differences were neutralized by B's zero value.",
+  "killable": false,
+  "kill_strategy": "The mutant is unkillable because the mutated condition only affects A loading, but the corresponding B value is always zero when A_row == K (due to B_row < K). Thus, the extra term contributes nothing to the dot product. To kill the mutant, we would need to also mutate B's condition to allow B_row == K when A_row == K, but that's not this mutation.",
+  "recommendations": "Mutation testing should consider coupled conditions: This mutation alone is equivalent due to the surrounding logic. Future mutations could target both A and B conditions simultaneously, or the tool could group related condition mutations. For this specific mutant, mark as 'equivalent' (unkillable).",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survives because the input shape used in stress tests (K=4096) is a multiple of the TILE_SIZE (commonly 32). When K is a multiple of TILE_SIZE, the maximum A_row computed in the tiled loop is K-1, so the condition A_row == K never occurs. Thus, both the original condition (A_row < K) and the mutated condition (A_row <= K) evaluate identically (both false for out-of-bounds threads, both true for in-bounds threads). No value distribution can expose a difference because the condition boundary is never exercised.",
+      "kill_strategy": "Change the input shape so that K is NOT a multiple of TILE_SIZE. Specifically, choose K such that in the last tile, there exists at least one thread where A_row equals K. Then the original condition (A_row < K) will be false (loading 0), while the mutated condition (A_row <= K) will be true, causing an out-of-bounds memory access. This may lead to a crash or reading of uninitialized memory, producing a different numerical result.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Choose K=31 (not multiple of 32), M=1024, N=2048 as in original\n    K = 31\n    M = 1024\n    N = 2048\n    torch.manual_seed(42)  # for reproducibility\n    A = torch.randn(K, M, device=device, dtype=torch.float32)\n    B = torch.randn(K, N, device=device, dtype=torch.float32)\n    return [A, B]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survived previous tests likely because the out-of-bounds memory access (when A_row == K) read from uninitialized or zeroed memory, resulting in the same value (zero) as the original's conditional zero-fill. The tool may handle out-of-bounds accesses without crashing, and the read values matched the original's zero. To kill the mutant, we must ensure the out-of-bounds access reads a known non-zero value, creating a detectable difference in the output.",
+      "kill_strategy": "Create tensor A as a view of a larger allocation that includes an extra row filled with non-zero values. Choose K not a multiple of TILE_SIZE so that a thread with A_row = K exists. The mutant will load the non-zero value from the extra row, while the original loads zero, causing a numerical difference in the output.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    K = 31\n    M = 1024\n    N = 2048\n    # Allocate larger tensor for A with extra row\n    A_large = torch.zeros(K+1, M, device=device, dtype=torch.float32)\n    A_large[K, :] = 1.0  # Extra row set to non-zero\n    A = A_large[:K, :]   # Shape (K, M), but underlying memory includes extra row\n    B = torch.ones(K, N, device=device, dtype=torch.float32)\n    return [A, B]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutant survives because while it allows reading one extra element beyond valid indices (A_row == K), the corresponding B tile loading condition (line 45) remains strict (B_row < K). Therefore, in the last tile when A_row == K, the mutant reads one extra value from A's memory, but Bs is zero-filled at that position. Since matrix multiplication is a dot product over K, the extra term becomes A[K][col] * 0 = 0, leaving the final sum unchanged. The previous attempts failed because they didn't account for B's conditional zeroing. Additionally, GPU memory may have padding preventing crashes, and numerical differences were neutralized by B's zero value.",
+      "kill_strategy": "The mutant is unkillable because the mutated condition only affects A loading, but the corresponding B value is always zero when A_row == K (due to B_row < K). Thus, the extra term contributes nothing to the dot product. To kill the mutant, we would need to also mutate B's condition to allow B_row == K when A_row == K, but that's not this mutation.",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel's robustness weakness is insufficient memory access boundary validation. The mutation survives because the kernel only partially guards out-of-bounds reads: when A_row == K, it reads potentially invalid memory, but relies on B's zero-filling to neutralize the effect. This is dangerous as it may cause illegal memory access violations on different GPU architectures or memory layouts. The kernel should use complete boundary checks for both A and B tile loading, ensuring no thread ever reads outside allocated tensor bounds, regardless of subsequent arithmetic operations. Additionally, the tiling loop condition should explicitly prevent out-of-bounds indices rather than relying on conditional zero-filling inside the tile.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized matrix multiplication with tiling\nmatmul_transpose_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\nconst int TILE_SIZE = 32;\n\n__global__ void matmul_transpose_kernel(\n    const float* A,  // shape: [K, M]\n    const float* B,  // shape: [K, N]\n    float* C,        // shape: [M, N]\n    int M, int K, int N) {\n    \n    // Shared memory for tiles\n    __shared__ float As[TILE_SIZE][TILE_SIZE];\n    __shared__ float Bs[TILE_SIZE][TILE_SIZE];\n    \n    int bx = blockIdx.x, by = blockIdx.y;\n    int tx = threadIdx.x, ty = threadIdx.y;\n    \n    // Row and column of C to compute\n    int row = by * TILE_SIZE + ty;\n    int col = bx * TILE_SIZE + tx;\n    \n    float sum = 0.0f;\n    \n    // Loop over tiles - compute exact number of full tiles needed\n    int num_tiles = (K + TILE_SIZE - 1) / TILE_SIZE;\n    \n    for (int t = 0; t < num_tiles; ++t) {\n        // Load A tile (transposed access: A[K][M] -> As[M][K])\n        int A_row = t * TILE_SIZE + tx;\n        int A_col = row;\n        \n        // Complete boundary check - read only when BOTH indices are valid\n        bool a_inbounds = (A_row < K) && (A_col < M);\n        As[ty][tx] = a_inbounds ? A[A_row * M + A_col] : 0.0f;\n        \n        // Load B tile with complete boundary check\n        int B_row = t * TILE_SIZE + ty;\n        int B_col = col;\n        bool b_inbounds = (B_row < K) && (B_col < N);\n        Bs[ty][tx] = b_inbounds ? B[B_row * N + B_col] : 0.0f;\n        \n        __syncthreads();\n        \n        // Compute partial sum - only over valid elements within tile\n        for (int k = 0; k < TILE_SIZE; ++k) {\n            // Additional safety: ensure we don't accumulate from invalid global indices\n            int global_k = t * TILE_SIZE + k;\n            if (global_k < K) {\n                sum += As[ty][k] * Bs[k][tx];\n            }\n        }\n        \n        __syncthreads();\n    }\n    \n    // Write result with boundary check\n    if (row < M && col < N) {\n        C[row * N + col] = sum;\n    }\n}\n\ntorch::Tensor matmul_transpose_cuda(torch::Tensor A, torch::Tensor B) {\n    // A: [K, M], B: [K, N]\n    int K = A.size(0);\n    int M = A.size(1);\n    int N = B.size(1);\n    \n    // Validate input dimensions\n    TORCH_CHECK(K == B.size(0), \"Dimension mismatch: A.shape[0] must equal B.shape[0]\");\n    \n    // Output: [M, N]\n    auto C = torch::zeros({M, N}, A.options());\n    \n    // Configure grid and block dimensions\n    dim3 block(TILE_SIZE, TILE_SIZE);\n    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);\n    \n    // Launch kernel only if there's work to do\n    if (M > 0 && N > 0 && K > 0) {\n        matmul_transpose_kernel<<<grid, block>>>(\n            A.data_ptr<float>(),\n            B.data_ptr<float>(),\n            C.data_ptr<float>(),\n            M, K, N\n        );\n    }\n    \n    return C;\n}\n\"\"\"\n\nmatmul_transpose_cpp_source = \"\"\"\ntorch::Tensor matmul_transpose_cuda(torch::Tensor A, torch::Tensor B);\n\"\"\"\n\n# Compile the inline CUDA code\nmatmul_transpose = load_inline(\n    name=\"matmul_transpose\",\n    cpp_sources=matmul_transpose_cpp_source,\n    cuda_sources=matmul_transpose_source,\n    functions=[\"matmul_transpose_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model with custom CUDA kernel for matrix multiplication with transpose\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.matmul_transpose = matmul_transpose\n    \n    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Performs optimized matrix multiplication C = A^T * B\n        \n        Args:\n            A: Input tensor of shape (K, M).\n            B: Input tensor of shape (K, N).\n            \n        Returns:\n            Output tensor of shape (M, N).\n        \"\"\"\n        return self.matmul_transpose.matmul_transpose_cuda(A, B)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Kernel Design Resilience"
+}

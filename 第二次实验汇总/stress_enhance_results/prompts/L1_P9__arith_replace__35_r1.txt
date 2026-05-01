@@ -1,0 +1,581 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 0 rounds of bitwise comparison)
+- Enhanced deterministic testing (5 dimensions, 126 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized tall-skinny matrix multiplication
+tall_skinny_matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Optimized kernel for A(M,K) * B(K,N) where M=16384, K=16, N=16384
+// Using shared memory tiling and register blocking
+__global__ void tall_skinny_matmul_kernel(
+    const float* __restrict__ A,  // shape: [M, K] where K=16
+    const float* __restrict__ B,  // shape: [K, N] where K=16
+    float* __restrict__ C,        // shape: [M, N]
+    int M, int K, int N
+) {
+    // Tile sizes
+    const int TILE_M = 64;
+    const int TILE_N = 64;
+    
+    // Block dimensions
+    const int BLOCK_SIZE = 256;
+    const int THREADS_PER_ROW = TILE_M / 4;  // 16 threads handle one row
+    const int THREADS_PER_COL = TILE_N / 4;  // 16 threads handle one column
+    
+    // Shared memory for A and B tiles
+    __shared__ float A_tile[TILE_M][16];
+    __shared__ float B_tile[16][TILE_N];
+    
+    // Thread indices
+    int tid = threadIdx.x;
+    int block_row = blockIdx.y * TILE_M;
+    int block_col = blockIdx.x * TILE_N;
+    
+    // Each thread handles 4x4 elements
+    int thread_row = (tid / THREADS_PER_COL) * 4;
+    int thread_col = (tid % THREADS_PER_COL) * 4;
+    
+    // Global row/col indices for this thread
+    int global_row = block_row + thread_row;
+    int global_col = block_col + thread_col;
+    
+    // Register accumulators for 4x4 output tile
+    float accum[4][4] = {{0.0f}};
+    
+    // Loop over K dimension in chunks of 16
+    for (int k_step = 0; k_step < K; k_step += 16) {
+        // Load A tile into shared memory (coalesced)
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int load_row = block_row + thread_row + i;
+            int load_k = k_step + (tid % 16);
+            
+            if (load_row < M && load_k < K) {
+                A_tile[thread_row + i][tid % 16] = A[load_row * K + load_k];
+            } else if (load_k < K) {
+                A_tile[thread_row + i][tid % 16] = 0.0f;
+            }
+        }
+        
+        // Load B tile into shared memory (coalesced)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int load_col = block_col + thread_col + j;
+            int load_k = k_step + (tid / 16);
+            
+            if (load_k < K && load_col < N) {
+                B_tile[tid / 16][thread_col + j] = B[load_k * N + load_col];
+            } else if (load_k < K) {
+                B_tile[tid / 16][thread_col + j] = 0.0f;
+            }
+        }
+        
+        __syncthreads();
+        
+        // Compute partial matrix multiplication
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            // Load A values for this thread
+            float a_vals[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                a_vals[i] = A_tile[thread_row + i][k];
+            }
+            
+            // Load B values for this thread
+            float b_vals[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                b_vals[j] = B_tile[k][thread_col + j];
+            }
+            
+            // Update accumulators
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    accum[i][j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+        
+        __syncthreads();
+    }
+    
+    // Write results to global memory
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int row = global_row + i;
+            int col = global_col + j;
+            
+            if (row < M && col < N) {
+                C[row * N + col] = accum[i][j];
+            }
+        }
+    }
+}
+
+torch::Tensor optimized_matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    auto sizes_A = A.sizes();
+    auto sizes_B = B.sizes();
+    
+    int M = sizes_A[0];
+    int K = sizes_A[1];
+    int N = sizes_B[1];
+    
+    // Create output tensor
+    auto C = torch::zeros({M, N}, A.options());
+    
+    // Special optimized case for 16384x16 * 16x16384
+    if (M == 16384 && K == 16 && N == 16384) {
+        // Configure grid and block
+        dim3 block_size(256);  // 256 threads per block
+        dim3 grid_size((N + 63) / 64, (M + 63) / 64);  // ceil(N/64) x ceil(M/64)
+        
+        // Launch kernel
+        tall_skinny_matmul_kernel<<<grid_size, block_size>>>(
+            A.data_ptr<float>(),
+            B.data_ptr<float>(),
+            C.data_ptr<float>(),
+            M, K, N
+        );
+        
+        // Check for CUDA errors
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        
+        // Synchronize to ensure kernel completes
+        cudaDeviceSynchronize();
+    } else {
+        // Fall back to torch.matmul for other cases
+        C = torch::matmul(A, B);
+    }
+    
+    return C;
+}
+"""
+
+optimized_matmul_cpp_source = """
+torch::Tensor optimized_matmul_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+# Compile the inline CUDA code
+optimized_matmul = load_inline(
+    name="optimized_matmul",
+    cpp_sources=optimized_matmul_cpp_source,
+    cuda_sources=tall_skinny_matmul_source,
+    functions=["optimized_matmul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with custom CUDA kernel for tall-skinny matrix multiplication
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.optimized_matmul = optimized_matmul
+    
+    def forward(self, A, B):
+        """
+        Performs optimized matrix multiplication with custom CUDA kernel.
+        
+        Args:
+            A (torch.Tensor): Input matrix of shape (M, K)
+            B (torch.Tensor): Input matrix of shape (K, N)
+            
+        Returns:
+            torch.Tensor: Output matrix of shape (M, N)
+        """
+        return self.optimized_matmul.optimized_matmul_cuda(A, B)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized tall-skinny matrix multiplication
+tall_skinny_matmul_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+// Optimized kernel for A(M,K) * B(K,N) where M=16384, K=16, N=16384
+// Using shared memory tiling and register blocking
+__global__ void tall_skinny_matmul_kernel(
+    const float* __restrict__ A,  // shape: [M, K] where K=16
+    const float* __restrict__ B,  // shape: [K, N] where K=16
+    float* __restrict__ C,        // shape: [M, N]
+    int M, int K, int N
+) {
+    // Tile sizes
+    const int TILE_M = 64;
+    const int TILE_N = 64;
+    
+    // Block dimensions
+    const int BLOCK_SIZE = 256;
+    const int THREADS_PER_ROW = TILE_M / 4;  // 16 threads handle one row
+    const int THREADS_PER_COL = TILE_N / 4;  // 16 threads handle one column
+    
+    // Shared memory for A and B tiles
+    __shared__ float A_tile[TILE_M][16];
+    __shared__ float B_tile[16][TILE_N];
+    
+    // Thread indices
+    int tid = threadIdx.x;
+    int block_row = blockIdx.y * TILE_M;
+    int block_col = blockIdx.x * TILE_N;
+    
+    // Each thread handles 4x4 elements
+    int thread_row = (tid / THREADS_PER_COL) * 4;
+    int thread_col = (tid % THREADS_PER_COL) * 4;
+    
+    // Global row/col indices for this thread
+    int global_row = block_row + thread_row;
+    int global_col = block_col + thread_col;
+    
+    // Register accumulators for 4x4 output tile
+    float accum[4][4] = {{0.0f}};
+    
+    // Loop over K dimension in chunks of 16
+    for (int k_step = 0; k_step < K; k_step += 16) {
+        // Load A tile into shared memory (coalesced)
+        #pragma unroll
+        for (int i = 0; i < 4; i++) {
+            int load_row = block_row + thread_row + i;
+            int load_k = k_step + (tid % 16);
+            
+            if (load_row < M && load_k < K) {
+                A_tile[thread_row + i][tid % 16] = A[load_row * K + load_k];
+            } else if (load_k < K) {
+                A_tile[thread_row + i][tid % 16] = 0.0f;
+            }
+        }
+        
+        // Load B tile into shared memory (coalesced)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int load_col = block_col + thread_col + j;
+            int load_k = k_step + (tid / 16);
+            
+            if (load_k < K && load_col < N) {
+                B_tile[tid / 16][thread_col + j] = B[load_k * N + load_col];
+            } else if (load_k < K) {
+                B_tile[tid / 16][thread_col + j] = 0.0f;
+            }
+        }
+        
+        __syncthreads();
+        
+        // Compute partial matrix multiplication
+        #pragma unroll
+        for (int k = 0; k < 16; k++) {
+            // Load A values for this thread
+            float a_vals[4];
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                a_vals[i] = A_tile[thread_row + i][k];
+            }
+            
+            // Load B values for this thread
+            float b_vals[4];
+            #pragma unroll
+            for (int j = 0; j < 4; j++) {
+                b_vals[j] = B_tile[k][thread_col + j];
+            }
+            
+            // Update accumulators
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                #pragma unroll
+                for (int j = 0; j < 4; j++) {
+                    accum[i][j] += a_vals[i] * b_vals[j];
+                }
+            }
+        }
+        
+        __syncthreads();
+    }
+    
+    // Write results to global memory
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        #pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int row = global_row + i;
+            int col = global_col + j;
+            
+            if (row < M && col < N) {
+                C[row * N + col] = accum[i][j];
+            }
+        }
+    }
+}
+
+torch::Tensor optimized_matmul_cuda(torch::Tensor A, torch::Tensor B) {
+    auto sizes_A = A.sizes();
+    auto sizes_B = B.sizes();
+    
+    int M = sizes_A[0];
+    int K = sizes_A[1];
+    int N = sizes_B[1];
+    
+    // Create output tensor
+    auto C = torch::zeros({M, N}, A.options());
+    
+    // Special optimized case for 16384x16 * 16x16384
+    if (M == 16384 && K == 16 && N == 16384) {
+        // Configure grid and block
+        dim3 block_size(256);  // 256 threads per block
+        dim3 grid_size((N + 63) * 64, (M + 63) / 64);  // ceil(N/64) x ceil(M/64)
+        
+        // Launch kernel
+        tall_skinny_matmul_kernel<<<grid_size, block_size>>>(
+            A.data_ptr<float>(),
+            B.data_ptr<float>(),
+            C.data_ptr<float>(),
+            M, K, N
+        );
+        
+        // Check for CUDA errors
+        cudaError_t err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            throw std::runtime_error(cudaGetErrorString(err));
+        }
+        
+        // Synchronize to ensure kernel completes
+        cudaDeviceSynchronize();
+    } else {
+        // Fall back to torch.matmul for other cases
+        C = torch::matmul(A, B);
+    }
+    
+    return C;
+}
+"""
+
+optimized_matmul_cpp_source = """
+torch::Tensor optimized_matmul_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+# Compile the inline CUDA code
+optimized_matmul = load_inline(
+    name="optimized_matmul",
+    cpp_sources=optimized_matmul_cpp_source,
+    cuda_sources=tall_skinny_matmul_source,
+    functions=["optimized_matmul_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with custom CUDA kernel for tall-skinny matrix multiplication
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.optimized_matmul = optimized_matmul
+    
+    def forward(self, A, B):
+        """
+        Performs optimized matrix multiplication with custom CUDA kernel.
+        
+        Args:
+            A (torch.Tensor): Input matrix of shape (M, K)
+            B (torch.Tensor): Input matrix of shape (K, N)
+            
+        Returns:
+            torch.Tensor: Output matrix of shape (M, N)
+        """
+        return self.optimized_matmul.optimized_matmul_cuda(A, B)
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 137
+- Original fragment: `/`
+- node_type: cuda_Div
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[16384, 16], dtype=torch.float32
+  arg[1]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 137
+- Original fragment: `/`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Error: worker_timeout_or_crash
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 63 / 63 rounds. Result: ALL SURVIVED (bitwise identical)
+  - large_magnitude seed=42: survived
+  - large_magnitude seed=43: survived
+  - large_magnitude seed=44: survived
+  - mixed_extremes seed=45: survived
+  - mixed_extremes seed=46: survived
+  - mixed_extremes seed=47: survived
+  - dense_nonzero seed=48: survived
+  - dense_nonzero seed=49: survived
+  - dense_nonzero seed=50: survived
+  - near_overflow seed=51: survived
+  - near_overflow seed=52: survived
+  - near_overflow seed=53: survived
+  - near_zero seed=54: survived
+  - near_zero seed=55: survived
+  - near_zero seed=56: survived
+  - denormals seed=57: survived
+  - denormals seed=58: survived
+  - denormals seed=59: survived
+  - all_negative seed=60: survived
+  - all_negative seed=61: survived
+  - all_negative seed=62: survived
+  - all_positive seed=63: survived
+  - all_positive seed=64: survived
+  - all_positive seed=65: survived
+  - alternating_sign seed=66: survived
+  - alternating_sign seed=67: survived
+  - alternating_sign seed=68: survived
+  - sparse seed=69: survived
+  - sparse seed=70: survived
+  - sparse seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+Result: ALL SURVIVED
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- boundary_last_element: all-zero baseline with last valid element amplified
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- large_magnitude: values ~1e6, tests large-number accumulation
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- near_zero: values ~1e-7, tests near-zero sensitivity
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse: 90% zeros, 10% random non-zero
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- structured_ramp: linearly increasing 0→N, index-visible pattern
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

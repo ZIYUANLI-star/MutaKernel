@@ -1,0 +1,380 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused hinge loss computation
+hinge_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {
+    __shared__ float shared_mem[256];
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    
+    float thread_loss = 0.0f;
+    
+    if (idx < size) {
+        float margin = 1.0f - predictions[idx] * targets[idx];
+        thread_loss = margin > 0.0f ? margin : 0.0f;
+    }
+    
+    shared_mem[tid] = thread_loss;
+    __syncthreads();
+    
+    // Parallel reduction for sum within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_mem[tid] += shared_mem[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // First thread writes block sum to global memory
+    if (tid == 0) {
+        loss[blockIdx.x] = shared_mem[0];
+    }
+}
+
+torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto size = predictions.numel();
+    
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    
+    // Allocate device memory for block sums
+    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));
+    
+    // Launch kernel
+    hinge_loss_kernel<<<num_blocks, block_size>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        block_sums.data_ptr<float>(),
+        size
+    );
+    
+    // Final reduction on CPU (small number of elements)
+    auto final_loss = block_sums.sum() / size;
+    
+    return final_loss;
+}
+"""
+
+hinge_loss_cpp_source = "torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);"
+
+# Compile the inline CUDA code for hinge loss
+hinge_loss_module = load_inline(
+    name="hinge_loss",
+    cpp_sources=hinge_loss_cpp_source,
+    cuda_sources=hinge_loss_source,
+    functions=["hinge_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Hinge Loss using custom CUDA kernel.
+    Fuses clamp, multiplication, subtraction, and mean operations.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.hinge_loss_kernel = hinge_loss_module
+
+    def forward(self, predictions, targets):
+        # Ensure tensors are contiguous and have same shape
+        predictions = predictions.contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+        
+        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for fused hinge loss computation
+hinge_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {
+    __shared__ float shared_mem[256];
+    
+    int idx = blockIdx.z * blockDim.x + threadIdx.x;
+    int tid = threadIdx.x;
+    
+    float thread_loss = 0.0f;
+    
+    if (idx < size) {
+        float margin = 1.0f - predictions[idx] * targets[idx];
+        thread_loss = margin > 0.0f ? margin : 0.0f;
+    }
+    
+    shared_mem[tid] = thread_loss;
+    __syncthreads();
+    
+    // Parallel reduction for sum within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_mem[tid] += shared_mem[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // First thread writes block sum to global memory
+    if (tid == 0) {
+        loss[blockIdx.x] = shared_mem[0];
+    }
+}
+
+torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto size = predictions.numel();
+    
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    
+    // Allocate device memory for block sums
+    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));
+    
+    // Launch kernel
+    hinge_loss_kernel<<<num_blocks, block_size>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        block_sums.data_ptr<float>(),
+        size
+    );
+    
+    // Final reduction on CPU (small number of elements)
+    auto final_loss = block_sums.sum() / size;
+    
+    return final_loss;
+}
+"""
+
+hinge_loss_cpp_source = "torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);"
+
+# Compile the inline CUDA code for hinge loss
+hinge_loss_module = load_inline(
+    name="hinge_loss",
+    cpp_sources=hinge_loss_cpp_source,
+    cuda_sources=hinge_loss_source,
+    functions=["hinge_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Hinge Loss using custom CUDA kernel.
+    Fuses clamp, multiplication, subtraction, and mean operations.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.hinge_loss_kernel = hinge_loss_module
+
+    def forward(self, predictions, targets):
+        # Ensure tensors are contiguous and have same shape
+        predictions = predictions.contiguous().view(-1)
+        targets = targets.contiguous().view(-1)
+        
+        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 13
+- Original fragment: `blockIdx.x`
+- node_type: cuda_dim|z
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[128, 1], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 1], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 13
+- Original fragment: `blockIdx.x`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [128, 1], 'dtype': 'torch.float32', 'min': -2.301694631576538, 'max': 3.0185158252716064, 'mean': 0.08119934797286987, 'has_nan': False, 'has_inf': False}, {'shape': [128, 1], 'dtype': 'torch.float32', 'min': -1.0, 'max': 1.0, 'mean': 0.15625, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [128, 1], 'dtype': 'torch.float32', 'min': -2.3075122833251953, 'max': 10000.0, 'mean': 78.07088470458984, 'has_nan': False, 'has_inf': False}, {'shape': [128, 1], 'dtype': 'torch.float32', 'min': -2.8199408054351807, 'max': 10000.0, 'mean': 78.26254272460938, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes `blockIdx.x` to `blockIdx.z`, which affects the thread index calculation. However, the kernel launch configuration uses `<<<num_blocks, block_size>>>` with only 1D grid dimensions (x dimension only). In CUDA, when only one dimension is specified, `blockIdx.y` and `blockIdx.z` are always 0. Therefore, `blockIdx.z * blockDim.x + threadIdx.x` always equals `threadIdx.x`, which is different from the original `blockIdx.x * blockDim.x + threadIdx.x`. This means threads will comput
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - near_overflow seed=42: survived
+  - near_overflow seed=43: survived
+  - near_overflow seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - near_zero seed=47: survived
+  - near_zero seed=48: survived
+  - near_zero seed=49: survived
+  - near_zero seed=50: survived
+  - near_zero seed=51: survived
+  - denormals seed=52: survived
+  - denormals seed=53: survived
+  - denormals seed=54: survived
+  - denormals seed=55: survived
+  - denormals seed=56: survived
+  - all_negative seed=57: survived
+  - all_negative seed=58: survived
+  - all_negative seed=59: survived
+  - all_negative seed=60: survived
+  - all_negative seed=61: survived
+  - all_positive seed=62: survived
+  - all_positive seed=63: survived
+  - all_positive seed=64: survived
+  - all_positive seed=65: survived
+  - all_positive seed=66: survived
+  - mixed_extremes seed=67: survived
+  - mixed_extremes seed=68: survived
+  - mixed_extremes seed=69: survived
+  - mixed_extremes seed=70: survived
+  - mixed_extremes seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- near_zero: values ~1e-7, tests near-zero sensitivity
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

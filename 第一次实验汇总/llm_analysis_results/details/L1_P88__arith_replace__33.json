@@ -1,0 +1,57 @@
+{
+  "mutant_id": "L1_P88__arith_replace__33",
+  "kernel_name": "L1_P88",
+  "operator_name": "arith_replace",
+  "status": "survived",
+  "survival_reason": "The previous tests attempted to use half-precision (float16) inputs to target the mutated half specialization, but both the original and mutant kernels failed (original_ok=False, mutant_ok=False), suggesting an infrastructure issue. The Input Specification requires float32 inputs, not float16. Since the mutation is only in the half template specialization, float32 inputs would invoke a different kernel (float specialization) untouched by the mutation, making the mutant unkillable under the given constraints. The mutant survived because the test harness likely doesn't support half-precision execution, or the kernel dispatch for half fails due to missing compilation/execution support, preventing any differential behavior from being observed.",
+  "killable": false,
+  "kill_strategy": "No viable input can kill the mutant because the required half-precision execution path appears broken or unreachable. The mutation is isolated to the half specialization, but the test environment either cannot run half kernels or the input specification forces float32, which bypasses the mutation entirely.",
+  "recommendations": "Fix the test infrastructure to properly support half-precision kernel execution if targeting this mutation. Alternatively, adjust the mutation testing to include half-precision inputs in the specification, or verify that the half specialization is actually reachable. The mutant is equivalent to the original for all valid inputs under the current constraints.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because all stress tests were executed with the original input dtype (torch.float32), which triggers the float32 specialization of the gelu_kernel. The mutation is located in the half specialization (template<half>), so the mutated code was never executed during testing. The AT_DISPATCH_FLOATING_TYPES_AND_HALF macro selects the appropriate kernel based on input scalar_type, and since the test inputs were always float32, the half kernel (and thus the mutation) was never invoked.",
+      "kill_strategy": "Execute the kernel with half-precision (torch.float16) input to force usage of the mutated template specialization. Include values that expose the arithmetic difference: x=0 causes division by zero (producing inf/NaN) versus multiplication by zero (producing 0), and values where 0.5/x differs from 0.5*x (e.g., x=2.0 or x=0.5). Also include |x|=1 where both expressions coincidentally match to verify they don't mask the difference.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    dtype = torch.float16\n    # Split 2000 rows into 4 segments of 500 each\n    part0 = torch.zeros(500, 2000, device=device, dtype=dtype)          # zeros -> division by zero in mutant\n    part1 = torch.ones(500, 2000, device=device, dtype=dtype)           # ones -> same result\n    part2 = torch.full((500, 2000), -1.0, device=device, dtype=dtype)   # -1 -> same result\n    part3 = torch.full((500, 2000), 2.0, device=device, dtype=dtype)    # 2 -> different result\n    input_tensor = torch.cat([part0, part1, part2, part3], dim=0)\n    return [input_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=nan, mean_diff=nan, ref_range=[-1.5894e-01,1.9551e+00], mut_range=[nan,nan]",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The previous test used a tensor containing zeros, which caused division-by-zero in the mutant (producing inf/NaN). However, the verification results show both original_ok=False and mutant_ok=False, indicating the original kernel also produced invalid output (likely NaN/inf). This suggests the original kernel may have a bug or numerical instability for half-precision inputs (e.g., the fast_tanh implementation may produce NaN for certain inputs when using half precision). Since both kernels produced invalid outputs, the mutant survived because the test did not distinguish between them—the mutation was not the sole cause of failure. The mutant may also be coincidentally equivalent at x=±1, but that alone wouldn't explain survival if zeros caused both to fail.",
+      "kill_strategy": "Avoid zeros and ensure inputs are within a numerically stable range for the original kernel. Use a tensor of small, non-zero, non-unit magnitude values where 0.5/x differs significantly from 0.5*x, and verify both kernels produce finite outputs. Focus on positive values between 0.2 and 0.8 (excluding 0.5 due to potential rounding) to minimize risk of overflow/underflow and ensure the fast_tanh function remains stable.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    dtype = torch.float16\n    torch.manual_seed(42)\n    # Generate random values in [0.2, 0.8)\n    input_tensor = torch.rand(2000, 2000, device=device, dtype=torch.float32) * 0.6 + 0.2\n    # Convert to half precision\n    input_tensor = input_tensor.to(dtype)\n    # Ensure no value is exactly 0.5 (unlikely but adjust if needed)\n    # This step is optional but safe\n    with torch.no_grad():\n        input_tensor[input_tensor == 0.5] = 0.5001\n    return [input_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=nan, mean_diff=nan, ref_range=[1.1578e-01,6.3037e-01], mut_range=[nan,nan]",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The previous tests attempted to use half-precision (float16) inputs to target the mutated half specialization, but both the original and mutant kernels failed (original_ok=False, mutant_ok=False), suggesting an infrastructure issue. The Input Specification requires float32 inputs, not float16. Since the mutation is only in the half template specialization, float32 inputs would invoke a different kernel (float specialization) untouched by the mutation, making the mutant unkillable under the given constraints. The mutant survived because the test harness likely doesn't support half-precision execution, or the kernel dispatch for half fails due to missing compilation/execution support, preventing any differential behavior from being observed.",
+      "kill_strategy": "No viable input can kill the mutant because the required half-precision execution path appears broken or unreachable. The mutation is isolated to the half specialization, but the test environment either cannot run half kernels or the input specification forces float32, which bypasses the mutation entirely.",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel has a critical weakness: it lacks defensive type consistency checking between template specializations. The mutation in the half-precision specialization went undetected because the test harness didn't exercise that code path. A robust kernel should ensure all specializations compute mathematically equivalent results through shared implementation or validation logic. Currently, the float/double and half specializations are independent implementations, allowing subtle bugs to hide in untested type paths. The code should either: 1) Use a single unified template that handles all types consistently, or 2) Add compile-time or runtime validation that all specializations produce equivalent results for sample inputs.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for GELU computation\ngelu_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAGuard.h>\n#include <math.h>\n\nnamespace {\nconstexpr float GELU_COEF = 0.044715f;\nconstexpr float SQRT_2_OVER_PI = 0.7978845608028654f;  // sqrt(2/π)\n}\n\ntemplate<typename T>\n__device__ T fast_tanh(T x) {\n    // More accurate tanh approximation for GELU\n    if (x < -4.97f) return T(-1.0f);\n    if (x > 4.97f) return T(1.0f);\n    T x2 = x * x;\n    T a = x * (T(135135.0f) + x2 * (T(17325.0f) + x2 * (T(378.0f) + x2)));\n    T b = T(135135.0f) + x2 * (T(62370.0f) + x2 * (T(3150.0f) + x2 * T(28.0f)));\n    return a / b;\n}\n\ntemplate<typename T>\n__device__ T compute_gelu(T x) {\n    // Unified computation that works for all floating types\n    T x_cubed = x * x * x;\n    T inner = T(SQRT_2_OVER_PI) * (x + T(GELU_COEF) * x_cubed);\n    T tanh_val = fast_tanh<T>(inner);\n    return T(0.5f) * x * (T(1.0f) + tanh_val);\n}\n\ntemplate<typename T>\n__global__ void gelu_kernel(const T* __restrict__ input, T* __restrict__ output, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    \n    if (idx < size) {\n        output[idx] = compute_gelu<T>(input[idx]);\n    }\n}\n\n// Specialization for half using conversion to float for computation\n// but following the EXACT same mathematical sequence as the template\ntemplate<>\n__global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    \n    if (idx < size) {\n        // Convert to float, compute using the SAME function as other types,\n        // then convert back - ensuring mathematical consistency\n        float x = __half2float(input[idx]);\n        float result = compute_gelu<float>(x);\n        output[idx] = __float2half(result);\n    }\n}\n\ntorch::Tensor gelu_cuda(torch::Tensor input) {\n    at::cuda::CUDAGuard guard(input.device());\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    // Validate input type is supported\n    TORCH_CHECK(input.scalar_type() == at::ScalarType::Float || \n                input.scalar_type() == at::ScalarType::Double ||\n                input.scalar_type() == at::ScalarType::Half,\n                \"gelu_cuda only supports float32, float64, and float16\");\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"gelu_cuda\", [&] {\n        gelu_kernel<scalar_t><<<num_blocks, block_size>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\ngelu_cpp_source = \"torch::Tensor gelu_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code for GELU\ngelu_module = load_inline(\n    name=\"gelu\",\n    cpp_sources=gelu_cpp_source,\n    cuda_sources=gelu_source,\n    functions=[\"gelu_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.gelu_cuda = gelu_module.gelu_cuda\n    \n    def forward(self, x):\n        return self.gelu_cuda(x)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Ineffective Mutation"
+}

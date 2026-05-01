@@ -1,0 +1,384 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 0 rounds of bitwise comparison)
+- Enhanced deterministic testing (5 dimensions, 68 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized L2 normalization
+l2_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename T>
+__global__ void l2_norm_kernel(const T* __restrict__ input, T* __restrict__ output, 
+                               int batch_size, int dim) {
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    // Use 256 threads per block (power of 2 for reduction)
+    const int threads = 256;
+    
+    // Shared memory for reduction
+    __shared__ float sdata[256];
+    
+    // Each thread processes multiple elements
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads
+    for (int i = tid; i < dim; i += threads) {
+        int idx = batch_idx * dim + i;
+        float val = static_cast<float>(input[idx]);
+        thread_sum += val * val;
+    }
+    
+    // Parallel reduction
+    sdata[tid] = thread_sum;
+    __syncthreads();
+    
+    // Tree reduction
+    for (int stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Compute reciprocal of L2 norm (1 / sqrt(sum))
+    float scale = 0.0f;
+    if (tid == 0) {
+        float norm = sqrtf(sdata[0] + 1e-8f);
+        scale = 1.0f / norm;
+        sdata[0] = scale;
+    }
+    __syncthreads();
+    
+    scale = sdata[0];
+    
+    // Normalize elements
+    for (int i = tid; i < dim; i += threads) {
+        int idx = batch_idx * dim + i;
+        float val = static_cast<float>(input[idx]);
+        output[idx] = static_cast<T>(val * scale);
+    }
+}
+
+torch::Tensor l2_norm_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto dim = input.size(1);
+    auto output = torch::empty_like(input);
+    
+    const int threads = 256;
+    const int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "l2_norm_cuda", ([&] {
+        l2_norm_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            dim
+        );
+    }));
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+l2_norm_cpp_source = "torch::Tensor l2_norm_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code for L2 normalization
+l2_norm_module = load_inline(
+    name="l2_norm",
+    cpp_sources=l2_norm_cpp_source,
+    cuda_sources=l2_norm_source,
+    functions=["l2_norm_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized L2 normalization model with custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L2 normalization using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, dim).
+            
+        Returns:
+            torch.Tensor: L2 normalized tensor, same shape as input.
+        """
+        # Ensure tensor is on CUDA device
+        if not x.is_cuda:
+            x = x.cuda()
+            
+        return l2_norm_module.l2_norm_cuda(x)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized L2 normalization
+l2_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename T>
+__global__ void l2_norm_kernel(const T* __restrict__ input, T* __restrict__ output, 
+                               int batch_size, int dim) {
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    // Use 256 threads per block (power of 2 for reduction)
+    const int threads = 256;
+    
+    // Shared memory for reduction
+    __shared__ float sdata[256];
+    
+    // Each thread processes multiple elements
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads
+    for (int i = tid; i < dim; i += threads) {
+        int idx = batch_idx * dim + i;
+        float val = static_cast<float>(input[idx]);
+        thread_sum += val * val;
+    }
+    
+    // Parallel reduction
+    sdata[tid] = thread_sum;
+    __syncthreads();
+    
+    // Tree reduction
+    for (int stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Compute reciprocal of L2 norm (1 / sqrt(sum))
+    float scale = 0.0f;
+    if (tid == 0) {
+        float norm = sqrtf(sdata[0] - 1e-8f);
+        scale = 1.0f / norm;
+        sdata[0] = scale;
+    }
+    __syncthreads();
+    
+    scale = sdata[0];
+    
+    // Normalize elements
+    for (int i = tid; i < dim; i += threads) {
+        int idx = batch_idx * dim + i;
+        float val = static_cast<float>(input[idx]);
+        output[idx] = static_cast<T>(val * scale);
+    }
+}
+
+torch::Tensor l2_norm_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto dim = input.size(1);
+    auto output = torch::empty_like(input);
+    
+    const int threads = 256;
+    const int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "l2_norm_cuda", ([&] {
+        l2_norm_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            dim
+        );
+    }));
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+l2_norm_cpp_source = "torch::Tensor l2_norm_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code for L2 normalization
+l2_norm_module = load_inline(
+    name="l2_norm",
+    cpp_sources=l2_norm_cpp_source,
+    cuda_sources=l2_norm_source,
+    functions=["l2_norm_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized L2 normalization model with custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L2 normalization using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, dim).
+            
+        Returns:
+            torch.Tensor: L2 normalized tensor, same shape as input.
+        """
+        # Ensure tensor is on CUDA device
+        if not x.is_cuda:
+            x = x.cuda()
+            
+        return l2_norm_module.l2_norm_cuda(x)
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 49
+- Original fragment: `+`
+- node_type: cuda_Add
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 49
+- Original fragment: `+`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Error: worker_timeout_or_crash
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 5 / 63 rounds. Result: ALL SURVIVED (bitwise identical)
+  - large_magnitude seed=42: survived
+  - large_magnitude seed=43: survived
+  - large_magnitude seed=44: survived
+  - mixed_extremes seed=45: survived
+  - mixed_extremes seed=46: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+Result: ALL SURVIVED
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- large_magnitude: values ~1e6, tests large-number accumulation
+- mixed_extremes: mix of 1e6 and 1e-6 values
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

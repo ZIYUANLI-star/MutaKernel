@@ -1,0 +1,188 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+     217|             num_features (int): Number of features in the input tensor.
+     218|             num_groups (int): Number of groups to divide the channels into.
+     219|         """
+     220|         super(ModelNew, self).__init__()
+     221|         self.num_groups = num_groups
+     222|         self.num_features = num_features
+     223|         
+     224|         # Learnable parameters
+     225|         self.weight = nn.Parameter(torch.ones(num_features))
+     226|         self.bias = nn.Parameter(torch.zeros(num_features))
+     227|         
+     228|         # Small epsilon for numerical stability
+>>>  229|         self.eps = 1e-5
+     230|         
+     231|         # CUDA kernel
+     232|         self.group_norm_kernel = group_norm_cuda
+     233| 
+     234|     def forward(self, x: torch.Tensor) -> torch.Tensor:
+     235|         """
+     236|         Applies optimized Group Normalization to the input tensor.
+     237| 
+     238|         Args:
+     239|             x (torch.Tensor): Input tensor of shape (batch_size, num_features, *).
+     240| 
+     241|         Returns:
+```
+
+## Mutated Code (around mutation site)
+```
+     217|             num_features (int): Number of features in the input tensor.
+     218|             num_groups (int): Number of groups to divide the channels into.
+     219|         """
+     220|         super(ModelNew, self).__init__()
+     221|         self.num_groups = num_groups
+     222|         self.num_features = num_features
+     223|         
+     224|         # Learnable parameters
+     225|         self.weight = nn.Parameter(torch.ones(num_features))
+     226|         self.bias = nn.Parameter(torch.zeros(num_features))
+     227|         
+     228|         # Small epsilon for numerical stability
+>>>  229|         self.eps = 9.9e-06
+     230|         
+     231|         # CUDA kernel
+     232|         self.group_norm_kernel = group_norm_cuda
+     233| 
+     234|     def forward(self, x: torch.Tensor) -> torch.Tensor:
+     235|         """
+     236|         Applies optimized Group Normalization to the input tensor.
+     237| 
+     238|         Args:
+     239|             x (torch.Tensor): Input tensor of shape (batch_size, num_features, *).
+     240| 
+     241|         Returns:
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 229
+- Original fragment: `1e-5`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Create a regime where the variance within a normalization group is extremely small (comparable to eps) while maintaining large activation magnitudes. This maximizes the sensitivity of the denominator sqrt(variance + eps) to epsilon changes. Specifically, use values that create group variances around 1e-6 to 1e-5, with large mean offsets to ensure noticeable output differences when epsilon changes.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Shape: [batch=16, channels=64, height=256, width=256]
+    batch, channels, h, w = 16, 64, 256, 256
+    # Assume 8 groups (64 channels / 8 = 8 channels per group)
+    groups = 8
+    channels_per_group = channels // groups
+    
+    # Create tensor where each group has nearly constant values
+    x = torch.zeros(batch, channels, h, w, device=device)
+    
+    # Target variance slightly below epsilon to maximize sensitivity
+    target_variance = 1e-6  # Much smaller than eps
+    target_std = math.sqrt(target_variance)
+    
+    # Large mean offset to amplify differences
+    mean_offset = 100.0
+    
+    # For each group, create slightly varying values
+    for g in range(groups):
+        # Base value for this group
+        base = mean_offset + g * 10.0  # Different mean per group
+        # Add tiny variations (±1.5*std) to achieve target variance
+        # Use deterministic pattern for reproducibility
+        chan_start = g * channels_per_group
+        for c in range(channels_per_group):
+            # Create a spatial pattern with controlled variance
+            pattern = torch.randn(h, w, device=device) * target_std
+            # Rescale to exact target variance
+            current_var = pattern.var()
+            if current_var > 0:
+                pattern = pattern * math.sqrt(target_variance / current_var)
+            x[:, chan_start + c, :, :] = base + pattern
+    
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Exploit the scenario where variance is exactly zero or negative due to numerical precision issues. When all activations in a group are identical (zero variance), the denominator reduces to sqrt(eps), making the output directly proportional to 1/sqrt(eps). This amplifies the epsilon difference maximally. Use identical values across entire groups and add extremely small perturbations to create near-zero variance that's below machine epsilon for float32.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Shape: [batch=16, channels=64, height=256, width=256]
+    batch, channels, h, w = 16, 64, 256, 256
+    groups = 8  # Assume 8 groups (64/8=8 channels per group)
+    channels_per_group = channels // groups
+    
+    # Create tensor with identical large values per group
+    x = torch.zeros(batch, channels, h, w, device=device)
+    
+    # Large base value to amplify epsilon sensitivity
+    base_value = 1000.0
+    
+    # For each group, set ALL elements to the same base value
+    # Add microscopic variations (1e-7) to avoid exact numerical issues
+    # but variance remains effectively zero (<1e-13)
+    for g in range(groups):
+        group_base = base_value + g * 0.1  # Slight offset per group
+        chan_start = g * channels_per_group
+        
+        # Set entire group to identical values with tiny noise
+        for c in range(channels_per_group):
+            # Create identical pattern with microscopic noise
+            # Noise magnitude 1e-7 ensures variance ~1e-14 << eps
+            identical = torch.full((h, w), group_base, device=device)
+            noise = torch.randn(h, w, device=device) * 1e-7
+            x[:, chan_start + c, :, :] = identical + noise
+    
+    # Force variance calculation to see exact zero effect
+    # by making last group perfectly identical (no noise)
+    last_group_start = (groups-1) * channels_per_group
+    for c in range(channels_per_group):
+        x[:, last_group_start + c, :, :] = base_value + (groups-1)*0.1
+    
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=9.971203e-01, mean_diff=7.414900e-01, ref_range=[-9.0274e-03,1.2867e-02], mut_range=[-9.8774e-01,9.8774e-01]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

@@ -1,0 +1,2666 @@
+{
+  "kernel": {
+    "problem_id": 100,
+    "level": 1,
+    "problem_name": "L1_P100",
+    "language": "cuda"
+  },
+  "summary": {
+    "total": 16,
+    "killed": 5,
+    "survived": 7,
+    "stillborn": 2,
+    "strict_equivalent": 0,
+    "candidate_equivalent": 2,
+    "equivalent": 2,
+    "mutation_score": 0.3571,
+    "mutation_score_optimistic": 0.4167,
+    "score_by_category": {
+      "A": 0.3333,
+      "B": 0.375,
+      "C": 0.0,
+      "D": 0.0
+    }
+  },
+  "mutants": [
+    {
+      "id": "L1_P100__arith_replace__9",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L58",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 919.7614192962646,
+      "site": {
+        "line_start": 58,
+        "line_end": 58,
+        "original_code": "/",
+        "node_type": "cuda_Div"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() * size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__arith_replace__7",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L44",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 1238.368034362793,
+      "site": {
+        "line_start": 44,
+        "line_end": 44,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size + 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__arith_replace__7",
+        "operator": "arith_replace",
+        "line_start": 44,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "e33674d2c5ec852a",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "04c657a3b319c691",
+          "mutation_site_line": 44,
+          "original_fragment": "-",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 27,
+              "original": "const int num_blocks = (size + block_size - 1) / block_size;",
+              "mutated": "const int num_blocks = (size + block_size + 1) / block_size;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": false,
+          "equiv_runs": 100,
+          "operator_name": "arith_replace",
+          "time_ms": 600149,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [],
+          "tested_policies": [],
+          "total_rounds": 0,
+          "first_input_summary": null,
+          "last_input_summary": null,
+          "error": "worker_timeout_or_crash",
+          "divergence": {},
+          "verdict": "not_equivalent"
+        },
+        "decided_at": "layer2"
+      }
+    },
+    {
+      "id": "L1_P100__arith_replace__2",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L19",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 884.3519687652588,
+      "site": {
+        "line_start": 19,
+        "line_end": 19,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f + predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__relop_replace__3",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L27",
+      "status": "stillborn",
+      "error_message": "Subprocess timeout/crash (180s)",
+      "kill_input_seed": null,
+      "execution_time_ms": 180000,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": ">=",
+        "node_type": "cuda_GtE"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >> 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__relop_replace__2",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L27",
+      "status": "stillborn",
+      "error_message": "Subprocess timeout/crash (180s)",
+      "kill_input_seed": null,
+      "execution_time_ms": 180000,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride >= 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__relop_replace__4",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L28",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation changes the reduction condition from `tid < stride` to `tid <= stride`. This is on the execution path for all threads. When `tid == stride`, the original code does NOT perform the additio",
+      "kill_input_seed": null,
+      "execution_time_ms": 904.8986434936523,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "<",
+        "node_type": "cuda_Lt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid <= stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__relop_replace__4",
+        "operator": "relop_replace",
+        "line_start": 28,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "4c98d46708cd8a11",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "400f3c9bc0fa2582",
+          "mutation_site_line": 28,
+          "original_fragment": "<",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 15,
+              "original": "if (tid < stride) {",
+              "mutated": "if (tid <= stride) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "relop_replace",
+          "time_ms": 3827,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2307.51220703125,
+                "max": 3538.789306640625,
+                "mean": -56.63067626953125,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2819.94091796875,
+                "max": 2620.388671875,
+                "mean": 143.226806640625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation changes the reduction condition from `tid < stride` to `tid <= stride`. This is on the execution path for all threads. When `tid == stride`, the original code does NOT perform the addition, but the mutant does. This causes thread `stride` to add `shared_mem[tid + stride]` (which equals `shared_mem[2*stride]`) to `shared_mem[stride]`. For the reduction to work correctly, only threads with `tid < stride` should participate. When `tid == stride`, the addition accesses out-of-bounds memory when `tid + stride == 2*stride` equals or exceeds `blockDim.x` (256). For example, when `stride = 128`, thread 128 would try to access `shared_mem[256]`, which is out of bounds. This could cause undefined behavior, but more importantly, it corrupts the reduction sum by including extra terms and potentially double-counting values.",
+          "kill_strategy": "Use any input values that trigger the kernel execution. The bug occurs during the reduction phase regardless of input values, as long as the kernel runs. The out-of-bounds access when `stride = 128` and `tid = 128` will access `shared_mem[256]`, which is beyond the 256-element shared memory array. This may cause incorrect results or crashes.",
+          "suggested_test": {
+            "description": "Test with random values to trigger the reduction bug. The out-of-bounds access occurs when stride = 128 and tid = 128, accessing shared_mem[256] which is out of bounds. This should produce different results between original and mutant.",
+            "python_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    predictions = torch.randn(128, 1, device=device, dtype=torch.float32)\n    targets = torch.randn(128, 1, device=device, dtype=torch.float32)\n    return predictions, targets"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation changes the reduction condition from `tid < stride` to `tid <= stride`. This is on the execution path for all threads. When `tid == stride`, the original code does NOT perform the addition, but the mutant does. This causes thread `stride` to add `shared_mem[tid + stride]` (which equals `shared_mem[2*stride]`) to `shared_mem[stride]`. For the reduction to work correctly, only threads with `tid < stride` should participate. When `tid == stride`, the addition accesses out-of-bounds memory when `tid + stride == 2*stride` equals or exceeds `blockDim.x` (256). For example, when `stride = 128`, thread 128 would try to access `shared_mem[256]`, which is out of bounds. This could cause undefined behavior, but more importantly, it corrupts the reduction sum by including extra terms and potentially double-counting values.\",\n  \"kill_strategy\": \"Use any input values that trigger the kernel execution. The ",
+          "time_ms": 15197,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: relop_replace\n- All runs bitwise identical: **True**\n- Time taken: 3827ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P100__const_perturb__1",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L11",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation changes shared memory size from 256 to 255 while the block size remains 256. This creates a buffer overflow: threadIdx.x values 0-255 write to shared_mem[0-255], but index 255 accesses sh",
+      "kill_input_seed": null,
+      "execution_time_ms": 807.2519302368164,
+      "site": {
+        "line_start": 11,
+        "line_end": 11,
+        "original_code": "256",
+        "node_type": "const:int-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[255];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__const_perturb__1",
+        "operator": "const_perturb",
+        "line_start": 11,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "bf5c88654b29b4df",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "180c6e1f41268ed8",
+          "mutation_site_line": 11,
+          "original_fragment": "256",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 4,
+              "original": "__shared__ float shared_mem[256];",
+              "mutated": "__shared__ float shared_mem[255];"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "const_perturb",
+          "time_ms": 2801,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_all_negative_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -353.8789367675781,
+                "max": -1.616840124130249,
+                "mean": -85.32425689697266,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -281.99407958984375,
+                "max": -0.21387441456317902,
+                "mean": -83.4705581665039,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation changes shared memory size from 256 to 255 while the block size remains 256. This creates a buffer overflow: threadIdx.x values 0-255 write to shared_mem[0-255], but index 255 accesses shared_mem[255] which is out-of-bounds (array size is 255). This is undefined behavior that could cause memory corruption, race conditions, or incorrect reduction results. While Layer 2's random tests didn't trigger observable differences, carefully crafted inputs could exploit this by making thread 255's contribution critical to the final loss value, causing divergence in reduction results due to memory corruption.",
+          "kill_strategy": "Create inputs where thread 255 (the last thread in the block) has a non-zero loss contribution that affects the final reduction. Since the reduction accesses shared_mem[tid + stride] where stride can be 128, 64, etc., the out-of-bounds access at index 255 could corrupt adjacent memory or cause incorrect summation.",
+          "suggested_test": {
+            "description": "Force thread 255 to have a significant loss value while other threads have zero loss, making the reduction sensitive to corruption of thread 255's contribution. Use predictions and targets that yield margin > 0 only for indices corresponding to thread 255 in the first block.",
+            "python_code": "def generate_inputs(device):\n    batch_size = 128\n    # Create tensors where only the element at index 255 (first block, thread 255) has non-zero loss\n    predictions = torch.zeros(batch_size, 1, device=device, dtype=torch.float32)\n    targets = torch.zeros(batch_size, 1, device=device, dtype=torch.float32)\n    \n    # Set predictions[255] = -1.0, targets[255] = 1.0 to get margin = 1 - (-1*1) = 2 > 0\n    # This gives thread_loss = 2.0 for thread 255\n    if batch_size > 255:\n        predictions[255, 0] = -1.0\n        targets[255, 0] = 1.0\n    \n    # Alternative: also test with thread 255 having zero loss but thread 127 (stride partner) having non-zero loss\n    # to test corruption during reduction\n    return predictions, targets"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation changes shared memory size from 256 to 255 while the block size remains 256. This creates a buffer overflow: threadIdx.x values 0-255 write to shared_mem[0-255], but index 255 accesses shared_mem[255] which is out-of-bounds (array size is 255). This is undefined behavior that could cause memory corruption, race conditions, or incorrect reduction results. While Layer 2's random tests didn't trigger observable differences, carefully crafted inputs could exploit this by making thread 255's contribution critical to the final loss value, causing divergence in reduction results due to memory corruption.\",\n  \"kill_strategy\": \"Create inputs where thread 255 (the last thread in the block) has a non-zero loss contribution that affects the final reduction. Since the reduction accesses shared_mem[tid + stride] where stride can be 128, 64, etc., the out-of-bounds access at index 255 could corrupt adjacent",
+          "time_ms": 17558,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: const_perturb\n- All runs bitwise identical: **True**\n- Time taken: 2801ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P100__const_perturb__0",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L11",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3013ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 1004.2314529418945,
+      "site": {
+        "line_start": 11,
+        "line_end": 11,
+        "original_code": "256",
+        "node_type": "const:int+1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[257];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__const_perturb__0",
+        "operator": "const_perturb",
+        "line_start": 11,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "f35014c86a43195b",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "b470a03a135197a7",
+          "mutation_site_line": 11,
+          "original_fragment": "256",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 4,
+              "original": "__shared__ float shared_mem[256];",
+              "mutated": "__shared__ float shared_mem[257];"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "const_perturb",
+          "time_ms": 3013,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_all_negative_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -353.8789367675781,
+                "max": -1.616840124130249,
+                "mean": -85.32425689697266,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -281.99407958984375,
+                "max": -0.21387441456317902,
+                "mean": -83.4705581665039,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 0.99,
+          "reasoning": "The mutation changes the shared memory size from 256 to 257, but the kernel execution path only accesses indices 0-255 via `shared_mem[tid]` where `tid = threadIdx.x`. Since the block size is fixed at 256 (line in host code: `const int block_size = 256`), threadIdx.x always ranges from 0 to 255. Therefore, the extra shared memory element at index 256 is never accessed, read, or written. The reduction loop also only accesses indices within the valid thread range (0-255). With fixed input shapes and block size, the execution path and memory accesses are identical between original and mutant. Layer 2's 100+ random value tests correctly found no difference.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 0.99,\n  \"reasoning\": \"The mutation changes the shared memory size from 256 to 257, but the kernel execution path only accesses indices 0-255 via `shared_mem[tid]` where `tid = threadIdx.x`. Since the block size is fixed at 256 (line in host code: `const int block_size = 256`), threadIdx.x always ranges from 0 to 255. Therefore, the extra shared memory element at index 256 is never accessed, read, or written. The reduction loop also only accesses indices within the valid thread range (0-255). With fixed input shapes and block size, the execution path and memory accesses are identical between original and mutant. Layer 2's 100+ random value tests correctly found no difference.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}\n```",
+          "time_ms": 6978,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: const_perturb\n- All runs bitwise identical: **True**\n- Time taken: 3013ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P100__index_replace__0",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L13",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation changes `blockIdx.x` to `blockIdx.y` in the thread index calculation. In the kernel launch configuration `<<<num_blocks, block_size>>>`, the grid dimensions are `(num_blocks, 1, 1)` by de",
+      "kill_input_seed": null,
+      "execution_time_ms": 1255.0077438354492,
+      "site": {
+        "line_start": 13,
+        "line_end": 13,
+        "original_code": "blockIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.y * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__index_replace__0",
+        "operator": "index_replace",
+        "line_start": 13,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "eaa839ed72b180fb",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "9bec277c76069eba",
+          "mutation_site_line": 13,
+          "original_fragment": "blockIdx.x",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 5,
+              "original": "int idx = blockIdx.x * blockDim.x + threadIdx.x;",
+              "mutated": "int idx = blockIdx.y * blockDim.x + threadIdx.x;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "index_replace",
+          "time_ms": 2892,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.3075122833251953,
+                "max": 10000.0,
+                "mean": 78.07088470458984,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.8199408054351807,
+                "max": 10000.0,
+                "mean": 78.26254272460938,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation changes `blockIdx.x` to `blockIdx.y` in the thread index calculation. In the kernel launch configuration `<<<num_blocks, block_size>>>`, the grid dimensions are `(num_blocks, 1, 1)` by default (only x dimension specified). Therefore, `blockIdx.y` is always 0, making `idx = 0 * blockDim.x + threadIdx.x = threadIdx.x`. This means only threads in the first block (blockIdx.x = 0) compute correct indices, while all other blocks compute indices based solely on threadIdx.x, causing massive data misalignment. However, Layer 2's tests showed bitwise identical outputs, suggesting the reduction logic may mask this error. The bug could be exposed by creating inputs where contributions from different blocks are distinguishable - specifically where the first block's computation differs from what would be computed by other blocks if they accessed correct indices.",
+          "kill_strategy": "Create inputs where the hinge loss contributions from elements in the first block (indices 0-255) are systematically different from contributions that would come from elements at indices 256-511, 512-767, etc. This can be achieved by making predictions and targets in the first block produce zero loss (margins ≤ 0), while elements in other blocks produce positive losses.",
+          "suggested_test": {
+            "description": "Set predictions and targets such that for indices 0-255 (first block): predictions[i] * targets[i] ≥ 1 (zero loss), while for indices 256+ (other blocks): predictions[i] * targets[i] < 1 (positive loss). This will cause the mutant to incorrectly compute zero loss for all blocks since blockIdx.y=0 for all blocks, making all threads access only the first 256 elements.",
+            "python_code": "def generate_inputs(device):\n    batch_size = 128\n    predictions = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)\n    targets = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)\n    \n    # First 256 elements (covers entire first block for block_size=256)\n    # Set margin ≤ 0 for zero loss\n    predictions[:256] = 1.0\n    targets[:256] = 1.0  # predictions * targets = 1 → margin = 0 → loss = 0\n    \n    # Elements beyond first block: create positive loss\n    if batch_size > 256:\n        predictions[256:] = -1.0\n        targets[256:] = 1.0  # predictions * targets = -1 → margin = 2 → loss = 2\n    \n    return predictions, targets"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation changes `blockIdx.x` to `blockIdx.y` in the thread index calculation. In the kernel launch configuration `<<<num_blocks, block_size>>>`, the grid dimensions are `(num_blocks, 1, 1)` by default (only x dimension specified). Therefore, `blockIdx.y` is always 0, making `idx = 0 * blockDim.x + threadIdx.x = threadIdx.x`. This means only threads in the first block (blockIdx.x = 0) compute correct indices, while all other blocks compute indices based solely on threadIdx.x, causing massive data misalignment. However, Layer 2's tests showed bitwise identical outputs, suggesting the reduction logic may mask this error. The bug could be exposed by creating inputs where contributions from different blocks are distinguishable - specifically where the first block's computation differs from what would be computed by other blocks if they accessed correct indices.\",\n  \"kill_strategy\": \"Create inputs where th",
+          "time_ms": 19553,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: index_replace\n- All runs bitwise identical: **True**\n- Time taken: 2892ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P100__index_replace__1",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L13",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3178ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 810.2617263793945,
+      "site": {
+        "line_start": 13,
+        "line_end": 13,
+        "original_code": "blockIdx.x",
+        "node_type": "cuda_dim|z"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.z * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__index_replace__1",
+        "operator": "index_replace",
+        "line_start": 13,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "87178e443a14dfd0",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "4459fe80ba733e85",
+          "mutation_site_line": 13,
+          "original_fragment": "blockIdx.x",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 5,
+              "original": "int idx = blockIdx.x * blockDim.x + threadIdx.x;",
+              "mutated": "int idx = blockIdx.z * blockDim.x + threadIdx.x;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "index_replace",
+          "time_ms": 3178,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.3075122833251953,
+                "max": 10000.0,
+                "mean": 78.07088470458984,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.8199408054351807,
+                "max": 10000.0,
+                "mean": 78.26254272460938,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes `blockIdx.x` to `blockIdx.z`, which affects the thread index calculation. However, the kernel launch configuration uses `<<<num_blocks, block_size>>>` with only 1D grid dimensions (x dimension only). In CUDA, when only one dimension is specified, `blockIdx.y` and `blockIdx.z` are always 0. Therefore, `blockIdx.z * blockDim.x + threadIdx.x` always equals `threadIdx.x`, which is different from the original `blockIdx.x * blockDim.x + threadIdx.x`. This means threads will compute incorrect indices, potentially accessing wrong memory locations. However, the reduction phase still uses `blockIdx.x` to write results, creating a mismatch between computation and storage. Despite this, with the fixed 1D grid launch, all threads will have `idx = threadIdx.x`, which is always < 256, and the kernel will only process the first 256 elements regardless of input size. Since the input shape is fixed at [128, 1] (128 elements), and 128 < 256, all threads with idx < 128 will process the correct elements. The reduction and final sum will still produce the correct result for this specific fixed shape.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes `blockIdx.x` to `blockIdx.z`, which affects the thread index calculation. However, the kernel launch configuration uses `<<<num_blocks, block_size>>>` with only 1D grid dimensions (x dimension only). In CUDA, when only one dimension is specified, `blockIdx.y` and `blockIdx.z` are always 0. Therefore, `blockIdx.z * blockDim.x + threadIdx.x` always equals `threadIdx.x`, which is different from the original `blockIdx.x * blockDim.x + threadIdx.x`. This means threads will compute incorrect indices, potentially accessing wrong memory locations. However, the reduction phase still uses `blockIdx.x` to write results, creating a mismatch between computation and storage. Despite this, with the fixed 1D grid launch, all threads will have `idx = threadIdx.x`, which is always < 256, and the kernel will only process the first 256 elements regardless of input size. Since the input shape is fixed a",
+          "time_ms": 9931,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: index_replace\n- All runs bitwise identical: **True**\n- Time taken: 3178ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P100__index_replace__4",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L13",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 679.4567108154297,
+      "site": {
+        "line_start": 13,
+        "line_end": 13,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.y;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__sync_remove__0",
+      "operator_name": "sync_remove",
+      "operator_category": "B",
+      "description": "Remove GPU synchronization barriers (tl.debug_barrier, __syncthreads) @ L24",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation removes a critical __syncthreads() barrier after writing to shared memory but before the reduction loop. This creates a race condition: threads may read uninitialized or partially updated",
+      "kill_input_seed": null,
+      "execution_time_ms": 936.3865852355957,
+      "site": {
+        "line_start": 24,
+        "line_end": 24,
+        "original_code": "__syncthreads();",
+        "node_type": "cuda_syncthreads"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__sync_remove__0",
+        "operator": "sync_remove",
+        "line_start": 24,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "9a61612df934e434",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "a6928f363dc0b266",
+          "mutation_site_line": 24,
+          "original_fragment": "__syncthreads();",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 13,
+              "original": "__syncthreads();",
+              "mutated": "for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {"
+            },
+            {
+              "cuda_line": 14,
+              "original": "for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {",
+              "mutated": "if (tid < stride) {"
+            },
+            {
+              "cuda_line": 15,
+              "original": "if (tid < stride) {",
+              "mutated": "shared_mem[tid] += shared_mem[tid + stride];"
+            },
+            {
+              "cuda_line": 16,
+              "original": "shared_mem[tid] += shared_mem[tid + stride];",
+              "mutated": "}"
+            },
+            {
+              "cuda_line": 17,
+              "original": "}",
+              "mutated": "__syncthreads();"
+            },
+            {
+              "cuda_line": 18,
+              "original": "__syncthreads();",
+              "mutated": "}"
+            },
+            {
+              "cuda_line": 19,
+              "original": "}",
+              "mutated": "if (tid == 0) {"
+            },
+            {
+              "cuda_line": 20,
+              "original": "if (tid == 0) {",
+              "mutated": "loss[blockIdx.x] = shared_mem[0];"
+            },
+            {
+              "cuda_line": 21,
+              "original": "loss[blockIdx.x] = shared_mem[0];",
+              "mutated": "}"
+            },
+            {
+              "cuda_line": 23,
+              "original": "}",
+              "mutated": "torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "sync_remove",
+          "time_ms": 2635,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.3075122833251953,
+                "max": 10000.0,
+                "mean": 78.07088470458984,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.8199408054351807,
+                "max": 10000.0,
+                "mean": 78.26254272460938,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation removes a critical __syncthreads() barrier after writing to shared memory but before the reduction loop. This creates a race condition: threads may read uninitialized or partially updated values from shared_mem[tid + stride] during the reduction. While Layer 2's random tests didn't trigger observable differences, this is because race conditions are non-deterministic and may not manifest in every execution. The reduction algorithm fundamentally requires synchronization between steps to ensure all threads have written their values before others read them. Without the barrier, threads in warp 0 could start reading from shared_mem[tid + stride] before threads in other warps have written their thread_loss values.",
+          "kill_strategy": "Create input values where different threads compute different thread_loss values (non-zero for some, zero for others), and ensure the reduction pattern exposes the race. Specifically, use alternating patterns where even-indexed threads compute non-zero loss and odd-indexed threads compute zero loss, making the reduction sensitive to timing.",
+          "suggested_test": {
+            "description": "Alternating pattern where even indices have margin > 0 (non-zero loss) and odd indices have margin <= 0 (zero loss). This makes the reduction sum depend on whether odd threads' zeros are read before they're written.",
+            "python_code": "def generate_inputs(device):\n    batch_size = 128\n    # Even indices: predictions = 0.0, targets = -1.0 → margin = 1.0 - (0.0 * -1.0) = 1.0 > 0\n    # Odd indices: predictions = 2.0, targets = 0.5 → margin = 1.0 - (2.0 * 0.5) = 0.0\n    predictions = torch.zeros(batch_size, 1, device=device, dtype=torch.float32)\n    targets = torch.zeros(batch_size, 1, device=device, dtype=torch.float32)\n    for i in range(batch_size):\n        if i % 2 == 0:\n            predictions[i] = 0.0\n            targets[i] = -1.0\n        else:\n            predictions[i] = 2.0\n            targets[i] = 0.5\n    return predictions, targets"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation removes a critical __syncthreads() barrier after writing to shared memory but before the reduction loop. This creates a race condition: threads may read uninitialized or partially updated values from shared_mem[tid + stride] during the reduction. While Layer 2's random tests didn't trigger observable differences, this is because race conditions are non-deterministic and may not manifest in every execution. The reduction algorithm fundamentally requires synchronization between steps to ensure all threads have written their values before others read them. Without the barrier, threads in warp 0 could start reading from shared_mem[tid + stride] before threads in other warps have written their thread_loss values.\",\n  \"kill_strategy\": \"Create input values where different threads compute different thread_loss values (non-zero for some, zero for others), and ensure the reduction pattern exposes the r",
+          "time_ms": 17205,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: sync_remove\n- All runs bitwise identical: **True**\n- Time taken: 2635ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P100__sync_remove__1",
+      "operator_name": "sync_remove",
+      "operator_category": "B",
+      "description": "Remove GPU synchronization barriers (tl.debug_barrier, __syncthreads) @ L31",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation removes the __syncthreads() call inside the reduction loop. This is a classic race condition scenario in parallel reductions. Without synchronization, threads in the same warp/wavefront m",
+      "kill_input_seed": null,
+      "execution_time_ms": 735.8620166778564,
+      "site": {
+        "line_start": 31,
+        "line_end": 31,
+        "original_code": "__syncthreads();",
+        "node_type": "cuda_syncthreads:reduction_tail"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__sync_remove__1",
+        "operator": "sync_remove",
+        "line_start": 31,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "5d64426482d78342",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "7839306301d945c2",
+          "mutation_site_line": 31,
+          "original_fragment": "__syncthreads();",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 18,
+              "original": "__syncthreads();",
+              "mutated": "}"
+            },
+            {
+              "cuda_line": 19,
+              "original": "}",
+              "mutated": "if (tid == 0) {"
+            },
+            {
+              "cuda_line": 20,
+              "original": "if (tid == 0) {",
+              "mutated": "loss[blockIdx.x] = shared_mem[0];"
+            },
+            {
+              "cuda_line": 21,
+              "original": "loss[blockIdx.x] = shared_mem[0];",
+              "mutated": "}"
+            },
+            {
+              "cuda_line": 23,
+              "original": "}",
+              "mutated": "torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {"
+            },
+            {
+              "cuda_line": 24,
+              "original": "torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {",
+              "mutated": "auto size = predictions.numel();"
+            },
+            {
+              "cuda_line": 25,
+              "original": "auto size = predictions.numel();",
+              "mutated": "const int block_size = 256;"
+            },
+            {
+              "cuda_line": 26,
+              "original": "const int block_size = 256;",
+              "mutated": "const int num_blocks = (size + block_size - 1) / block_size;"
+            },
+            {
+              "cuda_line": 27,
+              "original": "const int num_blocks = (size + block_size - 1) / block_size;",
+              "mutated": "auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));"
+            },
+            {
+              "cuda_line": 28,
+              "original": "auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));",
+              "mutated": "hinge_loss_kernel<<<num_blocks, block_size>>>("
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "sync_remove",
+          "time_ms": 2726,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.3075122833251953,
+                "max": 10000.0,
+                "mean": 78.07088470458984,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.8199408054351807,
+                "max": 10000.0,
+                "mean": 78.26254272460938,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation removes the __syncthreads() call inside the reduction loop. This is a classic race condition scenario in parallel reductions. Without synchronization, threads in the same warp/wavefront may read shared_mem[tid + stride] values that have already been partially updated by other threads in the same iteration, leading to incorrect reduction sums. The race condition depends on thread execution timing, which can be influenced by input values that cause different execution paths (e.g., some threads having zero loss vs non-zero loss). Layer 2's random tests may have missed specific patterns that maximize timing differences between threads.",
+          "kill_strategy": "Create input patterns that maximize divergence in thread execution timing. Specifically, use alternating patterns where adjacent threads have very different loss values (some zero, some large), causing different execution paths in the reduction. This increases the likelihood that threads read partially updated values before synchronization would have occurred.",
+          "suggested_test": {
+            "description": "Alternating pattern where even-indexed elements produce zero loss (margin <= 0) and odd-indexed elements produce large positive loss (margin > 0). This creates maximum divergence in thread execution and maximizes race condition effects in the reduction.",
+            "python_code": "def generate_inputs(device):\n    batch_size = 128\n    # Even indices: predictions = 1.0, targets = 1.0 → margin = 0 → loss = 0\n    # Odd indices: predictions = -1.0, targets = 1.0 → margin = 2 → loss = 2\n    predictions = torch.zeros(batch_size, 1, device=device, dtype=torch.float32)\n    targets = torch.zeros(batch_size, 1, device=device, dtype=torch.float32)\n    \n    for i in range(batch_size):\n        if i % 2 == 0:\n            predictions[i] = 1.0\n            targets[i] = 1.0\n        else:\n            predictions[i] = -1.0\n            targets[i] = 1.0\n    \n    return predictions, targets"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation removes the __syncthreads() call inside the reduction loop. This is a classic race condition scenario in parallel reductions. Without synchronization, threads in the same warp/wavefront may read shared_mem[tid + stride] values that have already been partially updated by other threads in the same iteration, leading to incorrect reduction sums. The race condition depends on thread execution timing, which can be influenced by input values that cause different execution paths (e.g., some threads having zero loss vs non-zero loss). Layer 2's random tests may have missed specific patterns that maximize timing differences between threads.\",\n  \"kill_strategy\": \"Create input patterns that maximize divergence in thread execution timing. Specifically, use alternating patterns where adjacent threads have very different loss values (some zero, some large), causing different execution paths in the reductio",
+          "time_ms": 15446,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: sync_remove\n- All runs bitwise identical: **True**\n- Time taken: 2726ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P100__mask_boundary__0",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L18",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 871.1035251617432,
+      "site": {
+        "line_start": 18,
+        "line_end": 18,
+        "original_code": "idx < size",
+        "node_type": "rhs-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size - 1) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "equiv_detail": {
+        "mutant_id": "L1_P100__mask_boundary__0",
+        "operator": "mask_boundary",
+        "line_start": 18,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 1], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 1], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P100",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/100_HingeLoss.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "138eddd305afb47c",
+          "cuda_norm_hash_mut": "5ad52d468ea5c6c1",
+          "py_norm_hash_orig": "0a481af12567652f",
+          "py_norm_hash_mut": "b8b2953bc2061269",
+          "mutation_site_line": 18,
+          "original_fragment": "idx < size",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 8,
+              "original": "if (idx < size) {",
+              "mutated": "if (idx < size - 1) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": false,
+          "equiv_runs": 100,
+          "operator_name": "mask_boundary",
+          "time_ms": 2924,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000
+          ],
+          "tested_policies": [],
+          "total_rounds": 0,
+          "first_input_summary": null,
+          "last_input_summary": null,
+          "divergence": {
+            "round_type": "random",
+            "round_index": 0,
+            "seed": 10000,
+            "policy": null,
+            "input_summary": [
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -2.301694631576538,
+                "max": 3.0185158252716064,
+                "mean": 0.08119934797286987,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  1
+                ],
+                "dtype": "torch.float32",
+                "min": -1.0,
+                "max": 1.0,
+                "mean": 0.15625,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "not_equivalent"
+        },
+        "decided_at": "layer2"
+      }
+    },
+    {
+      "id": "L1_P100__mask_boundary__1",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L28",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 705.8589458465576,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "tid < stride",
+        "node_type": "rhs-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride - 1) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__launch_config_mutate__0",
+      "operator_name": "launch_config_mutate",
+      "operator_category": "B",
+      "description": "Perturb grid/block sizing expressions (// BLOCK, triton.cdiv) by ±1 @ L44",
+      "status": "killed",
+      "error_message": "Runtime trial 0: CUDA error: invalid configuration argument\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_L",
+      "kill_input_seed": 42,
+      "execution_time_ms": 715.9206867218018,
+      "site": {
+        "line_start": 44,
+        "line_end": 44,
+        "original_code": "(size + block_size - 1) / block_size",
+        "node_type": "-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size - 1;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    }
+  ]
+}

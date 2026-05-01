@@ -1,0 +1,108 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      22|     if (bi < n) temp[bi] = data[bi];
+      23|     
+      24|     __syncthreads();
+      25|     
+      26|     // Up-sweep phase
+      27|     for (int d = n >> 1; d > 0; d >>= 1) {
+      28|         if (tid < d) {
+      29|             int ai = offset * (2 * tid + 1) - 1;
+      30|             int bi = offset * (2 * tid + 2) - 1;
+      31|             temp[bi] += temp[ai];
+      32|         }
+      33|         offset <<= 1;
+>>>   34|         __syncthreads();
+      35|     }
+      36|     
+      37|     // Down-sweep phase
+      38|     if (tid == 0) {
+      39|         temp[n - 1] = 0;
+      40|     }
+      41|     
+      42|     for (int d = 1; d < n; d <<= 1) {
+      43|         offset >>= 1;
+      44|         __syncthreads();
+      45|         
+      46|         if (tid < d) {
+```
+
+## Mutated Code (around mutation site)
+```
+      22|     if (bi < n) temp[bi] = data[bi];
+      23|     
+      24|     __syncthreads();
+      25|     
+      26|     // Up-sweep phase
+      27|     for (int d = n >> 1; d > 0; d >>= 1) {
+      28|         if (tid < d) {
+      29|             int ai = offset * (2 * tid + 1) - 1;
+      30|             int bi = offset * (2 * tid + 2) - 1;
+      31|             temp[bi] += temp[ai];
+      32|         }
+      33|         offset <<= 1;
+>>>   34|     }
+      35|     
+      36|     // Down-sweep phase
+      37|     if (tid == 0) {
+      38|         temp[n - 1] = 0;
+      39|     }
+      40|     
+      41|     for (int d = 1; d < n; d <<= 1) {
+      42|         offset >>= 1;
+      43|         __syncthreads();
+      44|         
+      45|         if (tid < d) {
+      46|             int ai = offset * (2 * tid + 1) - 1;
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 34
+- Original fragment: `__syncthreads();`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[128, 4000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input shape to reduce the number of warps and increase the likelihood of warp interleaving. Use a small power-of-two inner dimension (e.g., 64) with one row to force a small thread block where warps from different iterations are more likely to overlap. The race condition will be exposed when threads in iteration 2 (e.g., tid=16) read temp[ai] before threads in iteration 1 (e.g., tid=32) have written to it, causing an incorrect prefix sum.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    # Shape changed to [1, 64] to expose the race condition
+    data = torch.ones(1, 64, dtype=torch.float32, device=device)
+    return [data]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

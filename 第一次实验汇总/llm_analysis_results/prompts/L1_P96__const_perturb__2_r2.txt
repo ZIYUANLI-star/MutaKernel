@@ -1,0 +1,110 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      15|     int total_elements,
+      16|     float beta
+      17| ) {
+      18|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      19|     
+      20|     if (idx < total_elements) {
+      21|         float diff = predictions[idx] - targets[idx];
+      22|         float abs_diff = fabsf(diff);
+      23|         
+      24|         if (abs_diff < beta) {
+      25|             output[idx] = 0.5f * diff * diff / beta;
+      26|         } else {
+>>>   27|             output[idx] = abs_diff - 0.5f * beta;
+      28|         }
+      29|     }
+      30| }
+      31| 
+      32| __global__ void sum_reduction_kernel(
+      33|     const float* __restrict__ input,
+      34|     float* __restrict__ output,
+      35|     int size
+      36| ) {
+      37|     extern __shared__ float shared_mem[];
+      38|     
+      39|     int tid = threadIdx.x;
+```
+
+## Mutated Code (around mutation site)
+```
+      15|     int total_elements,
+      16|     float beta
+      17| ) {
+      18|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      19|     
+      20|     if (idx < total_elements) {
+      21|         float diff = predictions[idx] - targets[idx];
+      22|         float abs_diff = fabsf(diff);
+      23|         
+      24|         if (abs_diff < beta) {
+      25|             output[idx] = 0.5f * diff * diff / beta;
+      26|         } else {
+>>>   27|             output[idx] = abs_diff - 0.495f * beta;
+      28|         }
+      29|     }
+      30| }
+      31| 
+      32| __global__ void sum_reduction_kernel(
+      33|     const float* __restrict__ input,
+      34|     float* __restrict__ output,
+      35|     int size
+      36| ) {
+      37|     extern __shared__ float shared_mem[];
+      38|     
+      39|     int tid = threadIdx.x;
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 27
+- Original fragment: `0.5f`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Force all elements into the linear region (abs_diff ≥ beta) with a constant large difference (1e10) to ensure the condition holds for any beta ≤ 1e10. This yields a per-element difference of 0.005f * beta, which is detectable for moderate-to-large beta values (e.g., beta ≥ 1.0 gives 0.005 absolute difference). The test should use the same beta as original, but if beta is unknown, a large constant difference maximizes the chance of entering the linear region and producing a non-zero difference.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    shape = (128, 4096)
+    predictions = torch.full(shape, 1e10, dtype=torch.float32, device=device)
+    targets = torch.zeros(shape, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

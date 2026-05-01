@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P90__arith_replace__6",
+  "kernel_name": "L1_P90",
+  "operator_name": "arith_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutation changes the output index calculation from `d * stride` to `d / stride`. With the fixed input shape [128, 4000] and assuming the kernel is processing dimension 1 (the 4000 dimension), we have `inner_size = 1` (since there are no dimensions after the target dimension when using typical CUDA kernel flattening). When `inner_size = 1`, then `stride = 1`, making both `d * 1 = d` and `d / 1 = d` equivalent. Therefore, the mutated index calculation produces identical memory accesses to the original, making the mutant behaviorally equivalent for this specific shape/dimension configuration.",
+  "killable": true,
+  "kill_strategy": "To kill this mutant, we must change the input shape such that `inner_size > 1`. This would make `stride > 1`, causing `d / stride` to produce different indices than `d * stride`. Specifically, we need a tensor shape where the dimension being cumproduced is NOT the innermost dimension in the kernel's flattening scheme. A 3D tensor with cumprod on the middle dimension would achieve this.",
+  "recommendations": "The kernel's test suite should include varied tensor shapes and dimensions, not just varied values. Specifically, it should test cumprod along non-innermost dimensions where stride > 1. Additionally, the kernel implementation should be reviewed to ensure it handles the general N-dimensional case correctly, not just 2D tensors.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutation changes the output index calculation from `d * stride` to `d / stride`. With the fixed input shape [128, 4000] and assuming the kernel is processing dimension 1 (the 4000 dimension), we have `inner_size = 1` (since there are no dimensions after the target dimension when using typical CUDA kernel flattening). When `inner_size = 1`, then `stride = 1`, making both `d * 1 = d` and `d / 1 = d` equivalent. Therefore, the mutated index calculation produces identical memory accesses to the original, making the mutant behaviorally equivalent for this specific shape/dimension configuration.",
+      "kill_strategy": "To kill this mutant, we must change the input shape such that `inner_size > 1`. This would make `stride > 1`, causing `d / stride` to produce different indices than `d * stride`. Specifically, we need a tensor shape where the dimension being cumproduced is NOT the innermost dimension in the kernel's flattening scheme. A 3D tensor with cumprod on the middle dimension would achieve this.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Create a 3D tensor where cumprod along dim=1 (middle dimension)\n    # Original kernel likely flattens to [outer=2, dim=3, inner=4]\n    # This makes inner_size=4, stride=4, so d*stride vs d/stride differ\n    shape = [2, 3, 4]\n    # Use simple increasing values to easily detect differences\n    data = torch.arange(1, 25, dtype=torch.float32, device=device).view(shape)\n    return [data]\n",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=7.664000e+03, mean_diff=1.047167e+03, ref_range=[1.0000e+00,7.6800e+03], mut_range=[5.0000e+00,7.6800e+03]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "stride_amplification_for_index_calc",
+    "rule_description": "Generates tensors where the stride (inner_size) in dimension-indexing calculations is deliberately set to a value >1, making index calculations sensitive to arithmetic mutations in stride multiplication/division. This exposes bugs where arithmetic operators in index computations are mutated, particularly when the mutated operation would cause repeated writes (division) versus strided writes (multiplication).",
+    "applicable_operators": [
+      "arith_replace",
+      "binary_operator_replace",
+      "constant_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Construct a multi-dimensional tensor where:\n    # - The target dimension (for operations like cumprod) is not the last dimension\n    # - The inner_size (product of dimensions after target dim) is >1\n    # This ensures stride != 1 in index calculations\n    \n    # We'll create a 3D tensor by default, as it's sufficient to expose the issue\n    # but can be generalized to higher dimensions\n    outer = rng.randint(2, 5)          # dimensions before target\n    target_dim_size = rng.randint(3, 6) # target dimension size\n    inner = rng.randint(2, 5)          # dimensions after target (must be >1)\n    \n    # Optional: with 25% probability, create 4D tensor for additional coverage\n    if rng.random() < 0.25:\n        outer2 = rng.randint(2, 4)\n        shape = (outer2, outer, target_dim_size, inner)\n    else:\n        shape = (outer, target_dim_size, inner)\n    \n    # Fill with distinct, easily traceable values\n    total_elements = torch.prod(torch.tensor(shape)).item()\n    data = torch.arange(1, total_elements + 1, dtype=dtype, device=device).view(shape)\n    \n    # Optional: add small random perturbations to avoid perfect regularity\n    # while maintaining distinctness\n    if dtype.is_floating_point:\n        noise = torch.randn_like(data) * 0.01\n        data = data + noise\n    \n    return data"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    # Create a 3D tensor where cumprod along dim=1 (middle dimension)\n    # Original kernel likely flattens to [outer=2, dim=3, inner=4]\n    # This makes inner_size=4, stride=4, so d*stride vs d/stride differ\n    shape = [2, 3, 4]\n    # Use simple increasing values to easily detect differences\n    data = torch.arange(1, 25, dtype=torch.float32, device=device).view(shape)\n    return [data]\n"
+}

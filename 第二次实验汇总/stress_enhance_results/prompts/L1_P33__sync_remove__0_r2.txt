@@ -1,0 +1,764 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived:
+- EMD 4-layer equivalence detection (112 rounds)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+- AND your previous suggested inputs (see below)
+
+Re-analyze with the failure information and try a fundamentally different approach.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison is BITWISE (NaN-aware).
+- **Do NOT suggest shape or batch size changes.**
+
+### Auxiliary configuration-stress track
+- Alternative batch sizes were tested separately (see below).
+- This does NOT redefine the main contract.
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for BatchNorm2d
+batchnorm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void batchnorm2d_forward_inference_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ running_mean,
+    const scalar_t* __restrict__ running_var,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t eps,
+    int batch_size,
+    int num_features,
+    int spatial_size,
+    int total_elements) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    
+    int spatial_idx = idx % spatial_size;
+    int feature_idx = (idx / spatial_size) % num_features;
+    int batch_idx = idx / (spatial_size * num_features);
+    
+    scalar_t mean = running_mean[feature_idx];
+    scalar_t var = running_var[feature_idx];
+    scalar_t gamma = weight ? weight[feature_idx] : scalar_t(1.0);
+    scalar_t beta = bias ? bias[feature_idx] : scalar_t(0.0);
+    
+    scalar_t inv_std = rsqrt(var + eps);
+    scalar_t scale = gamma * inv_std;
+    scalar_t shift = beta - mean * scale;
+    
+    int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+    output[input_idx] = input[input_idx] * scale + shift;
+}
+
+template<typename scalar_t>
+__global__ void compute_mean_var_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ batch_mean,
+    scalar_t* __restrict__ batch_var,
+    int batch_size,
+    int num_features,
+    int spatial_size) {
+    
+    extern __shared__ char shared_mem_raw[];
+    scalar_t* shared_sum = reinterpret_cast<scalar_t*>(shared_mem_raw);
+    scalar_t* shared_sqsum = &shared_sum[blockDim.x];
+    
+    int feature_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int total_elements = batch_size * spatial_size;
+    
+    scalar_t sum = scalar_t(0);
+    scalar_t sqsum = scalar_t(0);
+    
+    // Each thread processes multiple elements
+    for (int i = tid; i < total_elements; i += blockDim.x) {
+        int batch_idx = i / spatial_size;
+        int spatial_idx = i % spatial_size;
+        int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+        scalar_t val = input[input_idx];
+        sum += val;
+        sqsum += val * val;
+    }
+    
+    shared_sum[tid] = sum;
+    shared_sqsum[tid] = sqsum;
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sqsum[tid] += shared_sqsum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        scalar_t mean_val = shared_sum[0] / total_elements;
+        scalar_t var_val = shared_sqsum[0] / total_elements - mean_val * mean_val;
+        batch_mean[feature_idx] = mean_val;
+        batch_var[feature_idx] = var_val;
+    }
+}
+
+template<typename scalar_t>
+__global__ void apply_batchnorm_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ batch_mean,
+    const scalar_t* __restrict__ batch_var,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t eps,
+    int batch_size,
+    int num_features,
+    int spatial_size,
+    int total_elements) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    
+    int spatial_idx = idx % spatial_size;
+    int feature_idx = (idx / spatial_size) % num_features;
+    int batch_idx = idx / (spatial_size * num_features);
+    
+    scalar_t mean_val = batch_mean[feature_idx];
+    scalar_t var_val = batch_var[feature_idx];
+    scalar_t gamma = weight ? weight[feature_idx] : scalar_t(1.0);
+    scalar_t beta = bias ? bias[feature_idx] : scalar_t(0.0);
+    
+    scalar_t inv_std = rsqrt(var_val + eps);
+    scalar_t scale = gamma * inv_std;
+    scalar_t shift = beta - mean_val * scale;
+    
+    int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+    output[input_idx] = input[input_idx] * scale + shift;
+}
+
+template<typename scalar_t>
+__global__ void update_running_stats_kernel(
+    scalar_t* __restrict__ running_mean,
+    scalar_t* __restrict__ running_var,
+    const scalar_t* __restrict__ batch_mean,
+    const scalar_t* __restrict__ batch_var,
+    scalar_t momentum,
+    int num_features) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_features) return;
+    
+    scalar_t new_running_mean = (scalar_t(1) - momentum) * running_mean[idx] + momentum * batch_mean[idx];
+    scalar_t new_running_var = (scalar_t(1) - momentum) * running_var[idx] + momentum * batch_var[idx];
+    
+    running_mean[idx] = new_running_mean;
+    running_var[idx] = new_running_var;
+}
+
+torch::Tensor batchnorm2d_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps,
+    bool training,
+    float momentum) {
+    
+    auto batch_size = input.size(0);
+    auto num_features = input.size(1);
+    auto spatial_size = input.size(2) * input.size(3);
+    auto total_elements = batch_size * num_features * spatial_size;
+    
+    auto output = torch::empty_like(input);
+    
+    if (!training) {
+        // Inference mode - fully parallel
+        const int block_size = 256;
+        const int num_blocks = (total_elements + block_size - 1) / block_size;
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "batchnorm2d_forward_inference_cuda", [&]() {
+            batchnorm2d_forward_inference_kernel<scalar_t><<<num_blocks, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                running_mean.data_ptr<scalar_t>(),
+                running_var.data_ptr<scalar_t>(),
+                weight.defined() ? weight.data_ptr<scalar_t>() : nullptr,
+                bias.defined() ? bias.data_ptr<scalar_t>() : nullptr,
+                scalar_t(eps),
+                batch_size,
+                num_features,
+                spatial_size,
+                total_elements);
+        });
+    } else {
+        // Training mode - optimized 3-step approach
+        auto batch_mean = torch::empty(num_features, input.options());
+        auto batch_var = torch::empty(num_features, input.options());
+        
+        // Step 1: Compute mean and variance per feature
+        const int threads_per_feature = 256;
+        const size_t shared_mem_size = 2 * threads_per_feature * sizeof(float);
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "compute_mean_var_cuda", [&]() {
+            compute_mean_var_kernel<scalar_t><<<num_features, threads_per_feature, shared_mem_size>>>(
+                input.data_ptr<scalar_t>(),
+                batch_mean.data_ptr<scalar_t>(),
+                batch_var.data_ptr<scalar_t>(),
+                batch_size,
+                num_features,
+                spatial_size);
+        });
+        
+        // Step 2: Apply batch normalization
+        const int block_size = 256;
+        const int num_blocks = (total_elements + block_size - 1) / block_size;
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "apply_batchnorm_cuda", [&]() {
+            apply_batchnorm_kernel<scalar_t><<<num_blocks, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_mean.data_ptr<scalar_t>(),
+                batch_var.data_ptr<scalar_t>(),
+                weight.defined() ? weight.data_ptr<scalar_t>() : nullptr,
+                bias.defined() ? bias.data_ptr<scalar_t>() : nullptr,
+                scalar_t(eps),
+                batch_size,
+                num_features,
+                spatial_size,
+                total_elements);
+        });
+        
+        // Step 3: Update running statistics
+        const int update_block_size = 256;
+        const int update_blocks = (num_features + update_block_size - 1) / update_block_size;
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "update_running_stats_cuda", [&]() {
+            update_running_stats_kernel<scalar_t><<<update_blocks, update_block_size>>>(
+                running_mean.data_ptr<scalar_t>(),
+                running_var.data_ptr<scalar_t>(),
+                batch_mean.data_ptr<scalar_t>(),
+                batch_var.data_ptr<scalar_t>(),
+                scalar_t(momentum),
+                num_features);
+        });
+    }
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+batchnorm_cpp_source = """
+torch::Tensor batchnorm2d_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps,
+    bool training,
+    float momentum);
+"""
+
+# Compile the inline CUDA code
+custom_batchnorm = load_inline(
+    name="custom_batchnorm",
+    cpp_sources=batchnorm_cpp_source,
+    cuda_sources=batchnorm_source,
+    functions=["batchnorm2d_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+)
+
+class CustomBatchNorm2d(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+        super(CustomBatchNorm2d, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        
+        self.batchnorm_op = custom_batchnorm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.batchnorm_op.batchnorm2d_forward_cuda(
+            x, 
+            self.running_mean, 
+            self.running_var,
+            self.weight, 
+            self.bias, 
+            self.eps,
+            self.training,
+            self.momentum
+        )
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.bn = CustomBatchNorm2d(num_features=num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bn(x)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for BatchNorm2d
+batchnorm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void batchnorm2d_forward_inference_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ running_mean,
+    const scalar_t* __restrict__ running_var,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t eps,
+    int batch_size,
+    int num_features,
+    int spatial_size,
+    int total_elements) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    
+    int spatial_idx = idx % spatial_size;
+    int feature_idx = (idx / spatial_size) % num_features;
+    int batch_idx = idx / (spatial_size * num_features);
+    
+    scalar_t mean = running_mean[feature_idx];
+    scalar_t var = running_var[feature_idx];
+    scalar_t gamma = weight ? weight[feature_idx] : scalar_t(1.0);
+    scalar_t beta = bias ? bias[feature_idx] : scalar_t(0.0);
+    
+    scalar_t inv_std = rsqrt(var + eps);
+    scalar_t scale = gamma * inv_std;
+    scalar_t shift = beta - mean * scale;
+    
+    int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+    output[input_idx] = input[input_idx] * scale + shift;
+}
+
+template<typename scalar_t>
+__global__ void compute_mean_var_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ batch_mean,
+    scalar_t* __restrict__ batch_var,
+    int batch_size,
+    int num_features,
+    int spatial_size) {
+    
+    extern __shared__ char shared_mem_raw[];
+    scalar_t* shared_sum = reinterpret_cast<scalar_t*>(shared_mem_raw);
+    scalar_t* shared_sqsum = &shared_sum[blockDim.x];
+    
+    int feature_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int total_elements = batch_size * spatial_size;
+    
+    scalar_t sum = scalar_t(0);
+    scalar_t sqsum = scalar_t(0);
+    
+    // Each thread processes multiple elements
+    for (int i = tid; i < total_elements; i += blockDim.x) {
+        int batch_idx = i / spatial_size;
+        int spatial_idx = i % spatial_size;
+        int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+        scalar_t val = input[input_idx];
+        sum += val;
+        sqsum += val * val;
+    }
+    
+    shared_sum[tid] = sum;
+    shared_sqsum[tid] = sqsum;
+    
+    // Parallel reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+            shared_sqsum[tid] += shared_sqsum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        scalar_t mean_val = shared_sum[0] / total_elements;
+        scalar_t var_val = shared_sqsum[0] / total_elements - mean_val * mean_val;
+        batch_mean[feature_idx] = mean_val;
+        batch_var[feature_idx] = var_val;
+    }
+}
+
+template<typename scalar_t>
+__global__ void apply_batchnorm_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const scalar_t* __restrict__ batch_mean,
+    const scalar_t* __restrict__ batch_var,
+    const scalar_t* __restrict__ weight,
+    const scalar_t* __restrict__ bias,
+    scalar_t eps,
+    int batch_size,
+    int num_features,
+    int spatial_size,
+    int total_elements) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= total_elements) return;
+    
+    int spatial_idx = idx % spatial_size;
+    int feature_idx = (idx / spatial_size) % num_features;
+    int batch_idx = idx / (spatial_size * num_features);
+    
+    scalar_t mean_val = batch_mean[feature_idx];
+    scalar_t var_val = batch_var[feature_idx];
+    scalar_t gamma = weight ? weight[feature_idx] : scalar_t(1.0);
+    scalar_t beta = bias ? bias[feature_idx] : scalar_t(0.0);
+    
+    scalar_t inv_std = rsqrt(var_val + eps);
+    scalar_t scale = gamma * inv_std;
+    scalar_t shift = beta - mean_val * scale;
+    
+    int input_idx = ((batch_idx * num_features + feature_idx) * spatial_size) + spatial_idx;
+    output[input_idx] = input[input_idx] * scale + shift;
+}
+
+template<typename scalar_t>
+__global__ void update_running_stats_kernel(
+    scalar_t* __restrict__ running_mean,
+    scalar_t* __restrict__ running_var,
+    const scalar_t* __restrict__ batch_mean,
+    const scalar_t* __restrict__ batch_var,
+    scalar_t momentum,
+    int num_features) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_features) return;
+    
+    scalar_t new_running_mean = (scalar_t(1) - momentum) * running_mean[idx] + momentum * batch_mean[idx];
+    scalar_t new_running_var = (scalar_t(1) - momentum) * running_var[idx] + momentum * batch_var[idx];
+    
+    running_mean[idx] = new_running_mean;
+    running_var[idx] = new_running_var;
+}
+
+torch::Tensor batchnorm2d_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps,
+    bool training,
+    float momentum) {
+    
+    auto batch_size = input.size(0);
+    auto num_features = input.size(1);
+    auto spatial_size = input.size(2) * input.size(3);
+    auto total_elements = batch_size * num_features * spatial_size;
+    
+    auto output = torch::empty_like(input);
+    
+    if (!training) {
+        // Inference mode - fully parallel
+        const int block_size = 256;
+        const int num_blocks = (total_elements + block_size - 1) / block_size;
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "batchnorm2d_forward_inference_cuda", [&]() {
+            batchnorm2d_forward_inference_kernel<scalar_t><<<num_blocks, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                running_mean.data_ptr<scalar_t>(),
+                running_var.data_ptr<scalar_t>(),
+                weight.defined() ? weight.data_ptr<scalar_t>() : nullptr,
+                bias.defined() ? bias.data_ptr<scalar_t>() : nullptr,
+                scalar_t(eps),
+                batch_size,
+                num_features,
+                spatial_size,
+                total_elements);
+        });
+    } else {
+        // Training mode - optimized 3-step approach
+        auto batch_mean = torch::empty(num_features, input.options());
+        auto batch_var = torch::empty(num_features, input.options());
+        
+        // Step 1: Compute mean and variance per feature
+        const int threads_per_feature = 256;
+        const size_t shared_mem_size = 2 * threads_per_feature * sizeof(float);
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "compute_mean_var_cuda", [&]() {
+            compute_mean_var_kernel<scalar_t><<<num_features, threads_per_feature, shared_mem_size>>>(
+                input.data_ptr<scalar_t>(),
+                batch_mean.data_ptr<scalar_t>(),
+                batch_var.data_ptr<scalar_t>(),
+                batch_size,
+                num_features,
+                spatial_size);
+        });
+        
+        // Step 2: Apply batch normalization
+        const int block_size = 256;
+        const int num_blocks = (total_elements + block_size - 1) / block_size;
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "apply_batchnorm_cuda", [&]() {
+            apply_batchnorm_kernel<scalar_t><<<num_blocks, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_mean.data_ptr<scalar_t>(),
+                batch_var.data_ptr<scalar_t>(),
+                weight.defined() ? weight.data_ptr<scalar_t>() : nullptr,
+                bias.defined() ? bias.data_ptr<scalar_t>() : nullptr,
+                scalar_t(eps),
+                batch_size,
+                num_features,
+                spatial_size,
+                total_elements);
+        });
+        
+        // Step 3: Update running statistics
+        const int update_block_size = 256;
+        const int update_blocks = (num_features + update_block_size - 1) / update_block_size;
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "update_running_stats_cuda", [&]() {
+            update_running_stats_kernel<scalar_t><<<update_blocks, update_block_size>>>(
+                running_mean.data_ptr<scalar_t>(),
+                running_var.data_ptr<scalar_t>(),
+                batch_mean.data_ptr<scalar_t>(),
+                batch_var.data_ptr<scalar_t>(),
+                scalar_t(momentum),
+                num_features);
+        });
+    }
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+batchnorm_cpp_source = """
+torch::Tensor batchnorm2d_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    float eps,
+    bool training,
+    float momentum);
+"""
+
+# Compile the inline CUDA code
+custom_batchnorm = load_inline(
+    name="custom_batchnorm",
+    cpp_sources=batchnorm_cpp_source,
+    cuda_sources=batchnorm_source,
+    functions=["batchnorm2d_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+)
+
+class CustomBatchNorm2d(nn.Module):
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1):
+        super(CustomBatchNorm2d, self).__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        
+        self.register_buffer('running_mean', torch.zeros(num_features))
+        self.register_buffer('running_var', torch.ones(num_features))
+        
+        self.batchnorm_op = custom_batchnorm
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.batchnorm_op.batchnorm2d_forward_cuda(
+            x, 
+            self.running_mean, 
+            self.running_var,
+            self.weight, 
+            self.bias, 
+            self.eps,
+            self.training,
+            self.momentum
+        )
+
+class ModelNew(nn.Module):
+    def __init__(self, num_features: int):
+        super(ModelNew, self).__init__()
+        self.bn = CustomBatchNorm2d(num_features=num_features)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.bn(x)
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 76
+- Original fragment: `__syncthreads();`
+- node_type: cuda_syncthreads
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 64, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis may contain errors. Reason independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 76
+- Original fragment: `__syncthreads();`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 64, 256, 256], 'dtype': 'torch.float32', 'min': -5.274710178375244, 'max': 5.644289970397949, 'mean': 0.00011265418288530782, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [16, 64, 256, 256], 'dtype': 'torch.float32', 'min': -5.683104515075684, 'max': 10000.0, 'mean': 0.00025104478118009865, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation removes the __syncthreads() barrier after writing to shared memory and before the parallel reduction loop. However, the reduction loop itself still contains __syncthreads() at each stride iteration. The removed barrier is redundant because the first iteration of the reduction loop (stride = blockDim.x / 2) already has a __syncthreads() before any thread reads from shared memory written by another thread. Threads only read from shared_sum[tid + stride] where stride > 0, and the first
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+### Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - mixed_extremes seed=42: survived
+  - mixed_extremes seed=43: survived
+  - mixed_extremes seed=44: survived
+  - mixed_extremes seed=45: survived
+  - mixed_extremes seed=46: survived
+  - near_overflow seed=47: survived
+  - near_overflow seed=48: survived
+  - near_overflow seed=49: survived
+  - near_overflow seed=50: survived
+  - near_overflow seed=51: survived
+  - near_zero seed=52: survived
+  - near_zero seed=53: survived
+  - near_zero seed=54: survived
+  - near_zero seed=55: survived
+  - near_zero seed=56: survived
+  - denormals seed=57: survived
+  - denormals seed=58: survived
+  - denormals seed=59: survived
+  - denormals seed=60: survived
+  - denormals seed=61: survived
+  - all_negative seed=62: survived
+  - all_negative seed=63: survived
+  - all_negative seed=64: survived
+  - all_negative seed=65: survived
+  - all_negative seed=66: survived
+  - all_positive seed=67: survived
+  - all_positive seed=68: survived
+  - all_positive seed=69: survived
+  - all_positive seed=70: survived
+  - all_positive seed=71: survived
+### Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+### Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+### Training Mode
+SKIPPED: operator_not_applicable
+### Configuration-Stress Track
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Supply an input where every element is the same constant (e.g., 1.0). This makes the correct per-feature sum trivially computable, and any race-induced error (e.g., reading uninitialized shared memory or a stale zero) will produce a different result.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Shape: [16, 64, 256, 256], dtype=torch.float32
+    x = torch.full((16, 64, 256, 256), 1.0, device=device, dtype=torch.float32)
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Reachability**: Derive concrete variable ranges from code constants.
+Do NOT claim a boundary case is reachable without deriving it.
+
+**Step 2 — Why previous attempts failed**: For each failed round, explain
+the specific mathematical reason it could not expose a difference.
+
+**Step 3 — Novel strategy or conclusion**: Either identify a fundamentally
+different value-level approach, or conclude unkillable with proof.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation or path argument>",
+  "survival_reason": "<updated analysis — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new VALUE-LEVEL strategy different from ALL previous, or why unkillable>",
+  "suggested_test": {
+    "description": "<what this NEW input tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... DIFFERENT from all previous>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same tensor count/shapes.
+- Shapes MUST EXACTLY MATCH Input Specification.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

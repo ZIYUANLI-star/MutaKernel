@@ -1,0 +1,119 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      14|     const float* __restrict__ targets,
+      15|     float* __restrict__ output,
+      16|     int batch_size,
+      17|     int feature_size
+      18| ) {
+      19|     __shared__ float shared_dot[THREADS_PER_BLOCK];
+      20|     __shared__ float shared_pred_norm[THREADS_PER_BLOCK];
+      21|     __shared__ float shared_target_norm[THREADS_PER_BLOCK];
+      22|     
+      23|     int tid = threadIdx.x;
+      24|     int batch_idx = blockIdx.x;
+      25|     
+>>>   26|     if (batch_idx >= batch_size) return;
+      27|     
+      28|     const float* pred_ptr = predictions + batch_idx * feature_size;
+      29|     const float* target_ptr = targets + batch_idx * feature_size;
+      30|     
+      31|     // Initialize accumulators
+      32|     float dot_product = 0.0f;
+      33|     float norm_pred = 0.0f;
+      34|     float norm_target = 0.0f;
+      35|     
+      36|     // Vectorized processing for better memory bandwidth utilization
+      37|     for (int base = 0; base < feature_size; base += THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) {
+      38|         int idx = base + tid * ELEMENTS_PER_THREAD;
+```
+
+## Mutated Code (around mutation site)
+```
+      14|     const float* __restrict__ targets,
+      15|     float* __restrict__ output,
+      16|     int batch_size,
+      17|     int feature_size
+      18| ) {
+      19|     __shared__ float shared_dot[THREADS_PER_BLOCK];
+      20|     __shared__ float shared_pred_norm[THREADS_PER_BLOCK];
+      21|     __shared__ float shared_target_norm[THREADS_PER_BLOCK];
+      22|     
+      23|     int tid = threadIdx.x;
+      24|     int batch_idx = blockIdx.x;
+      25|     
+>>>   26|     if (batch_idx >= batch_size + 1) return;
+      27|     
+      28|     const float* pred_ptr = predictions + batch_idx * feature_size;
+      29|     const float* target_ptr = targets + batch_idx * feature_size;
+      30|     
+      31|     // Initialize accumulators
+      32|     float dot_product = 0.0f;
+      33|     float norm_pred = 0.0f;
+      34|     float norm_target = 0.0f;
+      35|     
+      36|     // Vectorized processing for better memory bandwidth utilization
+      37|     for (int base = 0; base < feature_size; base += THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) {
+      38|         int idx = base + tid * ELEMENTS_PER_THREAD;
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 26
+- Original fragment: `batch_idx >= batch_size`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can only be killed by launching more CUDA blocks than the batch size, specifically with `gridDim.x >= batch_size + 1`. This allows a block with `batch_idx == batch_size` to execute. That block would then perform out-of-bounds memory accesses through `pred_ptr` and `target_ptr` (pointing one batch beyond valid memory), potentially causing a segmentation fault or reading garbage values. However, note that the mutation testing tool may not automatically vary launch configurations, which is why the mutant survived.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use small batch_size=1, feature_size=4096
+    batch_size = 1
+    feature_size = 4096
+    
+    # Create tensors with known pattern: first batch is all 1.0s, rest is uninitialized/zeros
+    predictions = torch.ones((batch_size, feature_size), dtype=torch.float32, device=device)
+    targets = torch.ones((batch_size, feature_size), dtype=torch.float32, device=device)
+    
+    # Return exactly 2 tensors as required
+    return [predictions, targets]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

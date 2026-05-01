@@ -1,0 +1,175 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      31|     // Initialize accumulators
+      32|     float dot_product = 0.0f;
+      33|     float norm_pred = 0.0f;
+      34|     float norm_target = 0.0f;
+      35|     
+      36|     // Vectorized processing for better memory bandwidth utilization
+      37|     for (int base = 0; base < feature_size; base += THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) {
+      38|         int idx = base + tid * ELEMENTS_PER_THREAD;
+      39|         
+      40|         #pragma unroll
+      41|         for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+      42|             int element_idx = idx + i;
+>>>   43|             if (element_idx < feature_size) {
+      44|                 float pred_val = pred_ptr[element_idx];
+      45|                 float target_val = target_ptr[element_idx];
+      46|                 dot_product += pred_val * target_val;
+      47|                 norm_pred += pred_val * pred_val;
+      48|                 norm_target += target_val * target_val;
+      49|             }
+      50|         }
+      51|     }
+      52|     
+      53|     // Store thread results in shared memory
+      54|     shared_dot[tid] = dot_product;
+      55|     shared_pred_norm[tid] = norm_pred;
+```
+
+## Mutated Code (around mutation site)
+```
+      31|     // Initialize accumulators
+      32|     float dot_product = 0.0f;
+      33|     float norm_pred = 0.0f;
+      34|     float norm_target = 0.0f;
+      35|     
+      36|     // Vectorized processing for better memory bandwidth utilization
+      37|     for (int base = 0; base < feature_size; base += THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) {
+      38|         int idx = base + tid * ELEMENTS_PER_THREAD;
+      39|         
+      40|         #pragma unroll
+      41|         for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+      42|             int element_idx = idx + i;
+>>>   43|             if (element_idx <= feature_size) {
+      44|                 float pred_val = pred_ptr[element_idx];
+      45|                 float target_val = target_ptr[element_idx];
+      46|                 dot_product += pred_val * target_val;
+      47|                 norm_pred += pred_val * pred_val;
+      48|                 norm_target += target_val * target_val;
+      49|             }
+      50|         }
+      51|     }
+      52|     
+      53|     // Store thread results in shared memory
+      54|     shared_dot[tid] = dot_product;
+      55|     shared_pred_norm[tid] = norm_pred;
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 43
+- Original fragment: `<`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input shape so that feature_size is NOT divisible by the vectorization stride (THREADS_PER_BLOCK * ELEMENTS_PER_THREAD). This will cause the final iteration of the outer loop to compute element_idx values that exceed feature_size. The mutant's `<=` condition will allow exactly one extra out-of-bounds access (element_idx == feature_size), while the original correctly stops before it. By controlling the memory immediately after the allocated buffer (e.g., via separate allocation), we can make this out-of-bounds read produce a non-zero value, altering the computed dot product and norms.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use feature_size = 4095 (not divisible by common strides like 1024)
+    # Allocate 4096 elements, fill the extra one with noticeable values
+    shape = [128, 4095]  # Changed from 4096 to 4095
+    
+    # Create base tensors of size 4096 (one extra column)
+    pred_full = torch.zeros(128, 4096, device=device, dtype=torch.float32)
+    target_full = torch.zeros(128, 4096, device=device, dtype=torch.float32)
+    
+    # Fill with random data in the valid range [0, 4094]
+    pred_full[:, :4095] = torch.randn(128, 4095, device=device)
+    target_full[:, :4095] = torch.randn(128, 4095, device=device)
+    
+    # Set the element immediately after the valid range (index 4095) to large values
+    # This memory will be accessed by the mutant but not the original
+    pred_full[:, 4095] = 1000.0
+    target_full[:, 4095] = 2000.0
+    
+    # Slice to the intended size (4095 columns)
+    pred = pred_full[:, :4095]
+    target = target_full[:, :4095]
+    
+    return [pred, target]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=9.966523e-01, mean_diff=9.966523e-01, ref_range=[9.9920e-01,9.9920e-01], mut_range=[2.5446e-03,2.5446e-03]
+
+### Round 2
+- Strategy: Instead of trying to cause out-of-bounds access, focus on numerical equivalence when element_idx == feature_size would occur if it were reachable. Since it's not reachable, the mutant is behaviorally equivalent to the original for all valid inputs. However, we can test the boundary condition by modifying the loop's termination condition through input-dependent execution paths. Specifically, we can create inputs where the floating-point calculations cause the loop to behave differently due to the mutation, even though the index boundary isn't directly accessed.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use the original shape as required
+    shape = [128, 4096]
+    
+    # Create tensors with extreme values to test floating-point edge cases
+    # Fill with mostly normal values
+    pred = torch.randn(shape, device=device, dtype=torch.float32)
+    target = torch.randn(shape, device=device, dtype=torch.float32)
+    
+    # Set specific elements to extreme values that might cause floating-point
+    # comparison issues in the loop condition
+    # Use NaN and Inf values to see if they propagate differently
+    for i in range(shape[0]):
+        # Set some elements to NaN
+        pred[i, 0] = float('nan')
+        target[i, 0] = float('nan')
+        # Set some to infinity
+        pred[i, 1] = float('inf')
+        target[i, 1] = float('inf')
+        # Set some to negative infinity
+        pred[i, 2] = float('-inf')
+        target[i, 2] = float('-inf')
+        # Set some to denormalized numbers
+        pred[i, 3] = torch.finfo(torch.float32).tiny / 2.0
+        target[i, 3] = torch.finfo(torch.float32).tiny / 2.0
+        
+    # Additionally, create a pattern where values might cause the loop
+    # to behave differently due to floating-point rounding in index calculations
+    # Use very large feature_size values near precision limits
+    # (though shape is fixed, we test with the given shape)
+    
+    return [pred, target]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

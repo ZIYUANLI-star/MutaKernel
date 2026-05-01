@@ -1,0 +1,1717 @@
+{
+  "kernel": {
+    "problem_id": 21,
+    "level": 1,
+    "problem_name": "L1_P21",
+    "language": "cuda"
+  },
+  "summary": {
+    "total": 14,
+    "killed": 8,
+    "survived": 0,
+    "stillborn": 0,
+    "strict_equivalent": 1,
+    "candidate_equivalent": 5,
+    "equivalent": 6,
+    "mutation_score": 0.6154,
+    "mutation_score_optimistic": 1.0,
+    "score_by_category": {
+      "A": 0.5,
+      "B": 0.8,
+      "C": 0.0,
+      "D": 0.0
+    }
+  },
+  "mutants": [
+    {
+      "id": "L1_P21__arith_replace__14",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L30",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 773.5309600830078,
+      "site": {
+        "line_start": 30,
+        "line_end": 30,
+        "original_code": "/",
+        "node_type": "cuda_Div"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f * (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    },
+    {
+      "id": "L1_P21__arith_replace__9",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L27",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 682.9290390014648,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": "+",
+        "node_type": "cuda_Add"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f - expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    },
+    {
+      "id": "L1_P21__arith_replace__8",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L27",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 920.0270175933838,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": "/",
+        "node_type": "cuda_Div"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f * (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    },
+    {
+      "id": "L1_P21__relop_replace__3",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L55",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3264ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 697.782039642334,
+      "site": {
+        "line_start": 55,
+        "line_end": 55,
+        "original_code": "==",
+        "node_type": "cuda_Eq"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() != torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "equiv_detail": {
+        "mutant_id": "L1_P21__relop_replace__3",
+        "operator": "relop_replace",
+        "line_start": 55,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P21",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/21_Sigmoid.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "d95fd5719b69fc4a",
+          "cuda_norm_hash_mut": "90f459485af1727e",
+          "py_norm_hash_orig": "0ad127e8036a3dce",
+          "py_norm_hash_mut": "6edd0154b3b22f4c",
+          "mutation_site_line": 55,
+          "original_fragment": "==",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 36,
+              "original": "if (input.scalar_type() == torch::kFloat32) {",
+              "mutated": "if (input.scalar_type() != torch::kFloat32) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "relop_replace",
+          "time_ms": 3264,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.515127182006836,
+                "mean": -0.0012394363293424249,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4131.53369140625,
+                "max": 5140.97314453125,
+                "mean": -2.817762613296509,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the condition from `== torch::kFloat32` to `!= torch::kFloat32`, which inverts the branch logic. However, the Python host code in `ModelNew.forward()` already guards the call to `vectorized_sigmoid_cuda` with `if x.is_cuda and x.dtype == torch.float32`. Therefore, when the input is a CUDA float32 tensor (as specified in the fixed input spec), the original code enters the `if` branch and runs the custom kernel, while the mutant enters the `else` branch and calls `torch::sigmoid(input)`. Both paths compute the sigmoid function, but the custom kernel uses vectorized float4 operations and may produce slightly different numerical results due to different floating-point operation order. Layer 2 tested 100+ random and stress inputs and found all outputs bitwise identical, indicating that for the given fixed shapes and float32 inputs, the numerical differences are negligible or nonexistent. Since the input shape and dtype are fixed and the mutation only affects the branch selection for float32 CUDA tensors, no value-level strategy can distinguish the two implementations under bitwise comparison.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the condition from `== torch::kFloat32` to `!= torch::kFloat32`, which inverts the branch logic. However, the Python host code in `ModelNew.forward()` already guards the call to `vectorized_sigmoid_cuda` with `if x.is_cuda and x.dtype == torch.float32`. Therefore, when the input is a CUDA float32 tensor (as specified in the fixed input spec), the original code enters the `if` branch and runs the custom kernel, while the mutant enters the `else` branch and calls `torch::sigmoid(input)`. Both paths compute the sigmoid function, but the custom kernel uses vectorized float4 operations and may produce slightly different numerical results due to different floating-point operation order. Layer 2 tested 100+ random and stress inputs and found all outputs bitwise identical, indicating that for the given fixed shapes and float32 inputs, the numerical differences are negligible or nonexistent. Since t",
+          "time_ms": 5347,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: relop_replace\n- All runs bitwise identical: **True**\n- Time taken: 3264ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P21__relop_replace__0",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L17",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3291ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 701.3871669769287,
+      "site": {
+        "line_start": 17,
+        "line_end": 17,
+        "original_code": "<",
+        "node_type": "cuda_Lt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 <= size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "equiv_detail": {
+        "mutant_id": "L1_P21__relop_replace__0",
+        "operator": "relop_replace",
+        "line_start": 17,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P21",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/21_Sigmoid.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "d95fd5719b69fc4a",
+          "cuda_norm_hash_mut": "4c3846d06d56423c",
+          "py_norm_hash_orig": "0ad127e8036a3dce",
+          "py_norm_hash_mut": "1fb94f9cedc40d01",
+          "mutation_site_line": 17,
+          "original_fragment": "<",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 8,
+              "original": "if (idx + 3 < size) {",
+              "mutated": "if (idx + 3 <= size) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "relop_replace",
+          "time_ms": 3291,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.515127182006836,
+                "mean": -0.0012394363293424249,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4131.53369140625,
+                "max": 5140.97314453125,
+                "mean": -2.817762613296509,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the condition from `idx + 3 < size` to `idx + 3 <= size`. This affects only the boundary case when `idx + 3 == size`. However, due to the grid/block computation, `idx` is always a multiple of 4 (since `threadIdx.x * 4` and `blockIdx.x * blockDim.x * 4`). Therefore, `idx + 3 == size` implies `size` is congruent to 3 modulo 4. But the kernel's host code computes `vectorized_size = size / 4` (integer division) and `num_blocks = (vectorized_size + block_size - 1) / block_size`. The last thread block may have threads where `idx` exceeds `size - 4`, but the condition `idx + 3 <= size` would incorrectly allow a vectorized store when `idx + 3 == size`, causing an out-of-bounds write to `output[idx + 3]`. However, the fixed input shape is [16, 16384], which has `size = 262144`, a multiple of 4. For such sizes, `idx + 3 == size` never occurs because `idx` is always a multiple of 4 and `size` is a multiple of 4, so `idx + 3` can never equal `size`. Thus, the mutant behaves identically to the original for all inputs with size divisible by 4. Layer 2's 100+ random tests confirm bitwise equality. No value-level strategy can distinguish them because the condition change is never triggered.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the condition from `idx + 3 < size` to `idx + 3 <= size`. This affects only the boundary case when `idx + 3 == size`. However, due to the grid/block computation, `idx` is always a multiple of 4 (since `threadIdx.x * 4` and `blockIdx.x * blockDim.x * 4`). Therefore, `idx + 3 == size` implies `size` is congruent to 3 modulo 4. But the kernel's host code computes `vectorized_size = size / 4` (integer division) and `num_blocks = (vectorized_size + block_size - 1) / block_size`. The last thread block may have threads where `idx` exceeds `size - 4`, but the condition `idx + 3 <= size` would incorrectly allow a vectorized store when `idx + 3 == size`, causing an out-of-bounds write to `output[idx + 3]`. However, the fixed input shape is [16, 16384], which has `size = 262144`, a multiple of 4. For such sizes, `idx + 3 == size` never occurs because `idx` is always a multiple of 4 and `size` is a mul",
+          "time_ms": 6868,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: relop_replace\n- All runs bitwise identical: **True**\n- Time taken: 3291ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P21__relop_replace__5",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L102",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3195ms, CUDA strings identical)",
+      "kill_input_seed": null,
+      "execution_time_ms": 604.5184135437012,
+      "site": {
+        "line_start": 102,
+        "line_end": 102,
+        "original_code": "==",
+        "node_type": "Eq"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype != torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "equiv_detail": {
+        "mutant_id": "L1_P21__relop_replace__5",
+        "operator": "relop_replace",
+        "line_start": 102,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P21",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/21_Sigmoid.py",
+        "layer0": {
+          "cuda_strings_equal": true,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "python_host",
+          "cuda_norm_hash_orig": "d95fd5719b69fc4a",
+          "cuda_norm_hash_mut": "d95fd5719b69fc4a",
+          "py_norm_hash_orig": "0ad127e8036a3dce",
+          "py_norm_hash_mut": "59a6274a403ec367",
+          "mutation_site_line": 102,
+          "original_fragment": "==",
+          "host_diff_analysis": {
+            "mutation_location": "inside class ModelNew",
+            "mutated_variable": null,
+            "used_in_model": null,
+            "used_in_get_inputs": null
+          },
+          "verdict": "cuda_identical_host_differs"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "relop_replace",
+          "time_ms": 3195,
+          "cuda_was_identical": true,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.515127182006836,
+                "mean": -0.0012394363293424249,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4131.53369140625,
+                "max": 5140.97314453125,
+                "mean": -2.817762613296509,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the condition on line 102 from `x.dtype == torch.float32` to `x.dtype != torch.float32`. However, the fixed input specification requires `dtype=torch.float32` and the tensor is placed on CUDA via `get_inputs()`. Therefore, in the original code, the condition `x.is_cuda and x.dtype == torch.float32` is true, and the custom CUDA kernel is called. In the mutant, the condition `x.is_cuda and x.dtype != torch.float32` is false (since dtype is float32), so the fallback `torch.sigmoid(x)` is executed. The CUDA kernel internally also checks `if (input.scalar_type() == torch::kFloat32)` and calls the same kernel or falls back to `torch::sigmoid`. Thus, for float32 CUDA inputs, both original and mutant ultimately compute `torch.sigmoid(x)` — the original via the custom kernel (which is mathematically identical to sigmoid) and the mutant via PyTorch's sigmoid. Since both paths produce bitwise-identical results for all float32 values (as confirmed by Layer 2's 100+ tests), the mutant is equivalent under the fixed-shape, fixed-dtype testing constraints.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the condition on line 102 from `x.dtype == torch.float32` to `x.dtype != torch.float32`. However, the fixed input specification requires `dtype=torch.float32` and the tensor is placed on CUDA via `get_inputs()`. Therefore, in the original code, the condition `x.is_cuda and x.dtype == torch.float32` is true, and the custom CUDA kernel is called. In the mutant, the condition `x.is_cuda and x.dtype != torch.float32` is false (since dtype is float32), so the fallback `torch.sigmoid(x)` is executed. The CUDA kernel internally also checks `if (input.scalar_type() == torch::kFloat32)` and calls the same kernel or falls back to `torch::sigmoid`. Thus, for float32 CUDA inputs, both original and mutant ultimately compute `torch.sigmoid(x)` — the original via the custom kernel (which is mathematically identical to sigmoid) and the mutant via PyTorch's sigmoid. Since both paths produce bitwise-identica",
+          "time_ms": 6106,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **True**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: cuda_identical_host_differs\n\n**Host-code diff analysis** (CUDA strings are identical, so mutation is in Python host code):\n- Mutation location: **inside class ModelNew**\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: relop_replace\n- All runs bitwise identical: **True**\n- Time taken: 3195ms\n- Note: CUDA kernel strings were identical (mutation in host code only)\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P21__const_perturb__2",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L18",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3316ms, CUDA strings identical)",
+      "kill_input_seed": null,
+      "execution_time_ms": 698.0979442596436,
+      "site": {
+        "line_start": 18,
+        "line_end": 18,
+        "original_code": "4",
+        "node_type": "const:int+1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 5 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "equiv_detail": {
+        "mutant_id": "L1_P21__const_perturb__2",
+        "operator": "const_perturb",
+        "line_start": 18,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P21",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/21_Sigmoid.py",
+        "layer0": {
+          "cuda_strings_equal": true,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "python_host",
+          "cuda_norm_hash_orig": "d95fd5719b69fc4a",
+          "cuda_norm_hash_mut": "d95fd5719b69fc4a",
+          "py_norm_hash_orig": "0ad127e8036a3dce",
+          "py_norm_hash_mut": "c93dde1af14c88a1",
+          "mutation_site_line": 18,
+          "original_fragment": "4",
+          "host_diff_analysis": {
+            "mutation_location": "module_level",
+            "mutated_variable": null,
+            "used_in_model": null,
+            "used_in_get_inputs": null
+          },
+          "verdict": "cuda_identical_host_differs"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "const_perturb",
+          "time_ms": 3316,
+          "cuda_was_identical": true,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.515127182006836,
+                "mean": -0.0012394363293424249,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_all_negative_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -514.0972900390625,
+                "max": -0.00043383942102082074,
+                "mean": -79.78519439697266,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes only a comment on line 18 from 'Load 4 elements at once' to 'Load 5 elements at once'. This is a purely cosmetic change to a comment string inside the CUDA kernel source. The actual code that loads and processes data remains identical — it still loads exactly 4 elements (in_vec.x through in_vec.w) and computes sigmoid for 4 elements. Comments have no effect on compilation or execution. Since the mutation does not alter any executable instruction, constant, or control flow, it cannot affect the output for any input. Layer 2's bitwise identical results across 100 diverse value distributions confirm this. No value-level strategy can distinguish the original from the mutant because the compiled kernel is exactly the same.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes only a comment on line 18 from 'Load 4 elements at once' to 'Load 5 elements at once'. This is a purely cosmetic change to a comment string inside the CUDA kernel source. The actual code that loads and processes data remains identical — it still loads exactly 4 elements (in_vec.x through in_vec.w) and computes sigmoid for 4 elements. Comments have no effect on compilation or execution. Since the mutation does not alter any executable instruction, constant, or control flow, it cannot affect the output for any input. Layer 2's bitwise identical results across 100 diverse value distributions confirm this. No value-level strategy can distinguish the original from the mutant because the compiled kernel is exactly the same.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}",
+          "time_ms": 3742,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **True**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: cuda_identical_host_differs\n\n**Host-code diff analysis** (CUDA strings are identical, so mutation is in Python host code):\n- Mutation location: **module_level**\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: const_perturb\n- All runs bitwise identical: **True**\n- Time taken: 3316ms\n- Note: CUDA kernel strings were identical (mutation in host code only)\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P21__const_perturb__19",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L109",
+      "status": "strict_equivalent",
+      "error_message": "Static rule: dead_host_constant",
+      "kill_input_seed": null,
+      "execution_time_ms": 707.2057723999023,
+      "site": {
+        "line_start": 109,
+        "line_end": 109,
+        "original_code": "16384",
+        "node_type": "const:int-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16383\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "equiv_detail": {
+        "mutant_id": "L1_P21__const_perturb__19",
+        "operator": "const_perturb",
+        "line_start": 109,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P21",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/21_Sigmoid.py",
+        "layer0": {
+          "cuda_strings_equal": true,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "python_host",
+          "cuda_norm_hash_orig": "d95fd5719b69fc4a",
+          "cuda_norm_hash_mut": "d95fd5719b69fc4a",
+          "py_norm_hash_orig": "0ad127e8036a3dce",
+          "py_norm_hash_mut": "00f6ae45cdaae777",
+          "mutation_site_line": 109,
+          "original_fragment": "16384",
+          "host_diff_analysis": {
+            "mutation_location": "module_level",
+            "mutated_variable": "dim",
+            "used_in_model": false,
+            "used_in_get_inputs": true
+          },
+          "verdict": "cuda_identical_host_differs"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": "dead_host_constant",
+          "rule_description": "module-level constant not used by ModelNew; dead code under fixed-shape testing",
+          "rule_details": {
+            "matched_variable": "dim",
+            "mutation_location": "module_level",
+            "used_in_model": false,
+            "used_in_get_inputs": true,
+            "why_dead": "variable not referenced in ModelNew; get_inputs() comes from REFERENCE module"
+          },
+          "verdict": "STRICT_EQUIVALENT (dead_host_constant)"
+        },
+        "decided_at": "layer1",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the module-level constant `dim` from 16384 to 16383. However, this constant is only used in `get_inputs()` to create the input tensor, and the input shapes are fixed by the testing framework to [16, 16384] regardless of this constant. The CUDA kernel and the forward method of ModelNew do not reference `dim`; they operate on the actual tensor dimensions via `input.numel()` and `input.shape`. Therefore, the mutation has no effect on the execution path or the computation result. The automated pipeline correctly identified this as dead code under fixed-shape testing.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the module-level constant `dim` from 16384 to 16383. However, this constant is only used in `get_inputs()` to create the input tensor, and the input shapes are fixed by the testing framework to [16, 16384] regardless of this constant. The CUDA kernel and the forward method of ModelNew do not reference `dim`; they operate on the actual tensor dimensions via `input.numel()` and `input.shape`. Therefore, the mutation has no effect on the execution path or the computation result. The automated pipeline correctly identified this as dead code under fixed-shape testing.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}",
+          "time_ms": 3458,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **True**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: cuda_identical_host_differs\n\n**Host-code diff analysis** (CUDA strings are identical, so mutation is in Python host code):\n- Mutation location: **module_level**\n- Mutated variable: `dim`\n- Used inside ModelNew (forward/init): **False**\n- Used inside get_inputs/get_init_inputs: **True**\n- **IMPORTANT**: This variable is NOT referenced in ModelNew. Under our fixed-shape testing framework, get_inputs() always comes from the REFERENCE module, so this mutation is effectively dead code.\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **dead_host_constant**\n- Rule explanation: module-level constant not used by ModelNew; dead code under fixed-shape testing\n- Layer 1 verdict: STRICT_EQUIVALENT (dead_host_constant)\n\n### Layer 2 — Dynamic Comparison: (not reached — decided at earlier layer)\n\n**Decision made at**: layer1",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P21__const_perturb__6",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L23",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 609.5178127288818,
+      "site": {
+        "line_start": 23,
+        "line_end": 23,
+        "original_code": "3",
+        "node_type": "const:int+1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 4];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    },
+    {
+      "id": "L1_P21__index_replace__4",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L15",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 724.0927219390869,
+      "site": {
+        "line_start": 15,
+        "line_end": 15,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.y * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    },
+    {
+      "id": "L1_P21__index_replace__1",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L15",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 794.4333553314209,
+      "site": {
+        "line_start": 15,
+        "line_end": 15,
+        "original_code": "blockIdx.x",
+        "node_type": "cuda_dim|z"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.z * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    },
+    {
+      "id": "L1_P21__index_replace__11",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L33",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 598.9458560943604,
+      "site": {
+        "line_start": 33,
+        "line_end": 33,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|z"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.z] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    },
+    {
+      "id": "L1_P21__mask_boundary__0",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L37",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3245ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 895.9925174713135,
+      "site": {
+        "line_start": 37,
+        "line_end": 37,
+        "original_code": "i < size",
+        "node_type": "rhs-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size - 1) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "equiv_detail": {
+        "mutant_id": "L1_P21__mask_boundary__0",
+        "operator": "mask_boundary",
+        "line_start": 37,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P21",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/21_Sigmoid.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "d95fd5719b69fc4a",
+          "cuda_norm_hash_mut": "6bb5b17a4210aecf",
+          "py_norm_hash_orig": "0ad127e8036a3dce",
+          "py_norm_hash_mut": "297296e1e4572ad8",
+          "mutation_site_line": 37,
+          "original_fragment": "i < size",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 22,
+              "original": "if (idx + i < size) {",
+              "mutated": "if (idx + i < size - 1) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "mask_boundary",
+          "time_ms": 3245,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.515127182006836,
+                "mean": -0.0012394363293424249,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4131.53369140625,
+                "max": 5140.97314453125,
+                "mean": -2.817762613296509,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the boundary guard from `idx + i < size` to `idx + i < size - 1` in the else branch that handles remaining elements. However, the else branch is only entered when `idx + 3 >= size`, meaning the thread is processing the last few elements of the array. In this case, the loop iterates i=0..3, and the condition `idx + i < size - 1` will skip the very last element (when idx + i == size - 1). But crucially, the last element is always handled by the main vectorized path when size is a multiple of 4, or by a different thread when size is not a multiple of 4. For the fixed shape [16, 16384], size = 262144, which is exactly divisible by 4. Therefore, every element is processed by the vectorized path (idx + 3 < size is true for all threads), and the else branch is never executed. The mutation has no effect on the output for any input values because the mutated code is dead code under the fixed shape. Layer 2's 100+ random tests confirm bitwise equality, and no value-level strategy can reach the mutated code.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the boundary guard from `idx + i < size` to `idx + i < size - 1` in the else branch that handles remaining elements. However, the else branch is only entered when `idx + 3 >= size`, meaning the thread is processing the last few elements of the array. In this case, the loop iterates i=0..3, and the condition `idx + i < size - 1` will skip the very last element (when idx + i == size - 1). But crucially, the last element is always handled by the main vectorized path when size is a multiple of 4, or by a different thread when size is not a multiple of 4. For the fixed shape [16, 16384], size = 262144, which is exactly divisible by 4. Therefore, every element is processed by the vectorized path (idx + 3 < size is true for all threads), and the else branch is never executed. The mutation has no effect on the output for any input values because the mutated code is dead code under the fixed shape. ",
+          "time_ms": 5122,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: mask_boundary\n- All runs bitwise identical: **True**\n- Time taken: 3245ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P21__launch_config_mutate__0",
+      "operator_name": "launch_config_mutate",
+      "operator_category": "B",
+      "description": "Perturb grid/block sizing expressions (// BLOCK, triton.cdiv) by ±1 @ L51",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 977.625846862793,
+      "site": {
+        "line_start": 51,
+        "line_end": 51,
+        "original_code": "(vectorized_size + block_size - 1) / block_size",
+        "node_type": "-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for vectorized sigmoid\nsigmoid_kernel_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <c10/cuda/CUDAStream.h>\n\n// Vectorized sigmoid using 1/(1+exp(-x))\n__global__ void vectorized_sigmoid_kernel(const float* __restrict__ input, \n                                          float* __restrict__ output, \n                                          int size) {\n    const int idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;\n    \n    if (idx + 3 < size) {\n        // Load 4 elements at once\n        float4 in_vec;\n        in_vec.x = input[idx];\n        in_vec.y = input[idx + 1];\n        in_vec.z = input[idx + 2];\n        in_vec.w = input[idx + 3];\n        \n        // Compute sigmoid for all 4 elements\n        float4 out_vec;\n        out_vec.x = 1.0f / (1.0f + expf(-in_vec.x));\n        out_vec.y = 1.0f / (1.0f + expf(-in_vec.y));\n        out_vec.z = 1.0f / (1.0f + expf(-in_vec.z));\n        out_vec.w = 1.0f / (1.0f + expf(-in_vec.w));\n        \n        // Store 4 elements at once\n        reinterpret_cast<float4*>(output)[blockIdx.x * blockDim.x + threadIdx.x] = out_vec;\n    } else {\n        // Handle remaining elements\n        for (int i = 0; i < 4; i++) {\n            if (idx + i < size) {\n                float x = input[idx + i];\n                output[idx + i] = 1.0f / (1.0f + expf(-x));\n            }\n        }\n    }\n}\n\ntorch::Tensor vectorized_sigmoid_cuda(torch::Tensor input) {\n    auto size = input.numel();\n    auto output = torch::empty_like(input);\n    \n    const int block_size = 256;  // 256 threads per block\n    const int vectorized_size = size / 4;\n    const int num_blocks = (vectorized_size + block_size - 1) / block_size - 1;\n    \n    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();\n    \n    if (input.scalar_type() == torch::kFloat32) {\n        vectorized_sigmoid_kernel<<<num_blocks, block_size, 0, stream>>>(\n            input.data_ptr<float>(),\n            output.data_ptr<float>(),\n            size\n        );\n    } else {\n        // Fallback to PyTorch for other types\n        output = torch::sigmoid(input);\n    }\n    \n    return output;\n}\n\"\"\"\n\nsigmoid_cpp_source = \"torch::Tensor vectorized_sigmoid_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code\nvectorized_sigmoid_module = load_inline(\n    name=\"vectorized_sigmoid\",\n    cpp_sources=sigmoid_cpp_source,\n    cuda_sources=sigmoid_kernel_source,\n    functions=[\"vectorized_sigmoid_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a vectorized Sigmoid activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.vectorized_sigmoid = vectorized_sigmoid_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies vectorized Sigmoid activation to the input tensor.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Sigmoid applied, same shape as input.\n        \"\"\"\n        if x.is_cuda and x.dtype == torch.float32:\n            return self.vectorized_sigmoid.vectorized_sigmoid_cuda(x)\n        else:\n            # Fallback to PyTorch for CPU tensors or non-float32 types\n            return torch.sigmoid(x)\n\nbatch_size = 16\ndim = 16384\n\ndef get_inputs():\n    x = torch.randn(batch_size, dim).cuda()\n    return [x]\n\ndef get_init_inputs():\n    return []  # No special initialization inputs needed"
+    }
+  ]
+}

@@ -1,0 +1,118 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+       9| 
+      10| template<typename scalar_t>
+      11| __global__ void masked_cumsum_kernel(
+      12|     const scalar_t* __restrict__ input,
+      13|     const bool* __restrict__ mask,
+      14|     scalar_t* __restrict__ output,
+      15|     const int64_t outer_size,
+      16|     const int64_t dim_size,
+      17|     const int64_t inner_size
+      18| ) {
+      19|     // Each block handles one outer position
+      20|     const int64_t outer_idx = blockIdx.x;
+>>>   21|     if (outer_idx >= outer_size) return;
+      22|     
+      23|     // Each thread handles multiple inner positions with vectorized loads
+      24|     const int64_t base_offset = outer_idx * dim_size * inner_size;
+      25|     
+      26|     // Process inner positions in parallel
+      27|     for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {
+      28|         scalar_t cum_sum = 0;
+      29|         
+      30|         // Sequential scan along the cumulative dimension
+      31|         for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
+      32|             const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;
+      33|             if (mask[offset]) {
+```
+
+## Mutated Code (around mutation site)
+```
+       9| 
+      10| template<typename scalar_t>
+      11| __global__ void masked_cumsum_kernel(
+      12|     const scalar_t* __restrict__ input,
+      13|     const bool* __restrict__ mask,
+      14|     scalar_t* __restrict__ output,
+      15|     const int64_t outer_size,
+      16|     const int64_t dim_size,
+      17|     const int64_t inner_size
+      18| ) {
+      19|     // Each block handles one outer position
+      20|     const int64_t outer_idx = blockIdx.x;
+>>>   21|     if (outer_idx > outer_size) return;
+      22|     
+      23|     // Each thread handles multiple inner positions with vectorized loads
+      24|     const int64_t base_offset = outer_idx * dim_size * inner_size;
+      25|     
+      26|     // Process inner positions in parallel
+      27|     for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {
+      28|         scalar_t cum_sum = 0;
+      29|         
+      30|         // Sequential scan along the cumulative dimension
+      31|         for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
+      32|             const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;
+      33|             if (mask[offset]) {
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 21
+- Original fragment: `outer_idx >= outer_size`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4000], dtype=torch.float32
+  arg[1]: shape=[128, 4000], dtype=torch.bool
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To kill this mutant, we must launch the kernel with a grid size larger than outer_size, so that a block with blockIdx.x == outer_size executes. This block would compute an invalid base_offset (outer_idx * dim_size * inner_size) leading to out-of-bounds memory accesses in the mutant, while the original would safely return. However, the test suite controls the launch configuration, not the input tensors. Therefore, we cannot directly control the grid size via input tensors. But we can create an input where outer_size is smaller than the typical grid size used by the test suite. For example, if the test suite always launches a multiple of 32 blocks (for warp alignment), setting outer_size to a value not a multiple of 32 (e.g., 1) might cause the grid to be larger than outer_size, triggering the bug.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Use outer_size=1, dim_size=4000, inner_size=1 (implied by 2D shape [1, 4000])
+    # This corresponds to tensors of shape [1, 4000]
+    outer_size = 1
+    dim_size = 4000
+    inner_size = 1
+    total_elements = outer_size * dim_size * inner_size
+    
+    input_tensor = torch.randn(total_elements, dtype=torch.float32, device=device).view(outer_size, dim_size)
+    mask_tensor = torch.ones(total_elements, dtype=torch.bool, device=device).view(outer_size, dim_size)
+    
+    return [input_tensor, mask_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

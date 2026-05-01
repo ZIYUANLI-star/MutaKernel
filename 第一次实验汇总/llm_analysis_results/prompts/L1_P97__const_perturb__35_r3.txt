@@ -1,0 +1,130 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+     105| torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+     106|     auto batch_size = predictions.size(0);
+     107|     auto feature_size = predictions.size(1);
+     108|     
+     109|     // Allocate output tensor (single value)
+     110|     auto options = torch::TensorOptions()
+     111|         .dtype(predictions.dtype())
+     112|         .device(predictions.device());
+     113|     auto output = torch::zeros({1}, options);
+     114|     
+     115|     // Choose optimal configuration based on feature size
+     116|     const int THREADS = 256;
+>>>  117|     const int ELEMENTS_PER_THREAD = 4;  // Process 4 elements per thread for better memory coalescing
+     118|     
+     119|     dim3 grid_size(batch_size, 1, 1);
+     120|     dim3 block_size(THREADS, 1, 1);
+     121|     
+     122|     // Launch fused kernel - one block per batch element
+     123|     cosine_loss_fused_kernel<THREADS, ELEMENTS_PER_THREAD><<<grid_size, block_size>>>(
+     124|         predictions.data_ptr<float>(),
+     125|         targets.data_ptr<float>(),
+     126|         output.data_ptr<float>(),
+     127|         batch_size,
+     128|         feature_size
+     129|     );
+```
+
+## Mutated Code (around mutation site)
+```
+     105| torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+     106|     auto batch_size = predictions.size(0);
+     107|     auto feature_size = predictions.size(1);
+     108|     
+     109|     // Allocate output tensor (single value)
+     110|     auto options = torch::TensorOptions()
+     111|         .dtype(predictions.dtype())
+     112|         .device(predictions.device());
+     113|     auto output = torch::zeros({1}, options);
+     114|     
+     115|     // Choose optimal configuration based on feature size
+     116|     const int THREADS = 256;
+>>>  117|     const int ELEMENTS_PER_THREAD = 3;  // Process 4 elements per thread for better memory coalescing
+     118|     
+     119|     dim3 grid_size(batch_size, 1, 1);
+     120|     dim3 block_size(THREADS, 1, 1);
+     121|     
+     122|     // Launch fused kernel - one block per batch element
+     123|     cosine_loss_fused_kernel<THREADS, ELEMENTS_PER_THREAD><<<grid_size, block_size>>>(
+     124|         predictions.data_ptr<float>(),
+     125|         targets.data_ptr<float>(),
+     126|         output.data_ptr<float>(),
+     127|         batch_size,
+     128|         feature_size
+     129|     );
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 117
+- Original fragment: `4`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use a feature size that causes different warp divergence or partial-warp handling between ELEMENTS_PER_THREAD=3 and 4. Specifically, choose a feature size where (feature_size % (256×3)) ≠ (feature_size % (256×4)), causing different numbers of threads to be active in the final loop iteration, leading to different floating-point accumulation patterns that may amplify rounding differences beyond noise.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    batch_size = 128
+    feature_size = 1025  # Mismatched remainder for EPT=3 vs 4
+    # Use structured alternating signs to maximize cancellation effects
+    t = torch.arange(feature_size, dtype=torch.float32, device=device)
+    predictions = (t * 1e-3).sin().unsqueeze(0).expand(batch_size, -1)
+    targets = (t * 1e-3).cos().unsqueeze(0).expand(batch_size, -1)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=1.849825e-01, mean_diff=1.849825e-01, ref_range=[2.0955e-01,2.0955e-01], mut_range=[2.4572e-02,2.4572e-02]
+
+### Round 2
+- Strategy: Use a minimal feature size (4) where the distribution of elements per thread differs starkly: with EPT=4, one thread processes all 4 elements; with EPT=3, two threads process 3 and 1 elements respectively. This forces different partial sums and a distinct reduction tree within the block. Combined with a non-exact floating-point value (1/3) that amplifies rounding differences, the final loss accumulation may diverge between the original and mutant.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    batch_size = 128
+    feature_size = 4
+    val = 1.0 / 3.0  # Non-exact in binary, amplifies rounding
+    predictions = torch.full((batch_size, feature_size), val, dtype=torch.float32, device=device)
+    targets = torch.full((batch_size, feature_size), val, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

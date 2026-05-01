@@ -1,0 +1,141 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+       1| import torch
+       2| import torch.nn as nn
+       3| from torch.utils.cpp_extension import load_inline
+       4| 
+       5| # Define the custom CUDA kernel for GELU computation
+       6| gelu_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| #include <c10/cuda/CUDAGuard.h>
+      10| #include <math.h>
+      11| 
+      12| namespace {
+>>>   13| constexpr float GELU_COEF = 0.044715f;
+      14| constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;  // sqrt(2/π)
+      15| }
+      16| 
+      17| template<typename T>
+      18| __device__ T fast_tanh(T x) {
+      19|     // More accurate tanh approximation for GELU
+      20|     if (x < -4.97f) return T(-1.0f);
+      21|     if (x > 4.97f) return T(1.0f);
+      22|     T x2 = x * x;
+      23|     T a = x * (T(135135.0f) + x2 * (T(17325.0f) + x2 * (T(378.0f) + x2)));
+      24|     T b = T(135135.0f) + x2 * (T(62370.0f) + x2 * (T(3150.0f) + x2 * T(28.0f)));
+      25|     return a / b;
+```
+
+## Mutated Code (around mutation site)
+```
+       1| import torch
+       2| import torch.nn as nn
+       3| from torch.utils.cpp_extension import load_inline
+       4| 
+       5| # Define the custom CUDA kernel for GELU computation
+       6| gelu_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| #include <c10/cuda/CUDAGuard.h>
+      10| #include <math.h>
+      11| 
+      12| namespace {
+>>>   13| constexpr float GELU_COEF = 0.04426785f;
+      14| constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;  // sqrt(2/π)
+      15| }
+      16| 
+      17| template<typename T>
+      18| __device__ T fast_tanh(T x) {
+      19|     // More accurate tanh approximation for GELU
+      20|     if (x < -4.97f) return T(-1.0f);
+      21|     if (x > 4.97f) return T(1.0f);
+      22|     T x2 = x * x;
+      23|     T a = x * (T(135135.0f) + x2 * (T(17325.0f) + x2 * (T(378.0f) + x2)));
+      24|     T b = T(135135.0f) + x2 * (T(62370.0f) + x2 * (T(3150.0f) + x2 * T(28.0f)));
+      25|     return a / b;
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 13
+- Original fragment: `0.044715f`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[2000, 2000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Target the sensitive region where the GELU argument (sqrt(2/π)*(x + C*x³)) is in the steep, non-saturated part of tanh (~ ±2.0). Choose x such that the change in coefficient causes a measurable shift in the tanh output. Specifically, solve for x where the derivative of GELU w.r.t. coefficient is maximized: ∂GELU/∂C ≈ 0.5*x*(1-tanh²(arg))*sqrt(2/π)*x³. This is maximized when tanh(arg)≈0 (arg≈0) and x is moderately large. Use x values around ±0.8 to ±1.5, where the cubic term is noticeable but tanh is not saturated.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    # Create tensor of shape [2000, 2000] with repeated sensitive values
+    n = 2000
+    # Use a combination of positive and negative sensitive values
+    # Values chosen where x + C*x^3 gives maximum sensitivity to C change
+    # We'll tile a small pattern to fill the tensor
+    pattern = torch.tensor([
+        -1.3, -0.9, 0.9, 1.3,  # primary sensitive points
+        -1.1, -0.8, 0.8, 1.1,   # secondary points
+    ], dtype=torch.float32, device=device)
+    # Repeat pattern to fill 2000*2000 elements
+    total_elements = n * n
+    repeats = (total_elements + len(pattern) - 1) // len(pattern)
+    data = pattern.repeat(repeats)[:total_elements].reshape(n, n)
+    return [data]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Instead of targeting moderate x, use extreme x values where the cubic term dominates: either very small x where C*x³ is comparable to x, or larger x where the cubic term magnifies the C difference. For very small x (~10⁻³), the linear and cubic terms are of similar magnitude, making the relative effect of C change maximal. Compute x such that |C*x³| = |x| → x² = 1/C ≈ 22.5 → x ≈ ±4.74, but this is near tanh saturation. Better: choose x where the derivative of the entire GELU w.r.t C is maximized considering both the cubic growth and tanh saturation.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    n = 2000
+    # Regime 1: very small x where x and C*x^3 compete
+    small = torch.tensor([-5e-3, -2e-3, 2e-3, 5e-3], dtype=torch.float32, device=device)
+    # Regime 2: x where sensitivity to C is high (derivative analysis)
+    # Solve numerically for max of f(x)=x^4*(1-tanh^2(sqrt(2/pi)*(x+C*x^3)))
+    # Approx maximum around x ≈ ±2.2 for original C
+    medium = torch.tensor([-2.2, -2.0, 2.0, 2.2], dtype=torch.float32, device=device)
+    pattern = torch.cat([small, medium])
+    total_elements = n * n
+    repeats = (total_elements + len(pattern) - 1) // len(pattern)
+    data = pattern.repeat(repeats)[:total_elements].reshape(n, n)
+    return [data]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

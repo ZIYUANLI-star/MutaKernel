@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P23__init_modify__0",
+  "kernel_name": "L1_P23",
+  "operator_name": "init_modify",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant replaces -INFINITY with -1e10f as the initial value for max reduction. This only produces incorrect behavior when ALL elements in a row are less than -1e10 (i.e., < -1.0 × 10¹⁰). The stress tests failed to kill it because they never generated rows where every single element was below -1e10. Even 'all_negative' tests likely used values in ranges like [-1, 0) or [-1000, 0), which are > -1e10. The reduction's parallel nature means a single element ≥ -1e10 would propagate correctly through fmaxf, making the mutant equivalent to the original.",
+  "killable": true,
+  "kill_strategy": "Create a row where ALL elements are < -1e10 (e.g., -2e10). This forces the mutant's initial -1e10 to remain as the 'maximum' since no element exceeds it, while the original correctly identifies the true maximum (which is < -1e10 but > -INF). This difference propagates through the subsequent softmax computations.",
+  "recommendations": "The test suite should include edge cases where entire rows/tensors exceed typical initialization bounds. Specifically for max reductions, test rows where all values are below the mutated initializer. The kernel itself is correct using -INFINITY; no change needed. Future mutation testing should vary input dimensions (not just values) as different shapes can affect thread/block distribution and expose hidden issues.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant replaces -INFINITY with -1e10f as the initial value for max reduction. This only produces incorrect behavior when ALL elements in a row are less than -1e10 (i.e., < -1.0 × 10¹⁰). The stress tests failed to kill it because they never generated rows where every single element was below -1e10. Even 'all_negative' tests likely used values in ranges like [-1, 0) or [-1000, 0), which are > -1e10. The reduction's parallel nature means a single element ≥ -1e10 would propagate correctly through fmaxf, making the mutant equivalent to the original.",
+      "kill_strategy": "Create a row where ALL elements are < -1e10 (e.g., -2e10). This forces the mutant's initial -1e10 to remain as the 'maximum' since no element exceeds it, while the original correctly identifies the true maximum (which is < -1e10 but > -INF). This difference propagates through the subsequent softmax computations.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size, num_features = 16, 16384\n    # Initialize with normal values (e.g., zeros)\n    x = torch.zeros(batch_size, num_features, dtype=torch.float32, device=device)\n    # Set first row to -2e10 (well below -1e10)\n    x[0, :] = -2e10\n    return [x]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=nan, mean_diff=nan, ref_range=[6.1035e-05,6.1035e-05], mut_range=[nan,nan]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "reduction_init_identity_extremes",
+    "rule_description": "Targets reduction operations with mutated identity elements by creating inputs where entire reduction sets (rows/columns) contain only values outside the mutant's valid range. For max reductions with finite negative identity, sets all elements in at least one reduction dimension to values below the mutant threshold. For min reductions with finite positive identity, sets all elements above the threshold.",
+    "applicable_operators": [
+      "init_modify",
+      "reduce_identity",
+      "reduction_initialization"
+    ],
+    "policy_code": "import torch\nimport numpy as np\n\ndef policy(shape, dtype, device, rng):\n    \"\"\"Generate tensor with at least one full reduction dimension containing extreme values.\"\"\"\n    # Use numpy RNG for reproducibility\n    np_rng = np.random.default_rng(rng.randint(0, 2**32 - 1))\n    \n    # Create base tensor with normal values\n    tensor = torch.zeros(shape, dtype=dtype, device=device)\n    \n    if len(shape) >= 2:\n        # Choose a reduction dimension (typically last dimension for row-wise reductions)\n        # but could be any dimension; here we use the last dimension for common patterns\n        reduce_dim = -1\n        \n        # Choose at least one slice in the other dimension to be extreme\n        # For 2D: set entire rows to extreme values\n        slice_dim = 0 if len(shape) == 2 else np_rng.choice(len(shape) - 1)\n        \n        # Number of slices to make extreme (1 to 25% of slices)\n        num_slices = max(1, int(shape[slice_dim] * np_rng.uniform(0.01, 0.25)))\n        slice_indices = np_rng.choice(shape[slice_dim], size=num_slices, replace=False)\n        \n        # Determine extreme value based on dtype\n        if dtype in (torch.float32, torch.float64):\n            # Values significantly below typical finite identity replacements\n            extreme_value = -1e20 if dtype == torch.float64 else -1e10\n        elif dtype == torch.float16:\n            extreme_value = -60000.0  # Near fp16 limits\n        else:\n            # For integer types, use near-minimum values\n            info = torch.iinfo(dtype) if dtype.is_integer else torch.finfo(dtype)\n            extreme_value = info.min + 1 if hasattr(info, 'min') else -1e6\n        \n        # Apply extreme values to selected slices\n        for idx in slice_indices:\n            if len(shape) == 2:\n                tensor[idx, :] = extreme_value\n            else:\n                # General n-dimensional case: set entire hyperplane\n                idx_tuple = [slice(None)] * len(shape)\n                idx_tuple[slice_dim] = idx\n                tensor[tuple(idx_tuple)] = extreme_value\n    \n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size, num_features = 16, 16384\n    # Initialize with normal values (e.g., zeros)\n    x = torch.zeros(batch_size, num_features, dtype=torch.float32, device=device)\n    # Set first row to -2e10 (well below -1e10)\n    x[0, :] = -2e10\n    return [x]"
+}

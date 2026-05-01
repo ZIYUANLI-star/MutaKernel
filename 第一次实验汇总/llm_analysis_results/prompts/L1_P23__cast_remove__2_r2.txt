@@ -1,0 +1,137 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      65|     
+      66|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      67|         if (tid < s) {
+      68|             shared_sum[tid] += shared_sum[tid + s];
+      69|         }
+      70|         __syncthreads();
+      71|     }
+      72|     
+      73|     float row_sum = shared_sum[0];
+      74|     
+      75|     // Third pass: normalize by sum
+      76|     for (int i = tid; i < num_features; i += stride) {
+>>>   77|         float val = static_cast<float>(batch_output[i]);
+      78|         batch_output[i] = static_cast<T>(val / row_sum);
+      79|     }
+      80| }
+      81| 
+      82| torch::Tensor softmax_cuda(torch::Tensor input) {
+      83|     auto sizes = input.sizes();
+      84|     auto batch_size = sizes[0];
+      85|     auto num_features = sizes[1];
+      86|     
+      87|     auto output = torch::empty_like(input);
+      88|     
+      89|     // Configure kernel launch parameters
+```
+
+## Mutated Code (around mutation site)
+```
+      65|     
+      66|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      67|         if (tid < s) {
+      68|             shared_sum[tid] += shared_sum[tid + s];
+      69|         }
+      70|         __syncthreads();
+      71|     }
+      72|     
+      73|     float row_sum = shared_sum[0];
+      74|     
+      75|     // Third pass: normalize by sum
+      76|     for (int i = tid; i < num_features; i += stride) {
+>>>   77|         float val = batch_output[i];
+      78|         batch_output[i] = static_cast<T>(val / row_sum);
+      79|     }
+      80| }
+      81| 
+      82| torch::Tensor softmax_cuda(torch::Tensor input) {
+      83|     auto sizes = input.sizes();
+      84|     auto batch_size = sizes[0];
+      85|     auto num_features = sizes[1];
+      86|     
+      87|     auto output = torch::empty_like(input);
+      88|     
+      89|     // Configure kernel launch parameters
+```
+
+## Mutation Details
+- Operator: cast_remove — Remove an explicit type cast (static_cast, .float(), etc.)
+- Location: line 77
+- Original fragment: `static_cast<float>(batch_output[i])`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by changing the input dtype to a non-float32 type, such as float16 (torch.half) or bfloat16 (torch.bfloat16). When T != float32, the explicit cast to float forces promotion to higher precision before division, while the mutant would use lower-precision arithmetic, potentially causing different rounding/overflow behavior. For example, with float16 inputs containing extreme values (near overflow or with subnormal magnitudes), the float promotion affects the division result, making the outputs differ between original and mutant.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use torch.half (float16) instead of float32
+    shape = [16, 16384]
+    # Create a mix of extreme values in float16
+    tensor = torch.empty(shape, dtype=torch.float16, device=device)
+    
+    # Fill with:
+    # 1. Max representable float16 (~65504) in first quarter
+    # 2. Smallest positive subnormal (~5.96e-8) in second quarter
+    # 3. Normal random values in third quarter
+    # 4. Alternating large positive/negative in fourth quarter
+    n = shape[1] // 4
+    for b in range(shape[0]):
+        # Quarter 1: max float16
+        tensor[b, :n] = torch.finfo(torch.float16).max
+        # Quarter 2: subnormals
+        tensor[b, n:2*n] = torch.tensor(2**-24, dtype=torch.float16)  # subnormal
+        # Quarter 3: normal random range
+        tensor[b, 2*n:3*n] = torch.rand(n, dtype=torch.float16, device=device) * 100 - 50
+        # Quarter 4: alternating signs with large magnitude
+        for i in range(3*n, 4*n):
+            sign = 1 if (i - 3*n) % 2 == 0 else -1
+            tensor[b, i] = sign * 60000  # Near overflow with sign
+    
+    # Ensure no infinities/NaNs from overflow
+    tensor = torch.clamp(tensor, 
+                         min=-torch.finfo(torch.float16).max,
+                         max=torch.finfo(torch.float16).max)
+    
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

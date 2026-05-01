@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P96__arith_replace__12",
+  "kernel_name": "L1_P96",
+  "operator_name": "arith_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant changes the grid dimension calculation from `(total_elements + block_size - 1) / block_size` to `(total_elements - block_size - 1) / block_size`. For the fixed input shape [128, 4096] with total_elements = 524,288 and block_size = 256, both formulas produce the same integer result: original = (524288 + 255)/256 = 2048, mutant = (524288 - 257)/256 = (524031)/256 = 2046 (integer division). Both evaluate to 2048 in integer division (524,543/256 = 2049 - epsilon, 524,031/256 = 2047 - epsilon; both truncate to 2048). Therefore, the kernel launches with identical grid dimensions (2048 blocks), making the mutant behaviorally equivalent to the original for this specific input shape. The mutation is effectively neutral due to integer division truncation.",
+  "killable": true,
+  "kill_strategy": "Change the input tensor shape/dimensions so that `total_elements` is NOT a multiple of block_size, specifically making it small enough that the subtraction in the mutant causes underflow or a different integer division result. When `total_elements < block_size + 1`, the mutant's numerator becomes negative, causing `num_blocks` to be 0 (or negative, but CUDA may interpret negative as huge unsigned), while the original yields at least 1. This causes the kernel to launch with 0 blocks (no threads) vs. 1+ blocks, leaving output uninitialized vs. computed.",
+  "recommendations": "The kernel's grid dimension calculation should be protected against underflow by using max(1, ...) or similar. The test suite should include varying tensor shapes/dimensions, not just values, especially edge cases where total_elements is small, non-multiples of block_size, or near boundaries. Mutation testing tools should consider shape mutations in addition to value mutations.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant changes the grid dimension calculation from `(total_elements + block_size - 1) / block_size` to `(total_elements - block_size - 1) / block_size`. For the fixed input shape [128, 4096] with total_elements = 524,288 and block_size = 256, both formulas produce the same integer result: original = (524288 + 255)/256 = 2048, mutant = (524288 - 257)/256 = (524031)/256 = 2046 (integer division). Both evaluate to 2048 in integer division (524,543/256 = 2049 - epsilon, 524,031/256 = 2047 - epsilon; both truncate to 2048). Therefore, the kernel launches with identical grid dimensions (2048 blocks), making the mutant behaviorally equivalent to the original for this specific input shape. The mutation is effectively neutral due to integer division truncation.",
+      "kill_strategy": "Change the input tensor shape/dimensions so that `total_elements` is NOT a multiple of block_size, specifically making it small enough that the subtraction in the mutant causes underflow or a different integer division result. When `total_elements < block_size + 1`, the mutant's numerator becomes negative, causing `num_blocks` to be 0 (or negative, but CUDA may interpret negative as huge unsigned), while the original yields at least 1. This causes the kernel to launch with 0 blocks (no threads) vs. 1+ blocks, leaving output uninitialized vs. computed.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use total_elements = 256 (exactly block_size)\n    # Original: (256 + 256 - 1)/256 = 511/256 = 1 (since integer division truncates)\n    # Mutant: (256 - 256 - 1)/256 = (-1)/256 = 0 (truncates toward zero)\n    shape = [1, 256]  # total_elements = 256\n    predictions = torch.randn(shape, device=device, dtype=torch.float32)\n    targets = torch.randn(shape, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "grid_dimension_boundary_tests",
+    "rule_description": "This rule generates inputs where the total number of elements equals or is slightly less than the thread block size, specifically targeting mutations in grid dimension calculations. It exploits integer division truncation to cause different block counts between original and mutated kernels, leading to uninitialized outputs in mutants.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "negate_condition"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    # Target boundary where total_elements equals or is less than typical block size (256)\n    # Create tensor with exactly 256 elements regardless of requested shape\n    # Use 2D shape [1, 256] to match typical kernel expectations\n    total_elements = 256\n    target_shape = [1, total_elements]\n    \n    # Generate random data with the target shape\n    # Using normal distribution for typical loss function inputs\n    tensor = torch.randn(target_shape, dtype=dtype, device=device)\n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use total_elements = 256 (exactly block_size)\n    # Original: (256 + 256 - 1)/256 = 511/256 = 1 (since integer division truncates)\n    # Mutant: (256 - 256 - 1)/256 = (-1)/256 = 0 (truncates toward zero)\n    shape = [1, 256]  # total_elements = 256\n    predictions = torch.randn(shape, device=device, dtype=torch.float32)\n    targets = torch.randn(shape, device=device, dtype=torch.float32)\n    return [predictions, targets]"
+}

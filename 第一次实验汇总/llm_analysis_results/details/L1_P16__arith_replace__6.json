@@ -1,0 +1,42 @@
+{
+  "mutant_id": "L1_P16__arith_replace__6",
+  "kernel_name": "L1_P16",
+  "operator_name": "arith_replace",
+  "status": "survived",
+  "survival_reason": "The mutant replaces division with multiplication in the tile loop bound calculation. Previous attempts failed because they caused integer overflow, which affected both original and mutant kernels (both returning false). The key insight is that with proper bounds checking in lines 36-40 and 45-49 (not shown), the condition `A_row < K && A_col < M` and similar for B prevent out-of-bounds accesses regardless of loop count. The mutant simply runs more iterations where it loads zeros into shared memory due to these guards, but still produces the same numerical result because zero tiles don't affect the final matrix product. The overflow attempts failed because they triggered undefined behavior that corrupted both computations equally, not creating a semantic difference.",
+  "killable": false,
+  "kill_strategy": "The mutant is likely equivalent due to the bounds checking guards. Even with different loop counts, the effective computation remains identical because extra iterations load zeros and zero tiles don't contribute to the matrix product. The only way to create a difference would be to disable or circumvent the bounds checking, but that's not possible within the mutation's scope.",
+  "recommendations": "Mark this mutant as 'equivalent'. The mutation testing tool should recognize that bounds-checking guards make this particular arithmetic replacement non-lethal regardless of input. Future mutation testing could consider mutations that affect the bounds-checking conditions themselves (lines 36, 45) or the zero-padding behavior (lines 39, 48).",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant changes the loop bound from `ceil(K / TILE_SIZE)` to `(K + TILE_SIZE - 1) * TILE_SIZE`. For the original fixed shape (K=4096), the mutant runs many extra iterations (e.g., 65776 vs 256 for TILE_SIZE=16). However, the tile-loading conditionals (`A_row < K && A_col < M` and similarly for B) cause out-of-bounds accesses to load zeros. Thus, the extra iterations only add zeros to the partial sums, leaving the final result unchanged. Since all stress tests used the same shape and the conditionals prevent out-of-bounds memory errors, the mutant survived.",
+      "kill_strategy": "Use a different input shape with a very large inner dimension K to cause integer overflow in the mutant's loop bound. For typical TILE_SIZE (e.g., 16, 32), choose K such that `(K + TILE_SIZE - 1) * TILE_SIZE` exceeds INT_MAX (2^31-1). The overflow leads to undefined behavior (e.g., a negative loop bound), causing the mutant to execute zero or very few iterations, while the original kernel runs the correct number of iterations. This results in different numerical outputs.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    K = 268435456  # Large enough to overflow for TILE_SIZE >= 8\n    M = 1\n    N = 1\n    A = torch.ones((K, M), dtype=torch.float32, device=device)\n    B = torch.ones((K, N), dtype=torch.float32, device=device)\n    return [A, B]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.684028e+08, mean_diff=2.684028e+08, ref_range=[2.6843e+08,2.6843e+08], mut_range=[3.1744e+04,3.1744e+04]",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant replaces division with multiplication in the tile loop bound calculation. Previous attempts failed because they caused integer overflow, which affected both original and mutant kernels (both returning false). The key insight is that with proper bounds checking in lines 36-40 and 45-49 (not shown), the condition `A_row < K && A_col < M` and similar for B prevent out-of-bounds accesses regardless of loop count. The mutant simply runs more iterations where it loads zeros into shared memory due to these guards, but still produces the same numerical result because zero tiles don't affect the final matrix product. The overflow attempts failed because they triggered undefined behavior that corrupted both computations equally, not creating a semantic difference.",
+      "kill_strategy": "The mutant is likely equivalent due to the bounds checking guards. Even with different loop counts, the effective computation remains identical because extra iterations load zeros and zero tiles don't contribute to the matrix product. The only way to create a difference would be to disable or circumvent the bounds checking, but that's not possible within the mutation's scope.",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel lacks explicit validation of the loop bound calculation. The tile count computation uses integer division without verifying that the result is correct or that subsequent indexing won't overflow. Defensive programming would: 1) Compute tile counts once using a dedicated, clearly named utility function with explicit ceiling division semantics; 2) Add static assertions or comments about the expected operator; 3) Validate that the calculated number of tiles doesn't exceed hardware limits or cause integer overflow; 4) Document the invariant that extra zero-initialized tiles don't affect correctness.",
+  "robustness_code": "#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cassert>\n\nconst int TILE_SIZE = 32;\n\n// Helper function for explicit, documented ceiling division\n__device__ __host__ __forceinline__ int ceil_div(int numerator, int denominator) {\n    return (numerator + denominator - 1) / denominator;  // CRITICAL: integer ceiling division\n}\n\n__global__ void matmul_transpose_kernel(\n    const float* A,  // shape: [K, M]\n    const float* B,  // shape: [K, N]\n    float* C,        // shape: [M, N]\n    int M, int K, int N) {\n    \n    // Shared memory for tiles\n    __shared__ float As[TILE_SIZE][TILE_SIZE];\n    __shared__ float Bs[TILE_SIZE][TILE_SIZE];\n    \n    int bx = blockIdx.x, by = blockIdx.y;\n    int tx = threadIdx.x, ty = threadIdx.y;\n    \n    // Row and column of C to compute\n    int row = by * TILE_SIZE + ty;\n    int col = bx * TILE_SIZE + tx;\n    \n    float sum = 0.0f;\n    \n    // Compute tile count once with explicit, named function\n    int num_tiles = ceil_div(K, TILE_SIZE);\n    // Safety: ensure loop bound is non-negative\n    if (num_tiles < 0) return;\n    \n    // Loop over tiles\n    for (int t = 0; t < num_tiles; ++t) {\n        // Load A tile (transposed access: A[K][M] -> As[M][K])\n        int A_row = t * TILE_SIZE + tx;\n        int A_col = row;\n        if (A_row < K && A_col < M) {\n            As[ty][tx] = A[A_row * M + A_col];  // A is stored as [K][M]\n        } else {\n            As[ty][tx] = 0.0f;\n        }\n        \n        // Load B tile\n        int B_row = t * TILE_SIZE + ty;\n        int B_col = col;\n        if (B_row < K && B_col < N) {\n            Bs[ty][tx] = B[B_row * N + B_col];  // B is stored as [K][N]\n        } else {\n            Bs[ty][tx] = 0.0f;\n        }\n        \n        __syncthreads();\n        \n        // Compute partial sum\n        for (int k = 0; k < TILE_SIZE; ++k) {\n            sum += As[ty][k] * Bs[k][tx];\n        }\n        \n        __syncthreads();\n    }\n    \n    // Write result\n    if (row < M && col < N) {\n        C[row * N + col] = sum;\n    }\n}\n\ntorch::Tensor matmul_transpose_cuda(torch::Tensor A, torch::Tensor B) {\n    // A: [K, M], B: [K, N]\n    int K = A.size(0);\n    int M = A.size(1);\n    int N = B.size(1);\n    \n    // Validate dimensions (defensive check)\n    assert(K > 0 && M > 0 && N > 0 && \"Dimensions must be positive\");\n    \n    // Output: [M, N]\n    auto C = torch::zeros({M, N}, A.options());\n    \n    // Configure grid and block dimensions using same ceiling division\n    dim3 block(TILE_SIZE, TILE_SIZE);\n    dim3 grid(ceil_div(N, TILE_SIZE), ceil_div(M, TILE_SIZE));\n    \n    // Launch kernel\n    matmul_transpose_kernel<<<grid, block>>>(\n        A.data_ptr<float>(),\n        B.data_ptr<float>(),\n        C.data_ptr<float>(),\n        M, K, N\n    );\n    \n    return C;\n}\n",
+  "test_construction_rule": null,
+  "cluster_label": "Kernel Design Resilience"
+}

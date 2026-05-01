@@ -1,0 +1,119 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      80|     // Parallel reduction for variance
+      81|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      82|         if (tid < stride) {
+      83|             shared_mem[tid] += shared_mem[tid + stride];
+      84|         }
+      85|         __syncthreads();
+      86|     }
+      87|     
+      88|     float variance = shared_mem[0] / feature_size;
+      89|     float inv_std = rsqrtf(variance + eps);
+      90|     
+      91|     // Phase 3: Apply normalization with gamma and beta
+>>>   92|     for (int i = tid; i < feature_size; i += blockDim.x) {
+      93|         float normalized = (convert_to_float(batch_input[i]) - mean) * inv_std;
+      94|         float gamma_val = convert_to_float(gamma[i % num_elements]);
+      95|         float beta_val = convert_to_float(beta[i % num_elements]);
+      96|         normalized = normalized * gamma_val + beta_val;
+      97|         
+      98|         batch_output[i] = convert_from_float<T>(normalized);
+      99|     }
+     100| }
+     101| 
+     102| torch::Tensor layernorm_fused_cuda(
+     103|     torch::Tensor input,
+     104|     torch::Tensor gamma,
+```
+
+## Mutated Code (around mutation site)
+```
+      80|     // Parallel reduction for variance
+      81|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      82|         if (tid < stride) {
+      83|             shared_mem[tid] += shared_mem[tid + stride];
+      84|         }
+      85|         __syncthreads();
+      86|     }
+      87|     
+      88|     float variance = shared_mem[0] / feature_size;
+      89|     float inv_std = rsqrtf(variance + eps);
+      90|     
+      91|     // Phase 3: Apply normalization with gamma and beta
+>>>   92|     for (int i = tid; i < feature_size; i += blockDim.y) {
+      93|         float normalized = (convert_to_float(batch_input[i]) - mean) * inv_std;
+      94|         float gamma_val = convert_to_float(gamma[i % num_elements]);
+      95|         float beta_val = convert_to_float(beta[i % num_elements]);
+      96|         normalized = normalized * gamma_val + beta_val;
+      97|         
+      98|         batch_output[i] = convert_from_float<T>(normalized);
+      99|     }
+     100| }
+     101| 
+     102| torch::Tensor layernorm_fused_cuda(
+     103|     torch::Tensor input,
+     104|     torch::Tensor gamma,
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 92
+- Original fragment: `blockDim.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the feature dimension size so it's NOT divisible by `blockDim.x` (and thus not divisible by the mutated stride of 1). With `feature_size % blockDim.x != 0`, the original strided loop covers all elements, but the sequential loop in the mutant will have threads accessing out-of-bounds elements (since `i < feature_size` condition still holds). This causes different memory access patterns and potentially missing elements or redundant computation. Specifically, when `blockDim.x` threads each process elements with stride 1 starting at their `tid`, they collectively process `blockDim.x` elements per iteration, potentially exceeding `feature_size` if it's not a multiple of `blockDim.x`. This leads to either missing some indices (if some threads stop early) or accessing beyond bounds (if loop condition miscalculated).
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Original: [16, 64, 256, 256]
+    # Change last dimension to 257 (prime)
+    batch = 16
+    seq_len = 64
+    hidden_dim = 257  # Prime, not divisible by typical block sizes
+    
+    # Create input tensor with random values
+    input_tensor = torch.randn(batch, seq_len, hidden_dim, dtype=torch.float32, device=device)
+    
+    # Return list with exactly one tensor as forward() expects
+    return [input_tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

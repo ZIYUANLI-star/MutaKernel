@@ -1,0 +1,113 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      50|     
+      51|     for (int i = idx; i < size; i += stride) {
+      52|         float val = input[i];
+      53|         output[i] = fmaxf(0.0f, fminf(1.0f, __fmaf_rd(val, 1.0f/6.0f, 0.5f)));
+      54|     }
+      55| }
+      56| 
+      57| torch::Tensor hardsigmoid_cuda_optimized(torch::Tensor input) {
+      58|     auto size = input.numel();
+      59|     auto output = torch::empty_like(input);
+      60|     
+      61|     // Use optimal configuration based on tensor size
+>>>   62|     if (size >= 1024) {
+      63|         // Use vectorized kernel for large tensors
+      64|         const int block_size = 256;  // Optimal for vectorized loads
+      65|         int num_blocks = (size + (block_size * 4) - 1) / (block_size * 4);
+      66|         
+      67|         // Ensure we have enough blocks for good occupancy
+      68|         num_blocks = min(max(num_blocks, 32), 1024);
+      69|         
+      70|         hardsigmoid_kernel_vectorized<<<num_blocks, block_size>>>(
+      71|             input.data_ptr<float>(),
+      72|             output.data_ptr<float>(),
+      73|             size
+      74|         );
+```
+
+## Mutated Code (around mutation site)
+```
+      50|     
+      51|     for (int i = idx; i < size; i += stride) {
+      52|         float val = input[i];
+      53|         output[i] = fmaxf(0.0f, fminf(1.0f, __fmaf_rd(val, 1.0f/6.0f, 0.5f)));
+      54|     }
+      55| }
+      56| 
+      57| torch::Tensor hardsigmoid_cuda_optimized(torch::Tensor input) {
+      58|     auto size = input.numel();
+      59|     auto output = torch::empty_like(input);
+      60|     
+      61|     // Use optimal configuration based on tensor size
+>>>   62|     if (size >= 1025) {
+      63|         // Use vectorized kernel for large tensors
+      64|         const int block_size = 256;  // Optimal for vectorized loads
+      65|         int num_blocks = (size + (block_size * 4) - 1) / (block_size * 4);
+      66|         
+      67|         // Ensure we have enough blocks for good occupancy
+      68|         num_blocks = min(max(num_blocks, 32), 1024);
+      69|         
+      70|         hardsigmoid_kernel_vectorized<<<num_blocks, block_size>>>(
+      71|             input.data_ptr<float>(),
+      72|             output.data_ptr<float>(),
+      73|             size
+      74|         );
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 62
+- Original fragment: `1024`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use an input with exactly 1024 elements to trigger different kernel dispatches: original uses vectorized kernel (size≥1024), mutant uses non-vectorized kernel (size<1025). Then choose values where the two kernels may produce different numeric results due to rounding differences (vectorized FMA with rounding-down vs scalar non-FMA operations).
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Exactly 1024 elements to hit the threshold
+    size = 1024
+    # Value in linear region of hardsigmoid, sensitive to rounding
+    # 1.0000001f has binary representation near rounding boundaries
+    value = 1.0000001
+    tensor = torch.full((size,), value, dtype=torch.float32, device=device)
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

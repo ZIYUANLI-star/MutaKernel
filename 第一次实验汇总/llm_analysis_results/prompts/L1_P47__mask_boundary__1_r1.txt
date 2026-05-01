@@ -1,0 +1,130 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant survived all 4 layers of stress testing (value-distribution, dtype-switch,
+repeated-execution, training-mode). Your task is to analyze WHY it survived and
+whether it CAN be killed with a specifically designed input.
+
+## Original Code (around mutation site)
+```
+      12| template<typename scalar_t>
+      13| __global__ void sum_reduction_kernel(
+      14|     const scalar_t* input,
+      15|     scalar_t* output,
+      16|     const int outer_size,
+      17|     const int reduce_size,
+      18|     const int inner_size
+      19| ) {
+      20|     // Each thread handles one element in the output
+      21|     const int outer_idx = blockIdx.x;
+      22|     const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+      23|     
+>>>   24|     if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+      25|     
+      26|     const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;
+      27|     scalar_t sum = 0;
+      28|     
+      29|     // Sequential reduction across reduce dimension
+      30|     for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {
+      31|         sum += input_ptr[reduce_idx * inner_size];
+      32|     }
+      33|     
+      34|     output[outer_idx * inner_size + inner_idx] = sum;
+      35| }
+      36| 
+```
+
+## Mutated Code (around mutation site)
+```
+      12| template<typename scalar_t>
+      13| __global__ void sum_reduction_kernel(
+      14|     const scalar_t* input,
+      15|     scalar_t* output,
+      16|     const int outer_size,
+      17|     const int reduce_size,
+      18|     const int inner_size
+      19| ) {
+      20|     // Each thread handles one element in the output
+      21|     const int outer_idx = blockIdx.x;
+      22|     const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+      23|     
+>>>   24|     if (outer_idx >= outer_size + 1 || inner_idx >= inner_size) return;
+      25|     
+      26|     const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;
+      27|     scalar_t sum = 0;
+      28|     
+      29|     // Sequential reduction across reduce dimension
+      30|     for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {
+      31|         sum += input_ptr[reduce_idx * inner_size];
+      32|     }
+      33|     
+      34|     output[outer_idx * inner_size + inner_idx] = sum;
+      35| }
+      36| 
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 24
+- Original fragment: `outer_idx >= outer_size`
+- node_type: ge_rhs+1
+
+## Stress Test Results (already tried — mutant survived ALL of these)
+**IMPORTANT**: All stress tests below used the SAME input shape as get_inputs().
+Only the input VALUES were changed — input shape/dimensions were NEVER varied.
+
+### Layer 1: Value-Distribution Stress (14 policies × 3 seeds = 42 tests)
+| Policy | Seeds | Result | Description |
+|--------|-------|--------|-------------|
+| boundary_last_element | ×3 | both_ok (no difference found) | last element set to extreme |
+| sparse | ×3 | both_ok (no difference found) | 90% zeros, 10% random |
+| large_magnitude | ×3 | both_ok (no difference found) | values ~1e6 |
+| near_overflow | ×3 | both_ok (no difference found) | values ~1e38 |
+| near_zero | ×3 | both_ok (no difference found) | values ~1e-7 |
+| denormals | ×3 | both_ok (no difference found) | values ~1e-40 (subnormal) |
+| all_negative | ×3 | both_ok (no difference found) | all values < 0 |
+| all_positive | ×3 | both_ok (no difference found) | all values > 0 |
+| mixed_extremes | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | mix of 1e6 and 1e-6 |
+| alternating_sign | ×3 | both_ok (no difference found) | [+big, -big, +big, ...] |
+| uniform_constant | ×3 | both_ok (no difference found) | all elements = same constant |
+| structured_ramp | ×3 | both_ok (no difference found) | linearly increasing 0→N |
+| head_heavy | ×3 | both_ok (no difference found) | first 10% large, rest small |
+| tail_heavy | ×3 | both_ok (no difference found) | last 10% large, rest small |
+
+### Layer 2 (dtype switch): not killed
+### Layer 3 (repeated execution, 10 trials × 3 seeds): ALL CONSISTENT
+### Layer 4 (training mode): not killed
+
+**Conclusion from stress testing**: No value-distribution change could distinguish
+original from mutant. If you believe the mutant is killable, you MUST try a
+fundamentally different approach (e.g., different input shapes/dimensions, not
+just different values).
+
+## Input Specification
+The kernel's `get_inputs()` returns tensors with these shapes/dtypes:
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 256, 256], dtype=torch.float32
+
+## Instructions
+Analyze deeply and respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<detailed technical explanation of WHY this mutant survives — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<if killable: describe the specific numerical regime or input pattern that could distinguish original from mutant; if not killable: explain why no input can expose a difference>",
+  "suggested_test": {
+    "description": "<what this input specifically tests>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` returning a list of tensors>"
+  },
+  "recommendations": "<what should be improved — either in the kernel code for robustness, or in the test suite for better coverage>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+  (see Input Specification above for the exact count, shapes, and dtypes)
+- For example, if forward(self, predictions, targets) takes 2 args and
+  get_inputs() returns [tensor_shape_A, tensor_shape_B], then generate_inputs
+  must return [tensor_shape_A, tensor_shape_B] — exactly 2 tensors
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- Focus on the MOST promising extreme-value or edge-case regime to kill this mutant
+- If you believe the mutant is truly unkillable, set "suggested_test" to null
