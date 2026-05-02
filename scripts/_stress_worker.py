@@ -128,8 +128,9 @@ def run_stress(cfg):
     orig_hash = _code_hash(cfg["kernel_code"])
     mut_hash = _code_hash(cfg["mutated_code"])
     ref_hash = _code_hash(cfg["problem_file"])
+    is_same_code = (cfg["kernel_code"] == cfg["mutated_code"])
 
-    ref_mod = _load_module_from_path(cfg["problem_file"], f"stress_ref_{ref_hash}")
+    ref_mod = _load_module_from_path(cfg["problem_file"], f"ext_ref_{ref_hash}")
     get_inputs = ref_mod.get_inputs
     get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
 
@@ -169,7 +170,7 @@ def run_stress(cfg):
 
     try:
         orig_mod = _load_module_from_source(
-            cfg["kernel_code"], f"stress_orig_{orig_hash}", tmp_dir,
+            cfg["kernel_code"], f"ext_orig_{orig_hash}", tmp_dir,
         )
     except Exception as e:
         return {"ref_ok": not ref_nan, "original_ok": False, "mutant_ok": False,
@@ -205,39 +206,44 @@ def run_stress(cfg):
 
     compare_target = orig_out if ref_nan else ref_out
 
-    try:
-        mut_mod = _load_module_from_source(
-            cfg["mutated_code"], f"stress_mut_{mut_hash}", tmp_dir,
-        )
-    except Exception as e:
-        return {"ref_ok": True, "original_ok": original_ok, "mutant_ok": False,
-                "ref_nan_fallback": ref_nan,
-                "error": f"mut compile: {str(e)[:200]}",
-                "time_ms": (time.time() - t0) * 1000}
-
-    mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-    mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else mut_cls())
-    mut_model = mut_model.to(device).eval()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, mut_model)
-
-    mutant_ok = False
-    with torch.no_grad():
+    if is_same_code:
+        mutant_ok = original_ok
+        bitwise_orig_mut_eq = True
+        mut_out = orig_out
+    else:
         try:
-            mut_out = mut_model(*stress_on_device)
-            mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
-            if _has_nan_inf(mut_out):
+            mut_mod = _load_module_from_source(
+                cfg["mutated_code"], f"ext_mut_{mut_hash}", tmp_dir,
+            )
+        except Exception as e:
+            return {"ref_ok": True, "original_ok": original_ok, "mutant_ok": False,
+                    "ref_nan_fallback": ref_nan,
+                    "error": f"mut compile: {str(e)[:200]}",
+                    "time_ms": (time.time() - t0) * 1000}
+
+        mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
+        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
+                      else mut_cls())
+        mut_model = mut_model.to(device).eval()
+        if cfg.get("sync_weights"):
+            _sync_weights(ref_model, mut_model)
+
+        mutant_ok = False
+        with torch.no_grad():
+            try:
+                mut_out = mut_model(*stress_on_device)
+                mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
+                if _has_nan_inf(mut_out):
+                    mutant_ok = False
+            except Exception:
                 mutant_ok = False
-        except Exception:
-            mutant_ok = False
 
-    bitwise_orig_mut_eq = False
-    if orig_out is not None and mutant_ok is not None:
-        try:
-            bitwise_orig_mut_eq = _bitwise_eq(orig_out, mut_out)
-        except Exception:
-            pass
+        bitwise_orig_mut_eq = False
+        if orig_out is not None and mutant_ok is not None:
+            try:
+                bitwise_orig_mut_eq = _bitwise_eq(orig_out, mut_out)
+            except Exception:
+                pass
 
     diff_summary = ""
     if not original_ok and orig_out is not None and not ref_nan:
@@ -267,7 +273,9 @@ def _build_models(cfg, seed_suffix, device):
     mut_hash = _code_hash(cfg["mutated_code"])
     ref_hash = _code_hash(cfg["problem_file"])
 
-    ref_mod = _load_module_from_path(cfg["problem_file"], f"build_ref_{ref_hash}")
+    is_same_code = (cfg["kernel_code"] == cfg["mutated_code"])
+
+    ref_mod = _load_module_from_path(cfg["problem_file"], f"ext_ref_{ref_hash}")
     get_inputs = ref_mod.get_inputs
     get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
     init_args = get_init_inputs()
@@ -279,7 +287,7 @@ def _build_models(cfg, seed_suffix, device):
     tmp_dir = tempfile.mkdtemp(prefix="stress_")
 
     orig_mod = _load_module_from_source(
-        cfg["kernel_code"], f"build_orig_{orig_hash}", tmp_dir)
+        cfg["kernel_code"], f"ext_orig_{orig_hash}", tmp_dir)
     orig_cls = getattr(orig_mod, "ModelNew", None) or getattr(orig_mod, "Model")
     orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
                   else orig_cls())
@@ -287,14 +295,17 @@ def _build_models(cfg, seed_suffix, device):
     if cfg.get("sync_weights"):
         _sync_weights(ref_model, orig_model)
 
-    mut_mod = _load_module_from_source(
-        cfg["mutated_code"], f"build_mut_{mut_hash}", tmp_dir)
-    mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-    mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else mut_cls())
-    mut_model = mut_model.to(device).eval()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, mut_model)
+    if is_same_code:
+        mut_model = orig_model
+    else:
+        mut_mod = _load_module_from_source(
+            cfg["mutated_code"], f"ext_mut_{mut_hash}", tmp_dir)
+        mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
+        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
+                     else mut_cls())
+        mut_model = mut_model.to(device).eval()
+        if cfg.get("sync_weights"):
+            _sync_weights(ref_model, mut_model)
 
     return ref_model, orig_model, mut_model, get_inputs, init_args, tmp_dir
 
@@ -324,8 +335,9 @@ def run_training_stress(cfg):
     orig_hash = _code_hash(cfg["kernel_code"])
     mut_hash = _code_hash(cfg["mutated_code"])
     ref_hash = _code_hash(cfg["problem_file"])
+    is_same_code = (cfg["kernel_code"] == cfg["mutated_code"])
 
-    ref_mod = _load_module_from_path(cfg["problem_file"], f"train_ref_{ref_hash}")
+    ref_mod = _load_module_from_path(cfg["problem_file"], f"ext_ref_{ref_hash}")
     get_inputs = ref_mod.get_inputs
     get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
 
@@ -366,7 +378,7 @@ def run_training_stress(cfg):
 
     try:
         orig_mod = _load_module_from_source(
-            cfg["kernel_code"], f"train_orig_{orig_hash}", tmp_dir)
+            cfg["kernel_code"], f"ext_orig_{orig_hash}", tmp_dir)
     except Exception as e:
         return {"ref_ok": not ref_nan, "original_ok": False, "mutant_ok": False,
                 "error": f"orig compile: {str(e)[:200]}",
@@ -401,31 +413,34 @@ def run_training_stress(cfg):
 
     compare_target = orig_out if ref_nan else ref_out
 
-    try:
-        mut_mod = _load_module_from_source(
-            cfg["mutated_code"], f"train_mut_{mut_hash}", tmp_dir)
-    except Exception as e:
-        return {"ref_ok": True, "original_ok": original_ok, "mutant_ok": False,
-                "ref_nan_fallback": ref_nan,
-                "error": f"mut compile: {str(e)[:200]}",
-                "time_ms": (time.time() - t0) * 1000}
-
-    mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-    mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else mut_cls())
-    mut_model = mut_model.to(device).train()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, mut_model)
-
-    mutant_ok = False
-    with torch.no_grad():
+    if is_same_code:
+        mutant_ok = original_ok
+    else:
         try:
-            mut_out = mut_model(*stress_on_device)
-            mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
-            if _has_nan_inf(mut_out):
+            mut_mod = _load_module_from_source(
+                cfg["mutated_code"], f"ext_mut_{mut_hash}", tmp_dir)
+        except Exception as e:
+            return {"ref_ok": True, "original_ok": original_ok, "mutant_ok": False,
+                    "ref_nan_fallback": ref_nan,
+                    "error": f"mut compile: {str(e)[:200]}",
+                    "time_ms": (time.time() - t0) * 1000}
+
+        mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
+        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
+                     else mut_cls())
+        mut_model = mut_model.to(device).train()
+        if cfg.get("sync_weights"):
+            _sync_weights(ref_model, mut_model)
+
+        mutant_ok = False
+        with torch.no_grad():
+            try:
+                mut_out = mut_model(*stress_on_device)
+                mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
+                if _has_nan_inf(mut_out):
+                    mutant_ok = False
+            except Exception:
                 mutant_ok = False
-        except Exception:
-            mutant_ok = False
 
     diff_summary = ""
     if not original_ok and orig_out is not None and not ref_nan:
@@ -694,7 +709,10 @@ def run_llm_verify(cfg):
                 "error": f"llm_generate: {str(e)[:300]}",
                 "time_ms": (time.time() - t0) * 1000}
 
-    # --- load reference model ---
+    orig_hash = _code_hash(cfg["kernel_code"])
+    mut_hash = _code_hash(cfg["mutated_code"])
+    is_same_code = (cfg["kernel_code"] == cfg["mutated_code"])
+
     ref_mod = _load_module_from_path(cfg["problem_file"], "llm_ref")
     get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
     init_args = get_init_inputs()
@@ -703,7 +721,6 @@ def run_llm_verify(cfg):
                  else ref_cls())
     ref_model = ref_model.to(device).eval()
 
-    # Auto-fix arg count: detect expected nargs from problem file's get_inputs()
     try:
         ref_get_inputs = getattr(ref_mod, "get_inputs", None)
         if ref_get_inputs:
@@ -728,11 +745,11 @@ def run_llm_verify(cfg):
 
     ref_nan = _has_nan_inf(ref_out)
 
-    # --- load original and mutant ---
     tmp_dir = tempfile.mkdtemp(prefix="llm_verify_")
 
     try:
-        orig_mod = _load_module_from_source(cfg["kernel_code"], "llm_orig", tmp_dir)
+        orig_mod = _load_module_from_source(
+            cfg["kernel_code"], f"ext_orig_{orig_hash}", tmp_dir)
     except Exception as e:
         return {"ref_ok": not ref_nan, "original_ok": False, "mutant_ok": False,
                 "error": f"orig compile: {str(e)[:200]}",
@@ -766,33 +783,39 @@ def run_llm_verify(cfg):
 
     compare_target = orig_out if ref_nan else ref_out
 
-    try:
-        mut_mod = _load_module_from_source(cfg["mutated_code"], "llm_mut", tmp_dir)
-    except Exception as e:
-        return {"ref_ok": True, "original_ok": original_ok, "mutant_ok": False,
-                "killed": original_ok, "ref_nan_fallback": ref_nan,
-                "diff_summary": "", "mut_error": f"mut compile: {str(e)[:200]}",
-                "error": f"mut compile: {str(e)[:200]}",
-                "time_ms": (time.time() - t0) * 1000}
-
-    mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-    mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else mut_cls())
-    mut_model = mut_model.to(device).eval()
-
-    mutant_ok = False
-    mut_out = None
-    mut_error = ""
-    with torch.no_grad():
+    if is_same_code:
+        mutant_ok = original_ok
+        mut_out = orig_out
+        mut_error = ""
+    else:
         try:
-            mut_out = mut_model(*llm_inputs)
-            mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
-            if _has_nan_inf(mut_out):
-                mutant_ok = False
-                mut_error = "mutant output NaN/Inf"
+            mut_mod = _load_module_from_source(
+                cfg["mutated_code"], f"ext_mut_{mut_hash}", tmp_dir)
         except Exception as e:
-            mutant_ok = False
-            mut_error = str(e)[:200]
+            return {"ref_ok": True, "original_ok": original_ok, "mutant_ok": False,
+                    "killed": original_ok, "ref_nan_fallback": ref_nan,
+                    "diff_summary": "", "mut_error": f"mut compile: {str(e)[:200]}",
+                    "error": f"mut compile: {str(e)[:200]}",
+                    "time_ms": (time.time() - t0) * 1000}
+
+        mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
+        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
+                     else mut_cls())
+        mut_model = mut_model.to(device).eval()
+
+        mutant_ok = False
+        mut_out = None
+        mut_error = ""
+        with torch.no_grad():
+            try:
+                mut_out = mut_model(*llm_inputs)
+                mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
+                if _has_nan_inf(mut_out):
+                    mutant_ok = False
+                    mut_error = "mutant output NaN/Inf"
+            except Exception as e:
+                mutant_ok = False
+                mut_error = str(e)[:200]
 
     diff_summary = ""
     if mut_out is not None and not mutant_ok:
@@ -896,8 +919,9 @@ def run_config_stress(cfg):
     orig_hash = _code_hash(cfg["kernel_code"])
     mut_hash = _code_hash(cfg["mutated_code"])
     ref_hash = _code_hash(cfg["problem_file"])
+    is_same_code = (cfg["kernel_code"] == cfg["mutated_code"])
 
-    ref_mod = _load_module_from_path(cfg["problem_file"], f"cfgstress_ref_{ref_hash}")
+    ref_mod = _load_module_from_path(cfg["problem_file"], f"ext_ref_{ref_hash}")
     get_inputs = ref_mod.get_inputs
     get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
     init_args = get_init_inputs()
@@ -911,7 +935,7 @@ def run_config_stress(cfg):
 
     try:
         orig_mod = _load_module_from_source(
-            cfg["kernel_code"], f"cfgstress_orig_{orig_hash}", tmp_dir)
+            cfg["kernel_code"], f"ext_orig_{orig_hash}", tmp_dir)
     except Exception as e:
         return {"killed": False, "error": f"orig compile: {str(e)[:200]}",
                 "time_ms": (time.time() - t0) * 1000}
@@ -922,18 +946,21 @@ def run_config_stress(cfg):
     if cfg.get("sync_weights"):
         _sync_weights(ref_model, orig_model)
 
-    try:
-        mut_mod = _load_module_from_source(
-            cfg["mutated_code"], f"cfgstress_mut_{mut_hash}", tmp_dir)
-    except Exception as e:
-        return {"killed": False, "error": f"mut compile: {str(e)[:200]}",
-                "time_ms": (time.time() - t0) * 1000}
-    mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-    mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else mut_cls())
-    mut_model = mut_model.to(device).eval()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, mut_model)
+    if is_same_code:
+        mut_model = orig_model
+    else:
+        try:
+            mut_mod = _load_module_from_source(
+                cfg["mutated_code"], f"ext_mut_{mut_hash}", tmp_dir)
+        except Exception as e:
+            return {"killed": False, "error": f"mut compile: {str(e)[:200]}",
+                    "time_ms": (time.time() - t0) * 1000}
+        mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
+        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
+                     else mut_cls())
+        mut_model = mut_model.to(device).eval()
+        if cfg.get("sync_weights"):
+            _sync_weights(ref_model, mut_model)
 
     results_per_batch = {}
 
