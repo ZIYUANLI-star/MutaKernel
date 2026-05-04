@@ -1,0 +1,157 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      25|     
+      26|     const int spatial_size = height * width;
+      27|     const int feature_offset = feature_idx * spatial_size;
+      28|     const int batch_offset = batch_idx * num_features * spatial_size;
+      29|     const int start_idx = batch_offset + feature_offset;
+      30|     
+      31|     // Shared memory for reduction
+      32|     __shared__ float shared_sum[256];
+      33|     __shared__ float shared_sq_sum[256];
+      34|     
+      35|     // First pass: compute mean
+      36|     float sum = 0.0f;
+>>>   37|     for (int i = tid; i < spatial_size; i += blockDim.x) {
+      38|         int idx = start_idx + i;
+      39|         sum += static_cast<float>(input[idx]);
+      40|     }
+      41|     
+      42|     shared_sum[tid] = sum;
+      43|     __syncthreads();
+      44|     
+      45|     // Reduction to compute mean
+      46|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      47|         if (tid < stride) {
+      48|             shared_sum[tid] += shared_sum[tid + stride];
+      49|         }
+```
+
+## Mutated Code (around mutation site)
+```
+      25|     
+      26|     const int spatial_size = height * width;
+      27|     const int feature_offset = feature_idx * spatial_size;
+      28|     const int batch_offset = batch_idx * num_features * spatial_size;
+      29|     const int start_idx = batch_offset + feature_offset;
+      30|     
+      31|     // Shared memory for reduction
+      32|     __shared__ float shared_sum[256];
+      33|     __shared__ float shared_sq_sum[256];
+      34|     
+      35|     // First pass: compute mean
+      36|     float sum = 0.0f;
+>>>   37|     for (int i = tid; i <= spatial_size; i += blockDim.x) {
+      38|         int idx = start_idx + i;
+      39|         sum += static_cast<float>(input[idx]);
+      40|     }
+      41|     
+      42|     shared_sum[tid] = sum;
+      43|     __syncthreads();
+      44|     
+      45|     // Reduction to compute mean
+      46|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      47|         if (tid < stride) {
+      48|             shared_sum[tid] += shared_sum[tid + stride];
+      49|         }
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 37
+- Original fragment: `<`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Exploit the fact that the extra iteration accesses the first element of the next feature channel. Design input where each feature channel has distinct statistical properties, and the first element of each channel differs drastically from the current channel's values. Specifically, set the first element of every channel to an extreme value (e.g., +1e6) while setting all other elements in the channel to a different baseline (e.g., 0). This ensures the extra iteration contaminates the sum with a large value from the next channel, causing a detectable shift in the computed mean for each channel except the last. For the last channel, the extra access is out-of-bounds (global tensor end), which may cause undefined behavior but could be masked; thus we also ensure the last channel's first element is similarly extreme.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    batch_size, num_features, height, width = 16, 64, 256, 256
+    x = torch.zeros(batch_size, num_features, height, width, dtype=torch.float32, device=device)
+    # Set first spatial element (0,0) of each feature to a large value unique per feature
+    for b in range(batch_size):
+        for f in range(num_features):
+            x[b, f, 0, 0] = 1e6 * (f + 1)  # feature-dependent large value
+    # For the very last element of the entire tensor (to avoid out-of-bounds crash in mutant)
+    # We set it to the same extreme pattern to keep it within bounds, though access is still logically wrong.
+    # This ensures the mutant doesn't crash but computes a wrong sum.
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Exploit that only thread 0 accesses the out-of-bounds element by making all threads except thread 0 sum to zero, while thread 0's regular iterations sum to zero, but the extra out-of-bounds access is a large value. This maximizes the relative error in the sum. Use a checkerboard pattern where thread 0's regular iterations see zeros, but the extra iteration sees an extreme value. Set the entire tensor to zero except at the specific index that thread 0 will access in its extra iteration for each feature (except the last feature where it's out-of-bounds).
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    batch_size, num_features, height, width = 16, 64, 256, 256
+    x = torch.zeros(batch_size, num_features, height, width, dtype=torch.float32, device=device)
+    spatial_size = height * width  # 65536
+    block_dim = 256
+    # Only thread 0 will have i = spatial_size when tid=0 and stride hits exactly 65536
+    # That accesses index: start_idx + spatial_size
+    # For each batch and each feature except last, set the element at start_idx + spatial_size to a huge value
+    # start_idx = batch_offset + feature_offset
+    # The extra access for feature f is the first element of feature f+1 in same batch
+    for b in range(batch_size):
+        for f in range(num_features - 1):
+            # compute the index that thread 0 will access in its extra iteration for feature f
+            feature_offset = f * spatial_size
+            batch_offset = b * num_features * spatial_size
+            start_idx = batch_offset + feature_offset
+            extra_idx = start_idx + spatial_size  # first element of next feature
+            # Convert flat index back to 4D coordinates
+            # Since tensor is contiguous, we can compute:
+            flat = extra_idx
+            f_next = (flat // spatial_size) % num_features
+            b_idx = flat // (num_features * spatial_size)
+            spatial = flat % spatial_size
+            h = spatial // width
+            w = spatial % width
+            x[b_idx, f_next, h, w] = 1e9  # huge value
+    # For the last feature, the extra access is out-of-bounds (beyond tensor).
+    # We cannot set it, but the error for last feature may be ignored if we only check first 63 features.
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

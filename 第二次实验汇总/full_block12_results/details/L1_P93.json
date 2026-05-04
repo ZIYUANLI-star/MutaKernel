@@ -1,0 +1,1485 @@
+{
+  "kernel": {
+    "problem_id": 93,
+    "level": 1,
+    "problem_name": "L1_P93",
+    "language": "cuda"
+  },
+  "summary": {
+    "total": 11,
+    "killed": 6,
+    "survived": 2,
+    "stillborn": 0,
+    "strict_equivalent": 0,
+    "candidate_equivalent": 3,
+    "equivalent": 3,
+    "mutation_score": 0.5455,
+    "mutation_score_optimistic": 0.75,
+    "score_by_category": {
+      "A": 0.8333,
+      "B": 0.2,
+      "C": 0.0,
+      "D": 0.0
+    }
+  },
+  "mutants": [
+    {
+      "id": "L1_P93__arith_replace__5",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L61",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 39739.40086364746,
+      "site": {
+        "line_start": 61,
+        "line_end": 61,
+        "original_code": "+",
+        "node_type": "cuda_Add"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim - 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)"
+    },
+    {
+      "id": "L1_P93__arith_replace__2",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L32",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 39076.884746551514,
+      "site": {
+        "line_start": 32,
+        "line_end": 32,
+        "original_code": "+",
+        "node_type": "cuda_Add"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset - dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)"
+    },
+    {
+      "id": "L1_P93__arith_replace__4",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L32",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 38998.4872341156,
+      "site": {
+        "line_start": 32,
+        "line_end": 32,
+        "original_code": "+",
+        "node_type": "cuda_Add"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size - inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "equiv_detail": {
+        "mutant_id": "L1_P93__arith_replace__4",
+        "operator": "arith_replace",
+        "line_start": 32,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P93",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/93_masked_cumsum.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "358ce42ff0eb0146",
+          "cuda_norm_hash_mut": "f6c97ab22655eb7d",
+          "py_norm_hash_orig": "439c618898e28519",
+          "py_norm_hash_mut": "1b9be0b890bb60f3",
+          "mutation_site_line": 32,
+          "original_fragment": "+",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 18,
+              "original": "const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;",
+              "mutated": "const int64_t offset = base_offset + dim_idx * inner_size - inner_idx;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": false,
+          "equiv_runs": 100,
+          "operator_name": "arith_replace",
+          "time_ms": 600156,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [],
+          "tested_policies": [],
+          "total_rounds": 0,
+          "first_input_summary": null,
+          "last_input_summary": null,
+          "error": "worker_timeout_or_crash",
+          "divergence": {},
+          "verdict": "not_equivalent"
+        },
+        "decided_at": "layer2"
+      }
+    },
+    {
+      "id": "L1_P93__relop_replace__7",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L54",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 39219.95973587036,
+      "site": {
+        "line_start": 54,
+        "line_end": 54,
+        "original_code": "<",
+        "node_type": "cuda_Lt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i <= dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)"
+    },
+    {
+      "id": "L1_P93__relop_replace__4",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L44",
+      "status": "killed",
+      "error_message": "Runtime trial 0: Mask must be boolean tensor",
+      "kill_input_seed": 42,
+      "execution_time_ms": 38957.76104927063,
+      "site": {
+        "line_start": 44,
+        "line_end": 44,
+        "original_code": "==",
+        "node_type": "cuda_Eq"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() != torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)"
+    },
+    {
+      "id": "L1_P93__relop_replace__1",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L27",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 38666.04399681091,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": "<",
+        "node_type": "cuda_Lt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx <= inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)"
+    },
+    {
+      "id": "L1_P93__index_replace__3",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L27",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation changes thread indexing from threadIdx.x to threadIdx.z, which fundamentally alters the parallel execution pattern. In the original code, threads iterate over inner positions using thread",
+      "kill_input_seed": null,
+      "execution_time_ms": 39116.453647613525,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|z"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.z; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "equiv_detail": {
+        "mutant_id": "L1_P93__index_replace__3",
+        "operator": "index_replace",
+        "line_start": 27,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P93",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/93_masked_cumsum.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "358ce42ff0eb0146",
+          "cuda_norm_hash_mut": "e6df0f2afdef172d",
+          "py_norm_hash_orig": "439c618898e28519",
+          "py_norm_hash_mut": "d46fec7786475011",
+          "mutation_site_line": 27,
+          "original_fragment": "threadIdx.x",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 15,
+              "original": "for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {",
+              "mutated": "for (int64_t inner_idx = threadIdx.z; inner_idx < inner_size; inner_idx += blockDim.x) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "index_replace",
+          "time_ms": 5178,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.637370586395264,
+                "mean": -0.0007910541025921702,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5007363557815552,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4.169435977935791,
+                "max": 10000.0,
+                "mean": 0.01800868846476078,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5005019307136536,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation changes thread indexing from threadIdx.x to threadIdx.z, which fundamentally alters the parallel execution pattern. In the original code, threads iterate over inner positions using threadIdx.x with stride blockDim.x, creating a standard parallel decomposition. With threadIdx.z, the iteration depends on the z-component of thread index, which is typically 1 for 1D thread blocks (as configured with dim3 block_size_dim). Since block_size_dim only sets the x-dimension, threadIdx.z will always be 0 for all threads, causing all threads to process the same inner_idx = 0, leading to massive underutilization and incorrect results when inner_size > 1. This is detectable with any input where inner_size > 1 and different inner positions have different values.",
+          "kill_strategy": "Use any input where inner_size > 1 (which is true for the fixed shape [128, 4000] with dim=1, giving inner_size=1) - wait, actually for this specific shape with dim=1, inner_size=1, so all threads would process the same single inner position anyway. However, the mutation is still killable because with inner_size=1, the loop condition 'inner_idx < inner_size' becomes '0 < 1' for threadIdx.z=0, but threads with threadIdx.z > 0 (which don't exist in 1D blocks) would skip. The real issue is that with 1D blocks, threadIdx.z is always 0, so the original and mutant behave identically for inner_size=1. But if we consider the general case with the fixed shape, we need to test with a different dim parameter to make inner_size > 1.",
+          "suggested_test": {
+            "description": "Test with dim=0 instead of dim=1 to make inner_size > 1. With shape [128, 4000] and dim=0, outer_size=1, dim_size=128, inner_size=4000. This will expose the bug because multiple inner positions need processing and threadIdx.z=0 for all threads means only the first inner position gets processed.",
+            "python_code": "def generate_inputs(device):\n    # Use dim=0 instead of dim=1 to make inner_size > 1\n    shape = [128, 4000]\n    dim = 0  # Changed from 1 to 0\n    \n    # Create random input and mask\n    torch.manual_seed(42)\n    x = torch.randn(shape, device=device, dtype=torch.float32)\n    mask = torch.bernoulli(torch.full(shape, 0.5, device=device)).bool()\n    \n    return x, mask, dim  # Need to return dim as well since it's a parameter"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation changes thread indexing from threadIdx.x to threadIdx.z, which fundamentally alters the parallel execution pattern. In the original code, threads iterate over inner positions using threadIdx.x with stride blockDim.x, creating a standard parallel decomposition. With threadIdx.z, the iteration depends on the z-component of thread index, which is typically 1 for 1D thread blocks (as configured with dim3 block_size_dim). Since block_size_dim only sets the x-dimension, threadIdx.z will always be 0 for all threads, causing all threads to process the same inner_idx = 0, leading to massive underutilization and incorrect results when inner_size > 1. This is detectable with any input where inner_size > 1 and different inner positions have different values.\",\n  \"kill_strategy\": \"Use any input where inner_size > 1 (which is true for the fixed shape [128, 4000] with dim=1, giving inner_size=1) - wait, act",
+          "time_ms": 28065,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: index_replace\n- All runs bitwise identical: **True**\n- Time taken: 5178ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P93__index_replace__2",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L27",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3638ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 39083.68372917175,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.y; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "equiv_detail": {
+        "mutant_id": "L1_P93__index_replace__2",
+        "operator": "index_replace",
+        "line_start": 27,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P93",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/93_masked_cumsum.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "358ce42ff0eb0146",
+          "cuda_norm_hash_mut": "9eb551e0e6eeb505",
+          "py_norm_hash_orig": "439c618898e28519",
+          "py_norm_hash_mut": "b3c31a557468efc3",
+          "mutation_site_line": 27,
+          "original_fragment": "threadIdx.x",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 15,
+              "original": "for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {",
+              "mutated": "for (int64_t inner_idx = threadIdx.y; inner_idx < inner_size; inner_idx += blockDim.x) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "index_replace",
+          "time_ms": 3638,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.637370586395264,
+                "mean": -0.0007910541025921702,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5007363557815552,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4.169435977935791,
+                "max": 10000.0,
+                "mean": 0.01800868846476078,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5005019307136536,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 0.95,
+          "reasoning": "The mutation changes `threadIdx.x` to `threadIdx.y` in the loop initialization, but the kernel is launched with `dim3 block_size_dim(min(block_size, (int)inner_size))` which creates a 1D block configuration where only `blockDim.x` is set (and `blockDim.y = blockDim.z = 1`). In CUDA, when using `dim3` with a single integer argument, only the x dimension is set. Therefore, `threadIdx.y` will always be 0 for all threads, making the loop effectively start at `inner_idx = 0` for all threads. However, the loop stride `inner_idx += blockDim.x` still uses `blockDim.x`, so all threads will process the same inner indices (starting at 0) rather than partitioning the work. Despite this, the kernel still produces correct results because: 1) Each thread writes to the same memory locations, 2) CUDA guarantees sequential consistency for writes to the same location from multiple threads in the same warp, and 3) All threads compute the same cumulative sum values. The 100+ random tests in Layer 2 would have caught any divergence if it existed.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation changes `threadIdx.x` to `threadIdx.y` in the loop initialization, but the kernel is launched with `dim3 block_size_dim(min(block_size, (int)inner_size))` which creates a 1D block configuration where only `blockDim.x` is set (and `blockDim.y = blockDim.z = 1`). In CUDA, when using `dim3` with a single integer argument, only the x dimension is set. Therefore, `threadIdx.y` will always be 0 for all threads, making the loop effectively start at `inner_idx = 0` for all threads. However, the loop stride `inner_idx += blockDim.x` still uses `blockDim.x`, so all threads will process the same inner indices (starting at 0) rather than partitioning the work. Despite this, the kernel still produces correct results because: 1) Each thread writes to the same memory locations, 2) CUDA guarantees sequential consistency for writes to the same location from multiple threads in the same warp, and 3) All thr",
+          "time_ms": 13399,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: index_replace\n- All runs bitwise identical: **True**\n- Time taken: 3638ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P93__index_replace__0",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L20",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 39127.39157676697,
+      "site": {
+        "line_start": 20,
+        "line_end": 20,
+        "original_code": "blockIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.y;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)"
+    },
+    {
+      "id": "L1_P93__mask_boundary__0",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L21",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3894ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 39014.67776298523,
+      "site": {
+        "line_start": 21,
+        "line_end": 21,
+        "original_code": "outer_idx >= outer_size",
+        "node_type": "ge>"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx > outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "equiv_detail": {
+        "mutant_id": "L1_P93__mask_boundary__0",
+        "operator": "mask_boundary",
+        "line_start": 21,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P93",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/93_masked_cumsum.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "358ce42ff0eb0146",
+          "cuda_norm_hash_mut": "8f545d349d04c015",
+          "py_norm_hash_orig": "439c618898e28519",
+          "py_norm_hash_mut": "2c056242c49923b4",
+          "mutation_site_line": 21,
+          "original_fragment": "outer_idx >= outer_size",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 13,
+              "original": "if (outer_idx >= outer_size) return;",
+              "mutated": "if (outer_idx > outer_size) return;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "mask_boundary",
+          "time_ms": 3894,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.637370586395264,
+                "mean": -0.0007910541025921702,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5007363557815552,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4169.43603515625,
+                "max": 5140.97314453125,
+                "mean": -1.5204887390136719,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5005019307136536,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the boundary check from `outer_idx >= outer_size` to `outer_idx > outer_size`. However, the kernel launch configuration uses `grid_size(outer_size)`, meaning `blockIdx.x` ranges from 0 to `outer_size-1`. Since `outer_idx` is always less than `outer_size`, both conditions evaluate to false for all valid blocks, and the early return is never taken. The mutation is therefore dead code under the fixed-shape testing paradigm where grid dimensions are derived from tensor sizes. No input values can affect this because the condition depends only on blockIdx.x and outer_size, which are fixed by the launch configuration.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the boundary check from `outer_idx >= outer_size` to `outer_idx > outer_size`. However, the kernel launch configuration uses `grid_size(outer_size)`, meaning `blockIdx.x` ranges from 0 to `outer_size-1`. Since `outer_idx` is always less than `outer_size`, both conditions evaluate to false for all valid blocks, and the early return is never taken. The mutation is therefore dead code under the fixed-shape testing paradigm where grid dimensions are derived from tensor sizes. No input values can affect this because the condition depends only on blockIdx.x and outer_size, which are fixed by the launch configuration.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}\n```",
+          "time_ms": 8679,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: mask_boundary\n- All runs bitwise identical: **True**\n- Time taken: 3894ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P93__mask_boundary__1",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L21",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 4057ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 38748.72016906738,
+      "site": {
+        "line_start": 21,
+        "line_end": 21,
+        "original_code": "outer_idx >= outer_size",
+        "node_type": "ge_rhs+1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized masked cumulative sum\nmasked_cumsum_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename scalar_t>\n__global__ void masked_cumsum_kernel(\n    const scalar_t* __restrict__ input,\n    const bool* __restrict__ mask,\n    scalar_t* __restrict__ output,\n    const int64_t outer_size,\n    const int64_t dim_size,\n    const int64_t inner_size\n) {\n    // Each block handles one outer position\n    const int64_t outer_idx = blockIdx.x;\n    if (outer_idx >= outer_size + 1) return;\n    \n    // Each thread handles multiple inner positions with vectorized loads\n    const int64_t base_offset = outer_idx * dim_size * inner_size;\n    \n    // Process inner positions in parallel\n    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {\n        scalar_t cum_sum = 0;\n        \n        // Sequential scan along the cumulative dimension\n        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {\n            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;\n            if (mask[offset]) {\n                cum_sum += input[offset];\n            }\n            output[offset] = cum_sum;\n        }\n    }\n}\n\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {\n    // Validate inputs\n    TORCH_CHECK(input.sizes() == mask.sizes(), \"Input and mask must have same shape\");\n    TORCH_CHECK(mask.scalar_type() == torch::kBool, \"Mask must be boolean tensor\");\n    TORCH_CHECK(dim >= 0 && dim < input.dim(), \"Dimension out of range\");\n    \n    auto output = torch::empty_like(input);\n    \n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    \n    // Calculate dimensions for kernel launch\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int64_t dim_size = sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Launch kernel with optimized configuration\n    // Use maximum threads per block for better occupancy\n    const int block_size = 256;\n    dim3 grid_size(outer_size);\n    dim3 block_size_dim(min(block_size, (int)inner_size));\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(\n        input.scalar_type(),\n        \"masked_cumsum_kernel\",\n        [&] {\n            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(\n                input.data_ptr<scalar_t>(),\n                mask.data_ptr<bool>(),\n                output.data_ptr<scalar_t>(),\n                outer_size,\n                dim_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmasked_cumsum_cpp_source = \"\"\"\ntorch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmasked_cumsum = load_inline(\n    name=\"masked_cumsum\",\n    cpp_sources=masked_cumsum_cpp_source,\n    cuda_sources=masked_cumsum_source,\n    functions=[\"masked_cumsum_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs a masked cumulative sum using custom CUDA kernel.\n    \n    Parameters:\n        dim (int): The dimension along which to perform the masked cumulative sum.\n    \"\"\"\n    \n    def __init__(self, dim):\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.masked_cumsum = masked_cumsum\n    \n    def forward(self, x, mask):\n        \"\"\"\n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).\n            mask (torch.Tensor): Boolean mask of the same shape as x.\n            \n        Returns:\n            torch.Tensor: Cumulative sum of elements where mask is True.\n        \"\"\"\n        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)",
+      "equiv_detail": {
+        "mutant_id": "L1_P93__mask_boundary__1",
+        "operator": "mask_boundary",
+        "line_start": 21,
+        "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P93",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/93_masked_cumsum.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "358ce42ff0eb0146",
+          "cuda_norm_hash_mut": "84874fb0f27388f7",
+          "py_norm_hash_orig": "439c618898e28519",
+          "py_norm_hash_mut": "2ab1c108708356af",
+          "mutation_site_line": 21,
+          "original_fragment": "outer_idx >= outer_size",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 13,
+              "original": "if (outer_idx >= outer_size) return;",
+              "mutated": "if (outer_idx >= outer_size + 1) return;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "mask_boundary",
+          "time_ms": 4057,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.637370586395264,
+                "mean": -0.0007910541025921702,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5007363557815552,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.float32",
+                "min": -4169.43603515625,
+                "max": 5140.97314453125,
+                "mean": -1.5204887390136719,
+                "has_nan": false,
+                "has_inf": false
+              },
+              {
+                "shape": [
+                  128,
+                  4000
+                ],
+                "dtype": "torch.bool",
+                "min": 0.0,
+                "max": 1.0,
+                "mean": 0.5005019307136536,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the boundary check from `outer_idx >= outer_size` to `outer_idx >= outer_size + 1`. However, the kernel launch configuration uses `grid_size(outer_size)`, meaning `blockIdx.x` ranges from 0 to `outer_size-1`. Since `outer_idx` is always less than `outer_size`, the condition `outer_idx >= outer_size + 1` is always false. Therefore, the mutated guard never triggers, and the execution path is identical to the original. This is a classic case of dead code mutation where the changed condition is never satisfied due to the grid launch parameters. No input values can affect this because the guard depends only on `outer_idx` and `outer_size`, both determined by tensor shapes and launch configuration, not input values.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the boundary check from `outer_idx >= outer_size` to `outer_idx >= outer_size + 1`. However, the kernel launch configuration uses `grid_size(outer_size)`, meaning `blockIdx.x` ranges from 0 to `outer_size-1`. Since `outer_idx` is always less than `outer_size`, the condition `outer_idx >= outer_size + 1` is always false. Therefore, the mutated guard never triggers, and the execution path is identical to the original. This is a classic case of dead code mutation where the changed condition is never satisfied due to the grid launch parameters. No input values can affect this because the guard depends only on `outer_idx` and `outer_size`, both determined by tensor shapes and launch configuration, not input values.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}\n```",
+          "time_ms": 9914,
+          "input_spec": "forward() expects 2 argument(s):\n  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32\n  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: mask_boundary\n- All runs bitwise identical: **True**\n- Time taken: 4057ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    }
+  ]
+}

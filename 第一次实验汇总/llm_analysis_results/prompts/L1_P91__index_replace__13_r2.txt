@@ -1,0 +1,112 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      34|     }
+      35| }
+      36| 
+      37| template<typename scalar_t>
+      38| __global__ void reverse_cumsum_kernel_unrolled(
+      39|     const scalar_t* __restrict__ input,
+      40|     scalar_t* __restrict__ output,
+      41|     const int64_t outer_size,
+      42|     const int64_t dim_size,
+      43|     const int64_t inner_size
+      44| ) {
+      45|     const int64_t outer_idx = blockIdx.y;
+>>>   46|     const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+      47|     
+      48|     if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+      49|     
+      50|     const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+      51|     
+      52|     scalar_t sum = 0;
+      53|     int64_t dim_idx = dim_size - 1;
+      54|     
+      55|     // Unroll by 4 for better instruction-level parallelism
+      56|     for (; dim_idx >= 3; dim_idx -= 4) {
+      57|         const int64_t offset0 = base_offset + dim_idx * inner_size;
+      58|         const int64_t offset1 = base_offset + (dim_idx - 1) * inner_size;
+```
+
+## Mutated Code (around mutation site)
+```
+      34|     }
+      35| }
+      36| 
+      37| template<typename scalar_t>
+      38| __global__ void reverse_cumsum_kernel_unrolled(
+      39|     const scalar_t* __restrict__ input,
+      40|     scalar_t* __restrict__ output,
+      41|     const int64_t outer_size,
+      42|     const int64_t dim_size,
+      43|     const int64_t inner_size
+      44| ) {
+      45|     const int64_t outer_idx = blockIdx.y;
+>>>   46|     const int64_t inner_idx = blockIdx.x * blockDim.z + threadIdx.x;
+      47|     
+      48|     if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+      49|     
+      50|     const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+      51|     
+      52|     scalar_t sum = 0;
+      53|     int64_t dim_idx = dim_size - 1;
+      54|     
+      55|     // Unroll by 4 for better instruction-level parallelism
+      56|     for (; dim_idx >= 3; dim_idx -= 4) {
+      57|         const int64_t offset0 = base_offset + dim_idx * inner_size;
+      58|         const int64_t offset1 = base_offset + (dim_idx - 1) * inner_size;
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 46
+- Original fragment: `blockDim.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[128, 4000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Expose the mutation by using a 3D input tensor where inner_size > 1 and is larger than the block's x-dimension, forcing multiple blocks in the x-dimension. The mutant will compute inner_idx = blockIdx.x * blockDim.z + threadIdx.x (with blockDim.z = 1), causing overlapping and missed indices, while the original uses blockDim.x (e.g., 256) to produce correct, non-overlapping indices. This leads to incorrect memory accesses and wrong results.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Shape: [outer_size, dim_size, inner_size] = [2, 4000, 300]
+    # inner_size=300 > typical blockDim.x (256), forcing gridDim.x = 2
+    shape = (2, 4000, 300)
+    # Fill with ones for predictable reverse cumsum
+    tensor = torch.ones(shape, dtype=torch.float32, device=device)
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

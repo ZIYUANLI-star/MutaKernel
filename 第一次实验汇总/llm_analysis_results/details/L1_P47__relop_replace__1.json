@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P47__relop_replace__1",
+  "kernel_name": "L1_P47",
+  "operator_name": "relop_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant changes the boundary condition from 'inner_idx >= inner_size' to 'inner_idx > inner_size', allowing threads with inner_idx == inner_size to execute. In the original stress tests, the input shape [16, 256, 256] was combined with a block size of 256 (or a divisor), resulting in grid dimensions that never launch threads with inner_idx == inner_size. Specifically, with inner_size=256 and blockDim.x=256, gridDim.y = ceil(256/256)=1, so inner_idx ranges from 0 to 255. Thus, the mutant's altered condition never triggers, and both kernels behave identically for all value distributions.",
+  "killable": true,
+  "kill_strategy": "To kill the mutant, we must change the input shape so that inner_size is not a multiple of the block size, causing extra threads with inner_idx == inner_size to be launched. A shape of [2, 2, 1] with blockDim.x=2 (implied by typical kernel launch heuristics) will launch threads with inner_idx=0 and 1. The thread with inner_idx=1 (equal to inner_size) proceeds in the mutant but not in the original. This thread performs out-of-bounds reads and writes, leading to a race condition that can alter the output numerically.",
+  "recommendations": "The kernel should use the exact same boundary condition for both outer and inner dimensions (>=). The test suite should vary input shapes, not just values, to catch boundary-condition mutants. Specifically, shapes where dimensions are not multiples of the block size (or where grid dimensions exceed problem size) are essential for testing thread-boundary logic. Additionally, consider adding memory access checks (e.g., via cuda-memcheck) to detect out-of-bounds accesses that may not manifest numerically.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant changes the boundary condition from 'inner_idx >= inner_size' to 'inner_idx > inner_size', allowing threads with inner_idx == inner_size to execute. In the original stress tests, the input shape [16, 256, 256] was combined with a block size of 256 (or a divisor), resulting in grid dimensions that never launch threads with inner_idx == inner_size. Specifically, with inner_size=256 and blockDim.x=256, gridDim.y = ceil(256/256)=1, so inner_idx ranges from 0 to 255. Thus, the mutant's altered condition never triggers, and both kernels behave identically for all value distributions.",
+      "kill_strategy": "To kill the mutant, we must change the input shape so that inner_size is not a multiple of the block size, causing extra threads with inner_idx == inner_size to be launched. A shape of [2, 2, 1] with blockDim.x=2 (implied by typical kernel launch heuristics) will launch threads with inner_idx=0 and 1. The thread with inner_idx=1 (equal to inner_size) proceeds in the mutant but not in the original. This thread performs out-of-bounds reads and writes, leading to a race condition that can alter the output numerically.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    outer_size = 2\n    reduce_size = 2\n    inner_size = 1\n    # Input tensor shaped [outer_size, reduce_size, inner_size]\n    # Values: [[[1], [2]], [[3], [4]]] flattened to [1,2,3,4]\n    input_tensor = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]], device=device, dtype=torch.float32)\n    return [input_tensor]\n",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.000000e+00, mean_diff=1.000000e+00, ref_range=[3.0000e+00,7.0000e+00], mut_range=[3.0000e+00,5.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "non_aligned_inner_dimension",
+    "rule_description": "Generates inputs where the inner dimension size is not a multiple of common GPU block sizes (especially 256). This forces grid launches where the last block contains threads with indices that exceed valid boundaries when boundary conditions are mutated. The rule targets boundary condition mutants by ensuring at least one thread executes beyond the intended range.",
+    "applicable_operators": [
+      "relop_replace",
+      "boundary_mutation",
+      "relop_mutation"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Target kernels with grid-stride loops where boundary conditions\n    # protect against out-of-range access\n    import torch\n    import numpy as np\n    \n    # Choose inner_size that is not divisible by typical block sizes\n    # to ensure extra threads in the last block\n    problematic_sizes = [1, 3, 5, 7, 9, 17, 33, 65, 129, 257, 513, 1025]\n    inner_size = int(rng.choice(problematic_sizes))\n    \n    # Keep outer dimensions small to create manageable test cases\n    outer_size = rng.randint(1, 5)\n    reduce_size = rng.randint(1, 5)\n    \n    # Construct tensor with shape that forces boundary condition exposure\n    shape = (outer_size, reduce_size, inner_size)\n    \n    # Use random values in a reasonable range\n    tensor = torch.randn(shape, dtype=dtype, device=device)\n    \n    # Scale to avoid extreme values that might mask boundary issues\n    tensor = tensor * 2.0 - 1.0  # Values in [-1, 1]\n    \n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    outer_size = 2\n    reduce_size = 2\n    inner_size = 1\n    # Input tensor shaped [outer_size, reduce_size, inner_size]\n    # Values: [[[1], [2]], [[3], [4]]] flattened to [1,2,3,4]\n    input_tensor = torch.tensor([[[1.0], [2.0]], [[3.0], [4.0]]], device=device, dtype=torch.float32)\n    return [input_tensor]\n"
+}

@@ -1,0 +1,149 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      31| }
+      32| 
+      33| template<typename scalar_t>
+      34| __global__ void elu_kernel_vectorized4(
+      35|     const scalar_t* __restrict__ input,
+      36|     scalar_t* __restrict__ output,
+      37|     scalar_t alpha,
+      38|     int64_t size) {
+      39|     
+      40|     const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+      41|     const int64_t idx = tid * 4;
+      42|     
+>>>   43|     if (idx + 3 < size) {
+      44|         // Load 4 elements
+      45|         scalar_t vals[4];
+      46|         #pragma unroll
+      47|         for (int j = 0; j < 4; ++j) {
+      48|             vals[j] = input[idx + j];
+      49|         }
+      50|         
+      51|         // Compute ELU for all 4 elements
+      52|         #pragma unroll
+      53|         for (int j = 0; j < 4; ++j) {
+      54|             output[idx + j] = elu_activation<scalar_t>(vals[j], alpha);
+      55|         }
+```
+
+## Mutated Code (around mutation site)
+```
+      31| }
+      32| 
+      33| template<typename scalar_t>
+      34| __global__ void elu_kernel_vectorized4(
+      35|     const scalar_t* __restrict__ input,
+      36|     scalar_t* __restrict__ output,
+      37|     scalar_t alpha,
+      38|     int64_t size) {
+      39|     
+      40|     const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+      41|     const int64_t idx = tid * 4;
+      42|     
+>>>   43|     if (idx - 3 < size) {
+      44|         // Load 4 elements
+      45|         scalar_t vals[4];
+      46|         #pragma unroll
+      47|         for (int j = 0; j < 4; ++j) {
+      48|             vals[j] = input[idx + j];
+      49|         }
+      50|         
+      51|         // Compute ELU for all 4 elements
+      52|         #pragma unroll
+      53|         for (int j = 0; j < 4; ++j) {
+      54|             output[idx + j] = elu_activation<scalar_t>(vals[j], alpha);
+      55|         }
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 43
+- Original fragment: `+`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by launching more threads than needed (oversubscription) so that some threads have `idx >= size + 3`. This causes the original condition `idx + 3 < size` to become false (skipping out-of-bounds accesses), while the mutant condition `idx - 3 < size` remains true (attempting illegal memory access). Specifically, we need an input size that is not a multiple of 4, and launch enough threads so that the last thread's `idx` is `ceil(size/4)*4`, which may exceed `size + 3`. This will trigger different behavior: the original skips the out-of-bounds thread, while the mutant attempts to load/store 4 elements beyond array bounds, potentially causing a crash or corrupted output.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Use a size that is NOT a multiple of 4 and small enough to create oversubscription
+    # Original shape was [16, 16384] = 262144 (divisible by 4). 
+    # We change to [16, 16383] = 262128, which is divisible by 4? 262128/4=65532, still divisible.
+    # Actually, we need size NOT divisible by 4. Let's use shape [16, 16383] but subtract 1 element:
+    # 16*16383 = 262128, then subtract 1 = 262127 (not divisible by 4).
+    # However, shape must be 2D. So we can use [16, 16383] and then slice? But slicing changes shape.
+    # Better: Use a completely different shape that results in size not divisible by 4.
+    # Let's use shape [1, 263] (263 elements, 263 % 4 = 3).
+    shape = [1, 263]  # Total size = 263, not divisible by 4
+    size = 263
+    # The kernel launch will use grid = ceil(size/4) = ceil(263/4) = 66 threads.
+    # Last thread idx = (65 * 4) = 260.
+    # Original: idx+3 = 263, which is NOT < 263, so condition false.
+    # Mutant: idx-3 = 257, which IS < 263, so condition true -> out-of-bounds access at indices 260-263.
+    # Values don't matter; use random data.
+    input_tensor = torch.randn(shape, dtype=torch.float32, device=device)
+    return [input_tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Exploit the underflow scenario when `idx < 3`. Create an input size small enough so that the first thread (tid=0, idx=0) is active, but the mutant condition `0 - 3 < size` underflows to a huge positive number (since `idx - 3` wraps around to a large unsigned value due to two's complement). This makes the mutant condition false, skipping computation for the first 4 elements, while the original condition `0 + 3 < size` is true, computing them. Use a non-zero-initialized output tensor to detect the difference. Also, ensure the kernel launches with at least 1 thread (tid=0) by adjusting grid/block, but the launch parameters are determined by the caller; we can choose a size that guarantees at least one thread. Use a size between 4 and the block size to ensure tid=0 is the only thread, making the difference observable.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Small size to ensure only first thread (tid=0) is active
+    shape = [1, 4]  # total size = 4
+    # Input with negative values to make ELU non-identity
+    input_tensor = torch.tensor([[-1.0, -2.0, 0.5, 3.0]], dtype=torch.float32, device=device)
+    # Output pre-filled with sentinel values (e.g., large positive numbers)
+    # The kernel will overwrite if condition true, else remain
+    output_sentinel = 999.0  # easily detectable value
+    # The caller will allocate output; we cannot pre-fill directly.
+    # Instead, we rely on the kernel's behavior: mutant skips, leaving output uninitialized (likely zero).
+    # So we must verify that output is different from expected ELU result.
+    return [input_tensor]
+
+# Note: The test harness must compare output with expected ELU of input.
+# The mutant will produce zeros (or uninitialized memory) for first 4 elements.
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

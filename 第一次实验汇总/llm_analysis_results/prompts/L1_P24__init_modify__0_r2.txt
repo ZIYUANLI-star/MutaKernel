@@ -1,0 +1,113 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      38| ) {
+      39|     // Each block handles one batch element
+      40|     const int batch_idx = blockIdx.x;
+      41|     const int tid = threadIdx.x;
+      42|     
+      43|     const T* batch_input = input + batch_idx * dim_size;
+      44|     T* batch_output = output + batch_idx * dim_size;
+      45|     
+      46|     // Shared memory for reductions
+      47|     __shared__ float sdata[1024];
+      48|     
+      49|     // Step 1: Find max using block reduction
+>>>   50|     float thread_max = -INFINITY;
+      51|     for (int i = tid; i < dim_size; i += blockDim.x) {
+      52|         float val = to_float<T>(batch_input[i]);
+      53|         thread_max = fmaxf(thread_max, val);
+      54|     }
+      55|     
+      56|     sdata[tid] = thread_max;
+      57|     __syncthreads();
+      58|     
+      59|     // Block reduction for max
+      60|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      61|         if (tid < s) {
+      62|             sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+```
+
+## Mutated Code (around mutation site)
+```
+      38| ) {
+      39|     // Each block handles one batch element
+      40|     const int batch_idx = blockIdx.x;
+      41|     const int tid = threadIdx.x;
+      42|     
+      43|     const T* batch_input = input + batch_idx * dim_size;
+      44|     T* batch_output = output + batch_idx * dim_size;
+      45|     
+      46|     // Shared memory for reductions
+      47|     __shared__ float sdata[1024];
+      48|     
+      49|     // Step 1: Find max using block reduction
+>>>   50|     float thread_max = -1e10f;
+      51|     for (int i = tid; i < dim_size; i += blockDim.x) {
+      52|         float val = to_float<T>(batch_input[i]);
+      53|         thread_max = fmaxf(thread_max, val);
+      54|     }
+      55|     
+      56|     sdata[tid] = thread_max;
+      57|     __syncthreads();
+      58|     
+      59|     // Block reduction for max
+      60|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      61|         if (tid < s) {
+      62|             sdata[tid] = fmaxf(sdata[tid], sdata[tid + s]);
+```
+
+## Mutation Details
+- Operator: init_modify — Change reduction identity elements (-inf → finite, etc.)
+- Location: line 50
+- Original fragment: `-INFINITY`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Create an input where ALL elements in at least one batch are less than -1e10f (e.g., -1e11f). The original kernel with -INFINITY will correctly compute the maximum among these negative values, while the mutant will get stuck at -1e10f, producing wrong output. The tensor shape must remain [16, 16384], but we can set one entire batch to extreme negative values.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Shape: [16, 16384] as specified
+    x = torch.randn(16, 16384, device=device) * 0.01  # small normal values for most batches
+    # Batch 0: all values set to -1e11f (< -1e10f)
+    x[0, :] = -1e11
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=inf, mean_diff=inf, ref_range=[-9.7480e+00,-9.6565e+00], mut_range=[-9.7480e+00,inf]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

@@ -1,0 +1,487 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived:
+- EMD 4-layer equivalence detection (112 rounds)
+- Enhanced deterministic testing (5 dimensions, 108 rounds)
+- AND your previous suggested inputs (see below)
+
+Re-analyze with the failure information and try a fundamentally different approach.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison is BITWISE (NaN-aware).
+- **Do NOT suggest shape or batch size changes.**
+
+### Auxiliary configuration-stress track
+- Alternative batch sizes were tested separately (see below).
+- This does NOT redefine the main contract.
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Smooth L1 Loss
+smooth_l1_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void smooth_l1_loss_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ output,
+    int total_elements,
+    float beta
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_elements) {
+        float diff = predictions[idx] - targets[idx];
+        float abs_diff = fabsf(diff);
+        
+        if (abs_diff < beta) {
+            output[idx] = 0.5f * diff * diff / beta;
+        } else {
+            output[idx] = abs_diff - 0.5f * beta;
+        }
+    }
+}
+
+__global__ void sum_reduction_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int size
+) {
+    extern __shared__ float shared_mem[];
+    
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Load data into shared memory
+    if (idx < size) {
+        shared_mem[tid] = input[idx];
+    } else {
+        shared_mem[tid] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_mem[tid] += shared_mem[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    // Write block sum to global memory
+    if (tid == 0) {
+        output[blockIdx.x] = shared_mem[0];
+    }
+}
+
+torch::Tensor smooth_l1_loss_cuda(torch::Tensor predictions, torch::Tensor targets, float beta=1.0) {
+    // Check inputs
+    TORCH_CHECK(predictions.sizes() == targets.sizes(), "Input tensors must have the same shape");
+    TORCH_CHECK(predictions.is_cuda() && targets.is_cuda(), "Inputs must be CUDA tensors");
+    
+    auto total_elements = predictions.numel();
+    
+    // First kernel: compute element-wise losses
+    const int block_size = 256;
+    const int num_blocks = (total_elements + block_size - 1) / block_size;
+    
+    auto element_losses = torch::empty({total_elements}, 
+                                       torch::TensorOptions()
+                                       .dtype(torch::kFloat32)
+                                       .device(torch::kCUDA));
+    
+    smooth_l1_loss_kernel<<<num_blocks, block_size>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        element_losses.data_ptr<float>(),
+        total_elements,
+        beta
+    );
+    
+    // Second kernel: reduction to get sum
+    const int reduction_block_size = 256;
+    const int reduction_blocks = (total_elements + reduction_block_size - 1) / reduction_block_size;
+    
+    auto block_sums = torch::zeros({reduction_blocks}, 
+                                   torch::TensorOptions()
+                                   .dtype(torch::kFloat32)
+                                   .device(torch::kCUDA));
+    
+    sum_reduction_kernel<<<reduction_blocks, reduction_block_size, reduction_block_size * sizeof(float)>>>(
+        element_losses.data_ptr<float>(),
+        block_sums.data_ptr<float>(),
+        total_elements
+    );
+    
+    // Final reduction on CPU (simpler and fine for small number of blocks)
+    auto block_sums_cpu = block_sums.cpu();
+    float total_loss = 0.0f;
+    for (int i = 0; i < reduction_blocks; i++) {
+        total_loss += block_sums_cpu.data_ptr<float>()[i];
+    }
+    
+    // Compute mean loss
+    float mean_loss = total_loss / total_elements;
+    return torch::tensor(mean_loss, torch::TensorOptions().device(torch::kCUDA));
+}
+"""
+
+smooth_l1_cpp_source = """
+torch::Tensor smooth_l1_loss_cuda(torch::Tensor predictions, torch::Tensor targets, float beta=1.0);
+"""
+
+# Compile the inline CUDA code
+smooth_l1_cuda = load_inline(
+    name="smooth_l1_loss",
+    cpp_sources=smooth_l1_cpp_source,
+    cuda_sources=smooth_l1_source,
+    functions=["smooth_l1_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Smooth L1 (Huber) Loss using custom CUDA kernels.
+    
+    Parameters:
+        beta (float): Specifies the threshold at which to change between L1 and L2 loss.
+                      Default: 1.0
+    """
+    def __init__(self, beta=1.0):
+        super(ModelNew, self).__init__()
+        self.beta = beta
+        self.smooth_l1_loss_cuda = smooth_l1_cuda
+    
+    def forward(self, predictions, targets):
+        return self.smooth_l1_loss_cuda.smooth_l1_loss_cuda(predictions, targets, self.beta)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Smooth L1 Loss
+smooth_l1_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+__global__ void smooth_l1_loss_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ output,
+    int total_elements,
+    float beta
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < total_elements) {
+        float diff = predictions[idx] - targets[idx];
+        float abs_diff = fabsf(diff);
+        
+        if (abs_diff < beta) {
+            output[idx] = 0.5f * diff * diff / beta;
+        } else {
+            output[idx] = abs_diff - 0.5f * beta;
+        }
+    }
+}
+
+__global__ void sum_reduction_kernel(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int size
+) {
+    extern __shared__ float shared_mem[];
+    
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Load data into shared memory
+    if (idx < size) {
+        shared_mem[tid] = input[idx];
+    } else {
+        shared_mem[tid] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_mem[tid] += shared_mem[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    // Write block sum to global memory
+    if (tid == 0) {
+        output[blockIdx.x] = shared_mem[0];
+    }
+}
+
+torch::Tensor smooth_l1_loss_cuda(torch::Tensor predictions, torch::Tensor targets, float beta=1.0) {
+    // Check inputs
+    TORCH_CHECK(predictions.sizes() == targets.sizes(), "Input tensors must have the same shape");
+    TORCH_CHECK(predictions.is_cuda() && targets.is_cuda(), "Inputs must be CUDA tensors");
+    
+    auto total_elements = predictions.numel();
+    
+    // First kernel: compute element-wise losses
+    const int block_size = 256;
+    const int num_blocks = (total_elements - block_size - 1) / block_size;
+    
+    auto element_losses = torch::empty({total_elements}, 
+                                       torch::TensorOptions()
+                                       .dtype(torch::kFloat32)
+                                       .device(torch::kCUDA));
+    
+    smooth_l1_loss_kernel<<<num_blocks, block_size>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        element_losses.data_ptr<float>(),
+        total_elements,
+        beta
+    );
+    
+    // Second kernel: reduction to get sum
+    const int reduction_block_size = 256;
+    const int reduction_blocks = (total_elements + reduction_block_size - 1) / reduction_block_size;
+    
+    auto block_sums = torch::zeros({reduction_blocks}, 
+                                   torch::TensorOptions()
+                                   .dtype(torch::kFloat32)
+                                   .device(torch::kCUDA));
+    
+    sum_reduction_kernel<<<reduction_blocks, reduction_block_size, reduction_block_size * sizeof(float)>>>(
+        element_losses.data_ptr<float>(),
+        block_sums.data_ptr<float>(),
+        total_elements
+    );
+    
+    // Final reduction on CPU (simpler and fine for small number of blocks)
+    auto block_sums_cpu = block_sums.cpu();
+    float total_loss = 0.0f;
+    for (int i = 0; i < reduction_blocks; i++) {
+        total_loss += block_sums_cpu.data_ptr<float>()[i];
+    }
+    
+    // Compute mean loss
+    float mean_loss = total_loss / total_elements;
+    return torch::tensor(mean_loss, torch::TensorOptions().device(torch::kCUDA));
+}
+"""
+
+smooth_l1_cpp_source = """
+torch::Tensor smooth_l1_loss_cuda(torch::Tensor predictions, torch::Tensor targets, float beta=1.0);
+"""
+
+# Compile the inline CUDA code
+smooth_l1_cuda = load_inline(
+    name="smooth_l1_loss",
+    cpp_sources=smooth_l1_cpp_source,
+    cuda_sources=smooth_l1_source,
+    functions=["smooth_l1_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Smooth L1 (Huber) Loss using custom CUDA kernels.
+    
+    Parameters:
+        beta (float): Specifies the threshold at which to change between L1 and L2 loss.
+                      Default: 1.0
+    """
+    def __init__(self, beta=1.0):
+        super(ModelNew, self).__init__()
+        self.beta = beta
+        self.smooth_l1_loss_cuda = smooth_l1_cuda
+    
+    def forward(self, predictions, targets):
+        return self.smooth_l1_loss_cuda.smooth_l1_loss_cuda(predictions, targets, self.beta)
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 73
+- Original fragment: `+`
+- node_type: cuda_Add
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[128, 4096], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 4096], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis may contain errors. Reason independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 73
+- Original fragment: `+`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - extreme_magnitude: passed
+  - extreme_magnitude: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - near_zero: passed
+  - near_zero: passed
+  - all_negative: passed
+  - all_negative: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.637370586395264, 'mean': -0.0009141105692833662, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4.499828815460205, 'max': 4.793313980102539, 'mean': 0.00023611041251569986, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4.169435977935791, 'max': 10000.0, 'mean': 0.017383672297000885, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4.866793632507324, 'max': 10000.0, 'mean': 0.01740950159728527, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: possibly_killable
+- Confidence: 0.95
+- Reasoning: The mutation changes the grid size calculation from `(total_elements + block_size - 1) / block_size` to `(total_elements - block_size - 1) / block_size`. This is on the execution path and affects how many threads are launched. For most input sizes, this results in fewer blocks being launched, potentially leaving some elements unprocessed. However, the kernel has a bounds check `if (idx < total_elements)`, so unlaunched threads won't cause crashes. The key insight is that when `total_elements` is
+- Kill strategy: Use input tensors with total_elements ≤ block_size (256). Specifically, create tensors with exactly 256 elements or fewer. The fixed shape [128, 4096] has 524288 elements, which is much larger than 256. However, we can use the SAME shapes but with a different interpretation: create tensors where most elements are zero or identical, but the key is that the reduction kernel will still process all elements. Actually, the critical issue is that with total_elements = 524288, the mutant calculates num_blocks = (524288 - 256 - 1) / 256 = 2047, while original calculates 2048. This means the last block (handling elements 2047*256 = 523,264 to 524,287) won't be launched in the mutant, leaving 1024 elements unprocessed. These unprocessed elements in element_losses will contain uninitialized memory, which then affects the reduction sum.
+- Suggested test: Test with the fixed shape [128, 4096] but ensure the last 1024 elements (which correspond to the missing block in the mutant) have non-zero values. The original will process all elements correctly, wh
+- Had executable code: True
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+### Value-Distribution Stress
+Tested 45 / 45 rounds. Result: ALL SURVIVED (bitwise identical)
+  - mixed_extremes seed=42: survived
+  - mixed_extremes seed=43: survived
+  - mixed_extremes seed=44: survived
+  - dense_nonzero seed=45: survived
+  - dense_nonzero seed=46: survived
+  - dense_nonzero seed=47: survived
+  - near_overflow seed=48: survived
+  - near_overflow seed=49: survived
+  - near_overflow seed=50: survived
+  - denormals seed=51: survived
+  - denormals seed=52: survived
+  - denormals seed=53: survived
+  - all_positive seed=54: survived
+  - all_positive seed=55: survived
+  - all_positive seed=56: survived
+  - alternating_sign seed=57: survived
+  - alternating_sign seed=58: survived
+  - alternating_sign seed=59: survived
+  - uniform_constant seed=60: survived
+  - uniform_constant seed=61: survived
+  - uniform_constant seed=62: survived
+  - structured_ramp seed=63: survived
+  - structured_ramp seed=64: survived
+  - structured_ramp seed=65: survived
+  - head_heavy seed=66: survived
+  - head_heavy seed=67: survived
+  - head_heavy seed=68: survived
+  - tail_heavy seed=69: survived
+  - tail_heavy seed=70: survived
+  - tail_heavy seed=71: survived
+### Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+### Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+### Training Mode
+Result: ALL SURVIVED
+### Configuration-Stress Track
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Force the missing 512 elements (indices 523776..524287) to have a non-zero loss by setting predictions to a large positive value (e.g., 10.0) and targets to 0.0 for those indices, while keeping all other elements as zeros. This guarantees the correct sum includes those losses, while the mutant's sum (using uninitialized memory, likely zero) will be smaller, producing a different mean loss.
+- Suggested code:
+```python
+def generate_inputs(device):
+    shape = (128, 4096)
+    total_elements = 128 * 4096
+    predictions = torch.zeros(shape, dtype=torch.float32, device=device)
+    targets = torch.zeros(shape, dtype=torch.float32, device=device)
+    # Set the last 512 elements (last row, last 512 columns) to have predictions=10, targets=0
+    predictions.view(-1)[-512:] = 10.0
+    # targets stay zero
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Exploit the fact that the uninitialized memory in element_losses is reused from previously freed allocations. Allocate a dummy tensor of shape [128*4096] (same total elements), fill it with NaN (or a large finite value like 1e38), free it, then call the kernel. The missing 512 elements will then contain the sentinel value instead of zero. Since the original kernel computes a finite loss for those elements, the mutant's reduction sum (including NaN) will differ from the original's finite sum, causing a bitwise mismatch.
+- Suggested code:
+```python
+def generate_inputs(device):
+    shape = (128, 4096)
+    total_elements = 128 * 4096
+    # Allocate a dummy tensor to poison the memory that will be reused by element_losses
+    dummy = torch.empty(total_elements, dtype=torch.float32, device=device)
+    dummy.fill_(float('nan'))  # Could also use float('inf') or a very large number
+    # Free the dummy tensor; the caching allocator may reuse the same memory block
+    del dummy
+    torch.cuda.synchronize()
+    # Now create the actual inputs
+    predictions = torch.ones(shape, dtype=torch.float32, device=device)
+    targets = torch.zeros(shape, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Reachability**: Derive concrete variable ranges from code constants.
+Do NOT claim a boundary case is reachable without deriving it.
+
+**Step 2 — Why previous attempts failed**: For each failed round, explain
+the specific mathematical reason it could not expose a difference.
+
+**Step 3 — Novel strategy or conclusion**: Either identify a fundamentally
+different value-level approach, or conclude unkillable with proof.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation or path argument>",
+  "survival_reason": "<updated analysis — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new VALUE-LEVEL strategy different from ALL previous, or why unkillable>",
+  "suggested_test": {
+    "description": "<what this NEW input tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... DIFFERENT from all previous>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same tensor count/shapes.
+- Shapes MUST EXACTLY MATCH Input Specification.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

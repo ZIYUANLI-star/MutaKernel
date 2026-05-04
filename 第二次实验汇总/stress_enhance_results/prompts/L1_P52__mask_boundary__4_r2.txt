@@ -1,0 +1,654 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived:
+- EMD 4-layer equivalence detection (112 rounds)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+- AND your previous suggested inputs (see below)
+
+Re-analyze with the failure information and try a fundamentally different approach.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison is BITWISE (NaN-aware).
+- **Do NOT suggest shape or batch size changes.**
+
+### Auxiliary configuration-stress track
+- Alternative batch sizes were tested separately (see below).
+- This does NOT redefine the main contract.
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for argmin with optimized memory access
+argmin_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <limits>
+
+template<typename scalar_t>
+__global__ void argmin_kernel_2d(const scalar_t* input, int64_t* output,
+                                 int64_t rows, int64_t cols, int64_t dim) {
+    // Each thread block handles one row (if dim=1) or one column (if dim=0)
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (dim == 1) {
+        // Reduce along columns (dim=1)
+        if (idx < rows) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            // Unrolled loop for better memory access
+            for (int64_t col = 0; col < cols; col++) {
+                scalar_t val = input[idx * cols + col];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = col;
+                }
+            }
+            output[idx] = min_idx;
+        }
+    } else if (dim == 0) {
+        // Reduce along rows (dim=0)
+        if (idx < cols) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            for (int64_t row = 0; row < rows; row++) {
+                scalar_t val = input[row * cols + idx];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = row;
+                }
+            }
+            output[idx] = min_idx;
+        }
+    }
+}
+
+template<typename scalar_t>
+__global__ void argmin_kernel_3d(const scalar_t* input, int64_t* output,
+                                 int64_t batch, int64_t rows, int64_t cols, int64_t dim) {
+    // Optimized for 3D tensors with batch dimension
+    int64_t batch_idx = blockIdx.x;
+    int64_t spatial_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (batch_idx >= batch) return;
+    
+    if (dim == 2) {
+        // Reduce along last dimension (cols)
+        if (spatial_idx < rows) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            int64_t base_offset = batch_idx * rows * cols + spatial_idx * cols;
+            for (int64_t col = 0; col < cols; col++) {
+                scalar_t val = input[base_offset + col];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = col;
+                }
+            }
+            output[batch_idx * rows + spatial_idx] = min_idx;
+        }
+    } else if (dim == 1) {
+        // Reduce along middle dimension (rows)
+        if (spatial_idx < cols) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            int64_t base_offset = batch_idx * rows * cols + spatial_idx;
+            for (int64_t row = 0; row < rows; row++) {
+                scalar_t val = input[base_offset + row * cols];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = row;
+                }
+            }
+            output[batch_idx * cols + spatial_idx] = min_idx;
+        }
+    } else if (dim == 0) {
+        // Reduce along batch dimension
+        if (spatial_idx < rows * cols) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            int64_t row = spatial_idx / cols;
+            int64_t col = spatial_idx % cols;
+            int64_t base_offset = row * cols + col;
+            
+            for (int64_t b = 0; b < batch; b++) {
+                scalar_t val = input[b * rows * cols + base_offset];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = b;
+                }
+            }
+            output[spatial_idx] = min_idx;
+        }
+    }
+}
+
+torch::Tensor argmin_cuda(torch::Tensor input, int64_t dim) {
+    auto sizes = input.sizes();
+    auto ndim = input.dim();
+    
+    // Calculate output shape
+    std::vector<int64_t> output_shape;
+    for (int64_t i = 0; i < ndim; i++) {
+        if (i != dim) {
+            output_shape.push_back(sizes[i]);
+        }
+    }
+    
+    auto output = torch::empty(output_shape, torch::TensorOptions().dtype(torch::kLong).device(input.device()));
+    
+    // Optimize kernel selection based on tensor dimensions
+    if (ndim == 2) {
+        int64_t rows = sizes[0];
+        int64_t cols = sizes[1];
+        
+        // Use 256 threads per block for better occupancy
+        int block_size = 256;
+        int grid_size = 0;
+        
+        if (dim == 1) {
+            grid_size = (rows + block_size - 1) / block_size;
+        } else if (dim == 0) {
+            grid_size = (cols + block_size - 1) / block_size;
+        }
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_2d", ([&] {
+            argmin_kernel_2d<scalar_t><<<grid_size, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<int64_t>(),
+                rows, cols, dim
+            );
+        }));
+        
+    } else if (ndim == 3) {
+        int64_t batch = sizes[0];
+        int64_t rows = sizes[1];
+        int64_t cols = sizes[2];
+        
+        // Optimize block and grid dimensions for 3D case
+        int block_size = 256;
+        
+        if (dim == 2) {
+            // Reduce along last dimension
+            dim3 grid(batch, (rows + block_size - 1) / block_size);
+            AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_3d_dim2", ([&] {
+                argmin_kernel_3d<scalar_t><<<grid, block_size>>>(
+                    input.data_ptr<scalar_t>(),
+                    output.data_ptr<int64_t>(),
+                    batch, rows, cols, dim
+                );
+            }));
+        } else if (dim == 1) {
+            // Reduce along middle dimension
+            dim3 grid(batch, (cols + block_size - 1) / block_size);
+            AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_3d_dim1", ([&] {
+                argmin_kernel_3d<scalar_t><<<grid, block_size>>>(
+                    input.data_ptr<scalar_t>(),
+                    output.data_ptr<int64_t>(),
+                    batch, rows, cols, dim
+                );
+            }));
+        } else if (dim == 0) {
+            // Reduce along batch dimension
+            int grid_size = (rows * cols + block_size - 1) / block_size;
+            AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_3d_dim0", ([&] {
+                argmin_kernel_3d<scalar_t><<<grid_size, block_size>>>(
+                    input.data_ptr<scalar_t>(),
+                    output.data_ptr<int64_t>(),
+                    batch, rows, cols, dim
+                );
+            }));
+        }
+    } else {
+        // Fallback for other dimensions - use PyTorch's implementation
+        output = torch::argmin(input, dim);
+    }
+    
+    return output;
+}
+"""
+
+argmin_cpp_source = "torch::Tensor argmin_cuda(torch::Tensor input, int64_t dim);"
+
+# Compile the inline CUDA code for argmin
+argmin_module = load_inline(
+    name="argmin",
+    cpp_sources=argmin_cpp_source,
+    cuda_sources=argmin_source,
+    functions=["argmin_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that finds the index of the minimum value along a specified dimension
+    using a custom CUDA kernel with optimized memory access patterns.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to perform argmin on.
+
+        Args:
+            dim (int): Dimension along which to find the minimum value.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.argmin_cuda = argmin_module.argmin_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Finds the index of the minimum value along the specified dimension
+        using custom CUDA kernel optimized for 2D and 3D tensors.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Tensor containing the indices of the minimum values along the specified dimension.
+        """
+        if x.is_cuda and x.dim() in [2, 3]:
+            return self.argmin_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors or unsupported dimensions
+            return torch.argmin(x, dim=self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for argmin with optimized memory access
+argmin_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <limits>
+
+template<typename scalar_t>
+__global__ void argmin_kernel_2d(const scalar_t* input, int64_t* output,
+                                 int64_t rows, int64_t cols, int64_t dim) {
+    // Each thread block handles one row (if dim=1) or one column (if dim=0)
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (dim == 1) {
+        // Reduce along columns (dim=1)
+        if (idx < rows) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            // Unrolled loop for better memory access
+            for (int64_t col = 0; col < cols; col++) {
+                scalar_t val = input[idx * cols + col];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = col;
+                }
+            }
+            output[idx] = min_idx;
+        }
+    } else if (dim == 0) {
+        // Reduce along rows (dim=0)
+        if (idx < cols) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            for (int64_t row = 0; row < rows; row++) {
+                scalar_t val = input[row * cols + idx];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = row;
+                }
+            }
+            output[idx] = min_idx;
+        }
+    }
+}
+
+template<typename scalar_t>
+__global__ void argmin_kernel_3d(const scalar_t* input, int64_t* output,
+                                 int64_t batch, int64_t rows, int64_t cols, int64_t dim) {
+    // Optimized for 3D tensors with batch dimension
+    int64_t batch_idx = blockIdx.x;
+    int64_t spatial_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (batch_idx > batch) return;
+    
+    if (dim == 2) {
+        // Reduce along last dimension (cols)
+        if (spatial_idx < rows) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            int64_t base_offset = batch_idx * rows * cols + spatial_idx * cols;
+            for (int64_t col = 0; col < cols; col++) {
+                scalar_t val = input[base_offset + col];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = col;
+                }
+            }
+            output[batch_idx * rows + spatial_idx] = min_idx;
+        }
+    } else if (dim == 1) {
+        // Reduce along middle dimension (rows)
+        if (spatial_idx < cols) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            int64_t base_offset = batch_idx * rows * cols + spatial_idx;
+            for (int64_t row = 0; row < rows; row++) {
+                scalar_t val = input[base_offset + row * cols];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = row;
+                }
+            }
+            output[batch_idx * cols + spatial_idx] = min_idx;
+        }
+    } else if (dim == 0) {
+        // Reduce along batch dimension
+        if (spatial_idx < rows * cols) {
+            scalar_t min_val = std::numeric_limits<scalar_t>::max();
+            int64_t min_idx = 0;
+            
+            int64_t row = spatial_idx / cols;
+            int64_t col = spatial_idx % cols;
+            int64_t base_offset = row * cols + col;
+            
+            for (int64_t b = 0; b < batch; b++) {
+                scalar_t val = input[b * rows * cols + base_offset];
+                if (val < min_val) {
+                    min_val = val;
+                    min_idx = b;
+                }
+            }
+            output[spatial_idx] = min_idx;
+        }
+    }
+}
+
+torch::Tensor argmin_cuda(torch::Tensor input, int64_t dim) {
+    auto sizes = input.sizes();
+    auto ndim = input.dim();
+    
+    // Calculate output shape
+    std::vector<int64_t> output_shape;
+    for (int64_t i = 0; i < ndim; i++) {
+        if (i != dim) {
+            output_shape.push_back(sizes[i]);
+        }
+    }
+    
+    auto output = torch::empty(output_shape, torch::TensorOptions().dtype(torch::kLong).device(input.device()));
+    
+    // Optimize kernel selection based on tensor dimensions
+    if (ndim == 2) {
+        int64_t rows = sizes[0];
+        int64_t cols = sizes[1];
+        
+        // Use 256 threads per block for better occupancy
+        int block_size = 256;
+        int grid_size = 0;
+        
+        if (dim == 1) {
+            grid_size = (rows + block_size - 1) / block_size;
+        } else if (dim == 0) {
+            grid_size = (cols + block_size - 1) / block_size;
+        }
+        
+        AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_2d", ([&] {
+            argmin_kernel_2d<scalar_t><<<grid_size, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<int64_t>(),
+                rows, cols, dim
+            );
+        }));
+        
+    } else if (ndim == 3) {
+        int64_t batch = sizes[0];
+        int64_t rows = sizes[1];
+        int64_t cols = sizes[2];
+        
+        // Optimize block and grid dimensions for 3D case
+        int block_size = 256;
+        
+        if (dim == 2) {
+            // Reduce along last dimension
+            dim3 grid(batch, (rows + block_size - 1) / block_size);
+            AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_3d_dim2", ([&] {
+                argmin_kernel_3d<scalar_t><<<grid, block_size>>>(
+                    input.data_ptr<scalar_t>(),
+                    output.data_ptr<int64_t>(),
+                    batch, rows, cols, dim
+                );
+            }));
+        } else if (dim == 1) {
+            // Reduce along middle dimension
+            dim3 grid(batch, (cols + block_size - 1) / block_size);
+            AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_3d_dim1", ([&] {
+                argmin_kernel_3d<scalar_t><<<grid, block_size>>>(
+                    input.data_ptr<scalar_t>(),
+                    output.data_ptr<int64_t>(),
+                    batch, rows, cols, dim
+                );
+            }));
+        } else if (dim == 0) {
+            // Reduce along batch dimension
+            int grid_size = (rows * cols + block_size - 1) / block_size;
+            AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "argmin_3d_dim0", ([&] {
+                argmin_kernel_3d<scalar_t><<<grid_size, block_size>>>(
+                    input.data_ptr<scalar_t>(),
+                    output.data_ptr<int64_t>(),
+                    batch, rows, cols, dim
+                );
+            }));
+        }
+    } else {
+        // Fallback for other dimensions - use PyTorch's implementation
+        output = torch::argmin(input, dim);
+    }
+    
+    return output;
+}
+"""
+
+argmin_cpp_source = "torch::Tensor argmin_cuda(torch::Tensor input, int64_t dim);"
+
+# Compile the inline CUDA code for argmin
+argmin_module = load_inline(
+    name="argmin",
+    cpp_sources=argmin_cpp_source,
+    cuda_sources=argmin_source,
+    functions=["argmin_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that finds the index of the minimum value along a specified dimension
+    using a custom CUDA kernel with optimized memory access patterns.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to perform argmin on.
+
+        Args:
+            dim (int): Dimension along which to find the minimum value.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.argmin_cuda = argmin_module.argmin_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Finds the index of the minimum value along the specified dimension
+        using custom CUDA kernel optimized for 2D and 3D tensors.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Tensor containing the indices of the minimum values along the specified dimension.
+        """
+        if x.is_cuda and x.dim() in [2, 3]:
+            return self.argmin_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors or unsupported dimensions
+            return torch.argmin(x, dim=self.dim)
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 58
+- Original fragment: `batch_idx >= batch`
+- node_type: ge>
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis may contain errors. Reason independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 58
+- Original fragment: `batch_idx >= batch`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 256, 256], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.793313980102539, 'mean': -0.0003390001365914941, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_large_magnitude_1', 'seed': 10101, 'tensors': [{'shape': [16, 256, 256], 'dtype': 'torch.float32', 'min': -4866.79345703125, 'max': 5496.4072265625, 'mean': -1.677351474761963, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes `batch_idx >= batch` to `batch_idx > batch`. However, `batch_idx` is derived from `blockIdx.x`, and the grid dimensions are set as `dim3 grid(batch, (rows + block_size - 1) / block_size)` for `dim == 2`. This means `blockIdx.x` ranges from `0` to `batch-1` inclusive. Therefore, `batch_idx` can never equal `batch` (since the maximum value is `batch-1`), making both conditions `batch_idx >= batch` and `batch_idx > batch` equivalent in practice—both will only be true when `batc
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+### Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - sparse_extreme seed=42: survived
+  - sparse_extreme seed=43: survived
+  - sparse_extreme seed=44: survived
+  - sparse_extreme seed=45: survived
+  - sparse_extreme seed=46: survived
+  - near_overflow seed=47: survived
+  - near_overflow seed=48: survived
+  - near_overflow seed=49: survived
+  - near_overflow seed=50: survived
+  - near_overflow seed=51: survived
+  - near_zero seed=52: survived
+  - near_zero seed=53: survived
+  - near_zero seed=54: survived
+  - near_zero seed=55: survived
+  - near_zero seed=56: survived
+  - denormals seed=57: survived
+  - denormals seed=58: survived
+  - denormals seed=59: survived
+  - denormals seed=60: survived
+  - denormals seed=61: survived
+  - all_negative seed=62: survived
+  - all_negative seed=63: survived
+  - all_negative seed=64: survived
+  - all_negative seed=65: survived
+  - all_negative seed=66: survived
+  - all_positive seed=67: survived
+  - all_positive seed=68: survived
+  - all_positive seed=69: survived
+  - all_positive seed=70: survived
+  - all_positive seed=71: survived
+### Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+### Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+### Training Mode
+SKIPPED: operator_not_applicable
+### Configuration-Stress Track
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Set the model's `dim` parameter to 0 when constructing ModelNew. With the fixed shape [16,256,256] and dim=0, the kernel uses a 1D grid where blockIdx.x can equal 16, causing the mutated guard to allow threads that the original would have early‑exited. This yields different output indices for the affected positions, producing a bitwise mismatch.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Shape is fixed: [16, 256, 256]
+    x = torch.ones(16, 256, 256, dtype=torch.float32, device=device)
+    return [x]
+# Note: The model must be instantiated with dim=0 for this test to kill the mutant.
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Reachability**: Derive concrete variable ranges from code constants.
+Do NOT claim a boundary case is reachable without deriving it.
+
+**Step 2 — Why previous attempts failed**: For each failed round, explain
+the specific mathematical reason it could not expose a difference.
+
+**Step 3 — Novel strategy or conclusion**: Either identify a fundamentally
+different value-level approach, or conclude unkillable with proof.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation or path argument>",
+  "survival_reason": "<updated analysis — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new VALUE-LEVEL strategy different from ALL previous, or why unkillable>",
+  "suggested_test": {
+    "description": "<what this NEW input tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... DIFFERENT from all previous>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same tensor count/shapes.
+- Shapes MUST EXACTLY MATCH Input Specification.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

@@ -1,0 +1,160 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      42|     const float* positive_ptr = positive + batch_idx * feature_dim;
+      43|     const float* negative_ptr = negative + batch_idx * feature_dim;
+      44|     
+      45|     // Vectorized distance computation with fused sqrt and margin
+      46|     float pos_dist = 0.0f;
+      47|     float neg_dist = 0.0f;
+      48|     
+      49|     // Process multiple elements per thread for better memory coalescing
+      50|     for (int i = tid * ELEMENTS_PER_THREAD; i < feature_dim; i += blockDim.x * ELEMENTS_PER_THREAD) {
+      51|         #pragma unroll
+      52|         for (int j = 0; j < ELEMENTS_PER_THREAD; j++) {
+      53|             int idx = i + j;
+>>>   54|             if (idx < feature_dim) {
+      55|                 float diff_pos = anchor_ptr[idx] - positive_ptr[idx];
+      56|                 float diff_neg = anchor_ptr[idx] - negative_ptr[idx];
+      57|                 pos_dist += diff_pos * diff_pos;
+      58|                 neg_dist += diff_neg * diff_neg;
+      59|             }
+      60|         }
+      61|     }
+      62|     
+      63|     // Warp-level reduction
+      64|     pos_dist = warp_reduce_sum(pos_dist);
+      65|     neg_dist = warp_reduce_sum(neg_dist);
+      66|     
+```
+
+## Mutated Code (around mutation site)
+```
+      42|     const float* positive_ptr = positive + batch_idx * feature_dim;
+      43|     const float* negative_ptr = negative + batch_idx * feature_dim;
+      44|     
+      45|     // Vectorized distance computation with fused sqrt and margin
+      46|     float pos_dist = 0.0f;
+      47|     float neg_dist = 0.0f;
+      48|     
+      49|     // Process multiple elements per thread for better memory coalescing
+      50|     for (int i = tid * ELEMENTS_PER_THREAD; i < feature_dim; i += blockDim.x * ELEMENTS_PER_THREAD) {
+      51|         #pragma unroll
+      52|         for (int j = 0; j < ELEMENTS_PER_THREAD; j++) {
+      53|             int idx = i + j;
+>>>   54|             if (idx < feature_dim - 1) {
+      55|                 float diff_pos = anchor_ptr[idx] - positive_ptr[idx];
+      56|                 float diff_neg = anchor_ptr[idx] - negative_ptr[idx];
+      57|                 pos_dist += diff_pos * diff_pos;
+      58|                 neg_dist += diff_neg * diff_neg;
+      59|             }
+      60|         }
+      61|     }
+      62|     
+      63|     // Warp-level reduction
+      64|     pos_dist = warp_reduce_sum(pos_dist);
+      65|     neg_dist = warp_reduce_sum(neg_dist);
+      66|     
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 54
+- Original fragment: `idx < feature_dim`
+
+## Input Specification
+forward() takes 3 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+  arg[2]: shape=[128, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Design inputs where the last feature element (index 4095) carries significant, asymmetric information compared to other elements. Specifically, set anchor[..., 4095] = 1, positive[..., 4095] = 0, negative[..., 4095] = 0, while keeping all other elements zero. This makes the positive distance entirely from the last element (which mutant skips), while the negative distance is zero. The original will compute non-zero distances; mutant will compute zero distances for both, leading to different loss values.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    batch_size, feature_dim = 128, 4096
+    anchor = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)
+    positive = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)
+    negative = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)
+    
+    # Only last element differs: anchor=1, positive=0, negative=0
+    anchor[:, -1] = 1.0  # Last element = 1
+    # Positive and negative remain 0 everywhere
+    
+    return [anchor, positive, negative]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Force the last feature element (index 4095) to carry a unique, large-magnitude value that cannot be masked by other elements, and ensure it's processed by a thread whose contributions cannot be compensated by other threads. Use extreme values to exploit floating-point sensitivity in the reduction, and also test with a non-power-of-two feature dimension to alter thread mapping.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Test two scenarios in one batch
+    batch_size = 128
+    
+    # First half of batch: original dimension 4096
+    feature_dim1 = 4096
+    anchor1 = torch.zeros(batch_size//2, feature_dim1, dtype=torch.float32, device=device)
+    positive1 = torch.zeros(batch_size//2, feature_dim1, dtype=torch.float32, device=device)
+    negative1 = torch.zeros(batch_size//2, feature_dim1, dtype=torch.float32, device=device)
+    
+    # Only last element differs dramatically
+    anchor1[:, -1] = 1e20
+    negative1[:, -1] = -1e20  # Creates huge squared difference for negative pair too
+    
+    # Second half of batch: non-power-of-two dimension 4095
+    feature_dim2 = 4095
+    anchor2 = torch.zeros(batch_size//2, feature_dim2, dtype=torch.float32, device=device)
+    positive2 = torch.zeros(batch_size//2, feature_dim2, dtype=torch.float32, device=device)
+    negative2 = torch.zeros(batch_size//2, feature_dim2, dtype=torch.float32, device=device)
+    
+    # Last element differs dramatically
+    anchor2[:, -1] = 1e20
+    negative2[:, -1] = -1e20
+    
+    # Concatenate both scenarios
+    anchor = torch.cat([anchor1, anchor2], dim=0)
+    positive = torch.cat([positive1, positive2], dim=0)
+    negative = torch.cat([negative1, negative2], dim=0)
+    
+    return [anchor, positive, negative]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

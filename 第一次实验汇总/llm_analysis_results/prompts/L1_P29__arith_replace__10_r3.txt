@@ -1,0 +1,139 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      69|             if constexpr (std::is_same<scalar_t, half>::value && VEC_SIZE == 8) {
+      70|                 half* half_out = reinterpret_cast<half*>(&vec_out);
+      71|                 half_out[i] = result;
+      72|             } else {
+      73|                 float* float_out = reinterpret_cast<float*>(&vec_out);
+      74|                 float_out[i] = static_cast<float>(result);
+      75|             }
+      76|         }
+      77|         
+      78|         *reinterpret_cast<VecType*>(&output[idx]) = vec_out;
+      79|     } else {
+      80|         // Handle remaining elements
+>>>   81|         for (int i = 0; i < VEC_SIZE && idx + i < size; i++) {
+      82|             output[idx + i] = softplus_activation<scalar_t, VEC_SIZE>(input[idx + i], beta);
+      83|         }
+      84|     }
+      85| }
+      86| 
+      87| torch::Tensor softplus_cuda(torch::Tensor input, float beta) {
+      88|     TORCH_CHECK(input.is_cuda(), "Input tensor must be on CUDA device");
+      89|     TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
+      90|     
+      91|     auto output = torch::empty_like(input);
+      92|     int64_t size = input.numel();
+      93|     
+```
+
+## Mutated Code (around mutation site)
+```
+      69|             if constexpr (std::is_same<scalar_t, half>::value && VEC_SIZE == 8) {
+      70|                 half* half_out = reinterpret_cast<half*>(&vec_out);
+      71|                 half_out[i] = result;
+      72|             } else {
+      73|                 float* float_out = reinterpret_cast<float*>(&vec_out);
+      74|                 float_out[i] = static_cast<float>(result);
+      75|             }
+      76|         }
+      77|         
+      78|         *reinterpret_cast<VecType*>(&output[idx]) = vec_out;
+      79|     } else {
+      80|         // Handle remaining elements
+>>>   81|         for (int i = 0; i < VEC_SIZE && idx - i < size; i++) {
+      82|             output[idx + i] = softplus_activation<scalar_t, VEC_SIZE>(input[idx + i], beta);
+      83|         }
+      84|     }
+      85| }
+      86| 
+      87| torch::Tensor softplus_cuda(torch::Tensor input, float beta) {
+      88|     TORCH_CHECK(input.is_cuda(), "Input tensor must be on CUDA device");
+      89|     TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
+      90|     
+      91|     auto output = torch::empty_like(input);
+      92|     int64_t size = input.numel();
+      93|     
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 81
+- Original fragment: `+`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use an input size that is NOT a multiple of VEC_SIZE (e.g., 262145 elements instead of 262144). This forces execution of the else block where the mutant's out-of-bounds writes will occur. With a non-multiple size, the original kernel correctly handles remaining elements while the mutant writes beyond array bounds, potentially causing memory corruption or segmentation faults. The difference should be detectable via CUDA error checking or memory comparison.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Create tensor with size NOT multiple of 8
+    # 262145 = 32768*8 + 1
+    total_elements = 262145
+    shape = [1, total_elements]  # Same dtype (float32) as original
+    
+    # Fill with random values to exercise computation
+    input_tensor = torch.randn(shape, device=device, dtype=torch.float32)
+    
+    # Return list with exactly one tensor as expected by forward()
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Force the kernel to process the tail case where `idx` is small (less than VEC_SIZE), causing `idx - i` to become negative for some i values while `idx + i` remains positive. This could lead to the mutant attempting to write to out-of-bounds memory locations before the start of the array. Use a very small tensor size where the entire tensor fits in the tail case (size < VEC_SIZE * 2), ensuring all threads go through the else branch.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Choose size just above VEC_SIZE to force tail processing for some threads
+    # VEC_SIZE is likely 4 or 8 based on kernel specialization
+    # Use 9 elements to ensure partial vector for last thread
+    size = 9
+    shape = [1, size]
+    
+    # Fill with random values
+    input_tensor = torch.randn(shape, device=device, dtype=torch.float32)
+    
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

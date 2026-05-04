@@ -1,0 +1,382 @@
+[
+  {
+    "rule_name": "force_multiple_blocks",
+    "rule_description": "Generates inputs that exceed a single thread block's capacity, requiring multiple CUDA blocks for full processing. This exposes mutations that affect block/thread indexing by creating scenarios where incorrect index calculations access wrong memory regions. The input ensures different behavior between first and subsequent blocks by setting distinct values in different block regions.",
+    "applicable_operators": [
+      "index_replace",
+      "thread_replace",
+      "block_replace",
+      "grid_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Target at least 2 blocks worth of data (assuming typical 256-thread blocks)\n    # Keep original tensor rank but expand first dimension\n    base_elements = 512  # Enough for 2 blocks of 256 threads\n    \n    # Calculate expanded shape: replace first dimension with at least base_elements\n    if shape[0] < base_elements:\n        expanded_shape = (base_elements,) + shape[1:]\n    else:\n        # If already large, keep original shape but ensure it's multiple of block size\n        expanded_shape = shape\n    \n    # Create two tensors for typical loss function inputs\n    # First tensor: predictions\n    predictions = torch.zeros(expanded_shape, dtype=dtype, device=device)\n    targets = torch.zeros(expanded_shape, dtype=dtype, device=device)\n    \n    # Block size assumption: typical 256 threads/block\n    # Adjust if kernel metadata indicates different block size\n    block_size = 256  # Conservative default\n    \n    # First block region: set to produce zero contribution\n    # (e.g., identical values for loss functions)\n    first_block_end = min(block_size, expanded_shape[0])\n    predictions[:first_block_end] = 1.0\n    targets[:first_block_end] = 1.0\n    \n    # Second block region: set to produce non-zero contribution\n    if expanded_shape[0] > block_size:\n        second_block_start = block_size\n        second_block_end = min(2 * block_size, expanded_shape[0])\n        predictions[second_block_start:second_block_end] = -1.0\n        targets[second_block_start:second_block_end] = 1.0\n        \n        # Fill any remaining elements beyond 2 blocks with non-zero values\n        if expanded_shape[0] > 2 * block_size:\n            predictions[2 * block_size:] = -1.0\n            targets[2 * block_size:] = 1.0\n    \n    return [predictions, targets]",
+    "mutant_id": "L1_P100__index_replace__1",
+    "kernel_name": "L1_P100"
+  },
+  {
+    "rule_name": "misaligned_grid_boundary",
+    "rule_description": "Targets kernels that use grid-stride loops with power‑of‑two tile sizes. By setting problem dimensions to be one less than a multiple of common tile sizes (e.g., 16, 32, 64), the last block of threads will compute indices that exactly equal the dimension boundary. This exposes relational-operator mutants (like < → ≤) that cause out‑of‑bounds accesses.",
+    "applicable_operators": [
+      "relop_replace",
+      "relop_negation",
+      "relop_exchange"
+    ],
+    "policy_code": "import torch\nimport numpy as np\n\ndef policy(shape, dtype, device, rng):\n    # This rule assumes the kernel is a matrix multiplication that expects two inputs:\n    #   A of shape (M, K)\n    #   B of shape (N, K)\n    # The critical dimension is N, which controls the column index boundary.\n    \n    # Choose N so it is NOT a multiple of common tile sizes.\n    # 2047 = 2048 - 1, where 2048 is divisible by 16, 32, 64, 128, 256, 512, 1024, 2048.\n    # This ensures that for any of these tile sizes, the last block will have a thread\n    # with column index exactly equal to N.\n    M = 1024\n    K = 4096\n    N = 2047  # critical: one less than a power‑of‑two multiple of common tile sizes\n    \n    # Use random data; exact values are irrelevant as long as they are non‑zero.\n    A = torch.randn(M, K, device=device, dtype=dtype)\n    B = torch.randn(N, K, device=device, dtype=dtype)\n    return [A, B]",
+    "mutant_id": "L1_P17__relop_replace__7",
+    "kernel_name": "L1_P17"
+  },
+  {
+    "rule_name": "non_multiple_block_shape_dimension",
+    "rule_description": "This rule creates inputs where matrix dimensions are NOT multiples of typical GPU block sizes (e.g., 16, 32). This triggers grid over-provisioning where extra threads are launched beyond the actual data boundaries. This exposes boundary-condition mutations by allowing threads with indices equal to the dimension size to execute, which would cause out-of-bounds access when relational operators are mutated.",
+    "applicable_operators": [
+      "relop_replace",
+      "boundary_condition"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import numpy as np\n    \n    # Common GPU block sizes to avoid multiples of\n    common_block_sizes = [16, 32, 64, 128, 256]\n    target_block_size = common_block_sizes[rng.randint(0, len(common_block_sizes))]\n    \n    # For matrix multiplication kernels like L1_P18, we expect shapes:\n    # A: [K, M], B: [N, K]\n    if len(shape) == 2:\n        # If this is likely the B matrix (N, K)\n        N, K = shape\n        # Make N not a multiple of target_block_size\n        # Choose a prime-ish offset (1, 3, 5, 7, 11) to avoid multiples of other block sizes too\n        offsets = [1, 3, 5, 7, 11]\n        offset = offsets[rng.randint(0, len(offsets))]\n        new_N = N + offset\n        \n        # Generate random data with the new shape\n        return torch.randn(new_N, K, device=device, dtype=dtype)\n    else:\n        # For other tensors, return original shape with random data\n        return torch.randn(*shape, device=device, dtype=dtype)",
+    "mutant_id": "L1_P18__relop_replace__3",
+    "kernel_name": "L1_P18"
+  },
+  {
+    "rule_name": "index_overflow_due_to_extended_bound",
+    "rule_description": "Targets kernels where relational operator mutations extend loop bounds beyond intended limits. Creates inputs where the index calculation for the extended bound causes integer overflow in 32-bit arithmetic, or produces values far beyond allocated memory bounds, making out-of-bounds writes detectable.",
+    "applicable_operators": [
+      "relop_replace",
+      "loop_boundary",
+      "arithmetic_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # For 2D matrix kernels, target square dimensions near sqrt(2^31) to cause overflow\n    # when index = row*N + N with row near N-1\n    if len(shape) == 2 and shape[0] == shape[1]:\n        N = shape[0]\n        # Choose dimension that ensures index overflow when computing (N-1)*N + N = N*N\n        # Smallest N where N*N > 2^31-1 is 46341\n        overflow_N = 46341\n        \n        # If requested N is smaller, still use a non-multiple of tile size (32)\n        # to ensure extended bounds produce out-of-bounds writes\n        if N < overflow_N:\n            # Adjust to be non-multiple of 32 to get extra threads\n            adjusted_N = N\n            if adjusted_N % 32 == 0:\n                adjusted_N += 1\n            \n            # Create matrices with predictable pattern for value comparison\n            A = torch.ones((adjusted_N, adjusted_N), device=device, dtype=dtype)\n            B = torch.eye(adjusted_N, device=device, dtype=dtype) * 2.0\n            return [A, B]\n        else:\n            # For large N near overflow boundary, use identity-like pattern\n            # but be mindful of memory constraints\n            A = torch.ones((N, N), device=device, dtype=dtype)\n            B = torch.eye(N, device=device, dtype=dtype)\n            return [A, B]\n    \n    # For 1D kernels, target size near 2^31 for overflow in index + 1 calculations\n    elif len(shape) == 1:\n        N = shape[0]\n        # Create input with pattern for easy validation\n        data = torch.arange(N, device=device, dtype=dtype) / N\n        return [data]\n    \n    # Default: return random data with seed for reproducibility\n    torch.manual_seed(123)\n    return [torch.randn(shape, device=device, dtype=dtype)]",
+    "mutant_id": "L1_P1__relop_replace__7",
+    "kernel_name": "L1_P1"
+  },
+  {
+    "rule_name": "reduction_init_identity_extremes",
+    "rule_description": "Targets reduction operations with mutated identity elements by creating inputs where entire reduction sets (rows/columns) contain only values outside the mutant's valid range. For max reductions with finite negative identity, sets all elements in at least one reduction dimension to values below the mutant threshold. For min reductions with finite positive identity, sets all elements above the threshold.",
+    "applicable_operators": [
+      "init_modify",
+      "reduce_identity",
+      "reduction_initialization"
+    ],
+    "policy_code": "import torch\nimport numpy as np\n\ndef policy(shape, dtype, device, rng):\n    \"\"\"Generate tensor with at least one full reduction dimension containing extreme values.\"\"\"\n    # Use numpy RNG for reproducibility\n    np_rng = np.random.default_rng(rng.randint(0, 2**32 - 1))\n    \n    # Create base tensor with normal values\n    tensor = torch.zeros(shape, dtype=dtype, device=device)\n    \n    if len(shape) >= 2:\n        # Choose a reduction dimension (typically last dimension for row-wise reductions)\n        # but could be any dimension; here we use the last dimension for common patterns\n        reduce_dim = -1\n        \n        # Choose at least one slice in the other dimension to be extreme\n        # For 2D: set entire rows to extreme values\n        slice_dim = 0 if len(shape) == 2 else np_rng.choice(len(shape) - 1)\n        \n        # Number of slices to make extreme (1 to 25% of slices)\n        num_slices = max(1, int(shape[slice_dim] * np_rng.uniform(0.01, 0.25)))\n        slice_indices = np_rng.choice(shape[slice_dim], size=num_slices, replace=False)\n        \n        # Determine extreme value based on dtype\n        if dtype in (torch.float32, torch.float64):\n            # Values significantly below typical finite identity replacements\n            extreme_value = -1e20 if dtype == torch.float64 else -1e10\n        elif dtype == torch.float16:\n            extreme_value = -60000.0  # Near fp16 limits\n        else:\n            # For integer types, use near-minimum values\n            info = torch.iinfo(dtype) if dtype.is_integer else torch.finfo(dtype)\n            extreme_value = info.min + 1 if hasattr(info, 'min') else -1e6\n        \n        # Apply extreme values to selected slices\n        for idx in slice_indices:\n            if len(shape) == 2:\n                tensor[idx, :] = extreme_value\n            else:\n                # General n-dimensional case: set entire hyperplane\n                idx_tuple = [slice(None)] * len(shape)\n                idx_tuple[slice_dim] = idx\n                tensor[tuple(idx_tuple)] = extreme_value\n    \n    return tensor",
+    "mutant_id": "L1_P23__init_modify__0",
+    "kernel_name": "L1_P23"
+  },
+  {
+    "rule_name": "non_divisible_by_vector_width",
+    "rule_description": "Generates input tensors whose total element count is NOT divisible by the kernel's vector width (typically 4 for float4). This forces execution of scalar tail handling code paths that process remaining elements after vectorized chunks. This is crucial for testing mutations that only affect scalar fallback code.",
+    "applicable_operators": [
+      "arith_replace",
+      "relational_operator_replacement",
+      "abs_remove",
+      "neg_replace",
+      "math_replace",
+      "incdec_operator_replacement"
+    ],
+    "policy_code": "import torch\nimport random\n\ndef policy(shape, dtype, device, rng):\n    # Choose a small adjustment to keep shape similar but break vector alignment\n    adjustments = [1, 2, 3]\n    adjustment = rng.choice(adjustments)\n    \n    # Calculate total elements and adjust to make non-divisible by 4\n    total_elements = torch.prod(torch.tensor(shape)).item()\n    \n    # Create base tensor with random values\n    x = torch.randn(shape, dtype=dtype, device=device, generator=rng)\n    \n    # For testing arithmetic mutations, values that produce noticeable differences work best\n    # Use values that amplify arithmetic differences (like 1.0 for multiplicative ops)\n    scaling_factor = 1.0\n    x = x * 0.1 + scaling_factor  # Center around 1.0 but with some variation\n    \n    # Now adjust shape to break vector alignment\n    # Strategy: reduce the last dimension slightly\n    new_shape = list(shape)\n    if len(new_shape) > 0:\n        last_dim = new_shape[-1]\n        if last_dim > adjustment:\n            new_shape[-1] = last_dim - adjustment\n        else:\n            # If last dimension too small, adjust total by adding elements\n            # Reshape to 1D, truncate, then reshape back\n            flat_size = total_elements - adjustment\n            x_flat = x.flatten()\n            x = x_flat[:flat_size].view(*new_shape[:-1], -1)\n    \n    return x",
+    "mutant_id": "L1_P28__arith_replace__9",
+    "kernel_name": "L1_P28"
+  },
+  {
+    "rule_name": "int_overflow_grid_calculation",
+    "rule_description": "Targets kernels where grid size calculations use integer arithmetic that could overflow when operators are mutated (e.g., division→multiplication). Generates inputs where total elements slightly exceed (2^31 / typical_block_size) to cause 32-bit signed integer overflow in the mutant's grid calculation while keeping the original kernel's grid size valid.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "expr_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Calculate total elements needed to overflow grid calculation\n    # Assumes typical block size of 1024, adjust if specific kernel info available\n    typical_block_size = 1024\n    overflow_threshold = (2**31) // typical_block_size\n    \n    # Add small margin above threshold to ensure overflow\n    target_elements = overflow_threshold + 1\n    \n    # Create tensor with target number of elements\n    # If requested shape already has more elements, keep it (already problematic)\n    # Otherwise create 1D tensor of required size\n    shape_elements = math.prod(shape) if shape else 1\n    if shape_elements < target_elements:\n        # Create minimal 1D tensor meeting overflow requirement\n        tensor = torch.randn(target_elements, dtype=dtype, device=device)\n    else:\n        # Use requested shape if it already has enough elements\n        tensor = torch.randn(shape, dtype=dtype, device=device)\n    \n    return tensor",
+    "mutant_id": "L1_P29__arith_replace__16",
+    "kernel_name": "L1_P29"
+  },
+  {
+    "rule_name": "minimum_data_volume_grid_stride",
+    "rule_description": "Tests kernels with the smallest possible input size (1 element) to expose mutations in grid/block calculations. Particularly effective for grid-stride loop implementations where larger inputs might mask mutations by having threads process multiple elements. The minimum input size ensures any miscalculation in thread/block counts becomes immediately visible.",
+    "applicable_operators": [
+      "arith_replace",
+      "constant_replacement",
+      "conditionals_boundary",
+      "negate_conditionals"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Create tensor with exactly 1 element regardless of requested shape\n    # but preserve the rank/dimensions if important for kernel validation\n    single_element_shape = (1,) * len(shape) if shape else (1,)\n    \n    # Use a non-zero, non-trivial value to ensure computation occurs\n    # and produce detectable output difference\n    value = 1000.0 if torch.is_floating_point(torch.tensor(0, dtype=dtype)) else 42\n    \n    return torch.full(single_element_shape, value, device=device, dtype=dtype)",
+    "mutant_id": "L1_P29__arith_replace__19",
+    "kernel_name": "L1_P29"
+  },
+  {
+    "rule_name": "small_prime_size_alternating_sign",
+    "rule_description": "Generates tensors with small prime total sizes (e.g., 17, 19, 23) and alternating positive/negative values. This breaks stride/coverage assumptions in grid-stride loops, exposing indexing arithmetic mutants when the stride exceeds the size. The alternating pattern ensures any duplicate/missing element processing becomes observable in elementwise operations with different branches.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "index_replace",
+      "boundary_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    # List of small primes that are not multiples of common block sizes (256, 512, 1024)\n    small_primes = [17, 19, 23, 29, 31, 37, 41, 43, 47, 53]\n    # Randomly select a prime size\n    p = small_primes[rng.randint(len(small_primes))]\n    # Create a 1D tensor of alternating 1.0 and -1.0 values to exercise different branches\n    data = [1.0 if i % 2 == 0 else -1.0 for i in range(p)]\n    tensor = torch.tensor(data, device=device, dtype=dtype)\n    # Reshape to match the original rank but with the prime size in the last dimension\n    new_shape = [1] * len(shape)  # Preserve rank\n    new_shape[-1] = p             # Set last dimension to prime size\n    return tensor.view(new_shape)",
+    "mutant_id": "L1_P31__arith_replace__3",
+    "kernel_name": "L1_P31"
+  },
+  {
+    "rule_name": "small_non_vectorized_inputs",
+    "rule_description": "Generates small tensor inputs (size ≤ 256) that force execution through non-vectorized kernel paths. These inputs are particularly effective against launch configuration mutations because they produce small grid/block values where ±1 perturbations change the actual launch dimensions (unlike larger inputs that get clamped to hardware limits).",
+    "applicable_operators": [
+      "launch_config_mutate",
+      "thread_mutate",
+      "block_mutate"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Ignore requested shape to force small non-vectorized inputs\n    # Generate random small size (1-256) to avoid vectorization thresholds\n    import torch\n    size = rng.randint(1, 257)\n    \n    # Create tensor with distinct values (negative for activation functions,\n    # random otherwise) to make output differences detectable\n    if rng.random() < 0.5:\n        # Use negative values that produce non-linear outputs for common activations\n        data = -rng.uniform(1.0, 10.0) * torch.ones(size, dtype=dtype, device=device)\n    else:\n        # Random values in a range that avoids saturation\n        data = torch.rand(size, dtype=dtype, device=device) * 2 - 1  # [-1, 1]\n    \n    # Reshape to 1D unless kernel requires specific shape\n    return data.view(-1) if data.dim() == 1 else data",
+    "mutant_id": "L1_P31__launch_config_mutate__0",
+    "kernel_name": "L1_P31"
+  },
+  {
+    "rule_name": "non_uniform_block_boundary_amplification",
+    "rule_description": "Generates inputs with a strategically placed large-magnitude value at an index that falls on a block boundary when using non-uniform grid dimensions. This amplifies indexing errors caused by thread/block dimension swaps, ensuring multiple blocks are launched and creating measurable discrepancies when overlapping or incorrect indices access the amplified value. The large value magnitude ensures detection even when reductions use atomic operations or symmetric values.",
+    "applicable_operators": [
+      "index_replace",
+      "grid_stride_loop_index_error",
+      "dimension_swap"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Create tensor with all zeros\n    tensor = torch.zeros(shape, dtype=dtype, device=device)\n    \n    # Place a large value at a strategic index likely to be on a block boundary\n    # Choose the last element along the innermost dimension for maximum boundary effect\n    idx = [0] * len(shape)\n    idx[-1] = shape[-1] - 1  # Last element of innermost dimension\n    \n    # Select amplification value based on dtype to avoid overflow\n    if dtype in [torch.float32, torch.float64]:\n        amp_value = 1000000.0  # 1e6\n    elif dtype in [torch.float16, torch.bfloat16]:\n        amp_value = 1000.0\n    elif dtype.is_floating_point:\n        amp_value = 1000000.0\n    else:\n        # For integer types, use maximum value that won't overflow in common operations\n        amp_value = min(1000000, torch.iinfo(dtype).max // 2)\n    \n    tensor[tuple(idx)] = amp_value\n    \n    # Ensure tensor requires at least 2 blocks in typical configurations\n    # by making innermost dimension > typical block size (1024)\n    if shape[-1] <= 1024:\n        # If shape too small, create new tensor with expanded innermost dimension\n        new_shape = list(shape)\n        new_shape[-1] = 1025  # Force >1024 to ensure multiple blocks\n        tensor = torch.zeros(new_shape, dtype=dtype, device=device)\n        tensor[tuple(idx)] = amp_value\n    \n    return tensor",
+    "mutant_id": "L1_P37__index_replace__11",
+    "kernel_name": "L1_P37"
+  },
+  {
+    "rule_name": "epsilon_sign_flip_norm_boundary",
+    "rule_description": "This rule generates inputs where the sum of squares per batch is exactly 2*epsilon, where epsilon is the small constant added/subtracted in normalization kernels. This creates a boundary condition where the original kernel's sqrt(3*epsilon) and mutant's sqrt(epsilon) produce distinct, finite scale factors without overflow/underflow. Input values are small but non-zero to avoid numerical instability.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "expr_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Configuration for epsilon boundary test\n    EPS = 1e-8  # Common epsilon value in normalization kernels\n    TARGET_SUM = 2 * EPS  # 2*epsilon boundary\n    \n    # Ensure we have at least batch dimension\n    if len(shape) == 1:\n        batch_size = 1\n        feature_dim = shape[0]\n    else:\n        batch_size = shape[0]\n        feature_dim = shape[1]\n    \n    # Use ~10% non-zero elements to keep values small but spread out\n    num_nonzero = max(1, int(feature_dim * 0.1))\n    \n    # Compute value per element to achieve exact target sum\n    val_per_element = math.sqrt(TARGET_SUM / num_nonzero)\n    \n    # Create tensor with controlled sum of squares\n    x = torch.zeros(shape, device=device, dtype=dtype)\n    for b in range(batch_size):\n        # Place non-zero elements at deterministic positions\n        indices = torch.arange(num_nonzero, device=device)\n        if len(shape) == 1:\n            x[indices] = val_per_element\n        else:\n            x[b, indices] = val_per_element\n    \n    # Verify the construction (optional, for debugging)\n    if len(shape) == 1:\n        actual_sum = (x ** 2).sum().item()\n    else:\n        actual_sum = (x[0] ** 2).sum().item()  # Check first batch\n    \n    return x",
+    "mutant_id": "L1_P39__arith_replace__7",
+    "kernel_name": "L1_P39"
+  },
+  {
+    "rule_name": "epsilon_sensitivity_targeting",
+    "rule_description": "Generates inputs where the sum of squares along the normalized dimension falls within epsilon-sensitive regimes. Specifically targets values comparable to the epsilon values used in numerical stability guards (e.g., between 1e-8 and 1e-2). Creates controlled scenarios where epsilon variations produce measurable output differences.",
+    "applicable_operators": [
+      "epsilon_modify",
+      "constant_change",
+      "arithmetic_replacement",
+      "div_mul_replacement"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Assume shape follows (batch, dim) pattern for normalization kernels\n    if len(shape) != 2:\n        # For other shapes, create a simple 2D case\n        batch_size = 16\n        dim = 16384\n    else:\n        batch_size, dim = shape\n    \n    x = torch.zeros(batch_size, dim, device=device, dtype=dtype)\n    \n    # Select target sum-of-squares values in epsilon-sensitive range\n    # Cover multiple orders of magnitude around typical epsilon values\n    target_ss_candidates = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2]\n    \n    # Use rng to select one target value for the sensitive batch\n    ss_target = target_ss_candidates[rng.randint(0, len(target_ss_candidates))]\n    \n    # For batch 0: create epsilon-sensitive pattern\n    # Option 1: Single non-zero element (simplest)\n    if rng.random() < 0.5:\n        single_val = math.sqrt(ss_target)\n        x[0, 0] = single_val\n    else:\n        # Option 2: Multiple small elements that sum to target\n        # Distribute target sum across multiple elements\n        n_elements = rng.randint(2, min(10, dim))\n        val_per_element = math.sqrt(ss_target / n_elements)\n        for i in range(n_elements):\n            x[0, i] = val_per_element\n    \n    # For remaining batches: create non-sensitive patterns\n    # with norms large enough to dominate epsilon\n    for b in range(1, batch_size):\n        # Create random vectors with norm >> epsilon\n        # Norm ~ sqrt(dim) to ensure sum-squares ~ O(dim)\n        random_vec = torch.randn(dim, device=device, dtype=dtype) * 0.1 + 1.0\n        x[b] = random_vec\n    \n    return [x]",
+    "mutant_id": "L1_P39__epsilon_modify__0",
+    "kernel_name": "L1_P39"
+  },
+  {
+    "rule_name": "force_multiple_grid_dimensions",
+    "rule_description": "Generates inputs where at least one dimension significantly exceeds typical block sizes (e.g., >1024) to ensure multiple blocks are launched in multiple grid dimensions. This reveals index-swapping mutants that incorrectly map threads to data elements when grid dimensions differ.",
+    "applicable_operators": [
+      "index_replace",
+      "dimension_swap",
+      "thread_id_mutation"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Determine the largest dimension in the original shape\n    max_dim_idx = max(range(len(shape)), key=lambda i: shape[i])\n    # Create a modified shape where the largest dimension is increased to 2000\n    # (or at least >1024) to guarantee multiple blocks even with max blockDim.x\n    modified_shape = list(shape)\n    modified_shape[max_dim_idx] = max(2000, shape[max_dim_idx] + 1024)\n    \n    # Generate random non-zero data to ensure distinct outputs\n    if dtype.is_floating_point:\n        tensor = torch.rand(*modified_shape, device=device, dtype=dtype, generator=rng) * 2 - 1  # uniform [-1, 1]\n        # Avoid exact zeros to prevent masking errors\n        tensor[tensor == 0] = 0.001\n    else:\n        # For integer types, generate values in a non-zero range\n        tensor = torch.randint(1, 100, modified_shape, device=device, dtype=dtype, generator=rng)\n    return tensor",
+    "mutant_id": "L1_P47__index_replace__3",
+    "kernel_name": "L1_P47"
+  },
+  {
+    "rule_name": "non_aligned_inner_dimension",
+    "rule_description": "Generates inputs where the inner dimension size is not a multiple of common GPU block sizes (especially 256). This forces grid launches where the last block contains threads with indices that exceed valid boundaries when boundary conditions are mutated. The rule targets boundary condition mutants by ensuring at least one thread executes beyond the intended range.",
+    "applicable_operators": [
+      "relop_replace",
+      "boundary_mutation",
+      "relop_mutation"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Target kernels with grid-stride loops where boundary conditions\n    # protect against out-of-range access\n    import torch\n    import numpy as np\n    \n    # Choose inner_size that is not divisible by typical block sizes\n    # to ensure extra threads in the last block\n    problematic_sizes = [1, 3, 5, 7, 9, 17, 33, 65, 129, 257, 513, 1025]\n    inner_size = int(rng.choice(problematic_sizes))\n    \n    # Keep outer dimensions small to create manageable test cases\n    outer_size = rng.randint(1, 5)\n    reduce_size = rng.randint(1, 5)\n    \n    # Construct tensor with shape that forces boundary condition exposure\n    shape = (outer_size, reduce_size, inner_size)\n    \n    # Use random values in a reasonable range\n    tensor = torch.randn(shape, dtype=dtype, device=device)\n    \n    # Scale to avoid extreme values that might mask boundary issues\n    tensor = tensor * 2.0 - 1.0  # Values in [-1, 1]\n    \n    return tensor",
+    "mutant_id": "L1_P47__relop_replace__1",
+    "kernel_name": "L1_P47"
+  },
+  {
+    "rule_name": "last_element_non_identity_per_dim",
+    "rule_description": "Creates inputs where the last element along each dimension is set to a non-identity value for common reduction operations (like 0.5 for product, non-zero for sum), while all other elements are set to the identity value. This exposes boundary condition mutations that skip the last element by making its inclusion/exclusion affect the computation result.",
+    "applicable_operators": [
+      "mask_boundary",
+      "guard_removal",
+      "loop_boundary_adjust"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    # Create tensor with identity values (1 for multiplicative reductions, 0 for additive)\n    # Use 1.0 as default since it's identity for multiplication and doesn't affect addition\n    tensor = torch.ones(shape, dtype=dtype, device=device)\n    \n    # Set last element along each dimension to non-identity value\n    # For floating point: use 0.5 (affects product, mean, etc.)\n    # For integer: use 2 (affects sum, product)\n    non_identity = torch.tensor(0.5 if torch.is_floating_point(tensor) else 2,\n                                 dtype=dtype, device=device)\n    \n    for dim in range(len(shape)):\n        # Build index to select last element along current dimension\n        idx = [slice(None)] * len(shape)\n        idx[dim] = -1\n        tensor[idx] = non_identity\n    \n    return tensor",
+    "mutant_id": "L1_P50__mask_boundary__2",
+    "kernel_name": "L1_P50"
+  },
+  {
+    "rule_name": "design_shape_constant_one",
+    "rule_description": "Generates inputs with the kernel's designed shape (typically the last dimension matching thread block size) and all values set to 1.0. This tests boundary condition mutations by ensuring out-of-bounds memory accesses (caused by operator changes) read uncontrolled values that differ from the constant, while the original kernel behaves correctly with valid indices.",
+    "applicable_operators": [
+      "relop_replace",
+      "array_index_replace",
+      "boundary_change"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Preserve the original shape (assumed to be the kernel's designed shape)\n    # Fill entire tensor with 1.0 to detect out-of-bounds reads from mutations\n    return torch.ones(shape, dtype=dtype, device=device)",
+    "mutant_id": "L1_P50__relop_replace__8",
+    "kernel_name": "L1_P50"
+  },
+  {
+    "rule_name": "non_trivial_inner_outer_dimensions",
+    "rule_description": "Generates inputs where both inner_size > 1 and outer_size > 1 to expose integer division truncation errors in index calculations. This is particularly effective for kernels that compute offsets using expressions like (outer_idx * dim_size) / inner_size, where replacing multiplication with division causes different truncation behavior when inner_size doesn't evenly divide the product.",
+    "applicable_operators": [
+      "arith_replace",
+      "binary_operator_replacement",
+      "arithmetic_mutation"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    # Ensure tensor has at least 3 dimensions for outer/dim/inner structure\n    if len(shape) < 3:\n        # For 1D/2D tensors, pad to 3D with size > 1 in all dimensions\n        padded_shape = [3, 5, 4]\n        # But respect original dimensionality if caller expects specific shape\n        # Return original shape with values that would still trigger the issue\n        # Use the killing example's approach: distinct positive values\n        tensor = torch.rand(shape, device=device, generator=rng) + 0.5\n        # Make values distinct by multiplying with indices\n        indices = torch.arange(1, torch.prod(torch.tensor(shape)).item() + 1,\n                              device=device).view(shape).to(dtype)\n        return tensor * indices\n    \n    # For 3D+ tensors, ensure middle dimensions have size > 1\n    # The cumulative dimension (dim) should be > 1\n    # For a 3D tensor, shape = [outer, dim, inner]\n    # We want outer > 1 and inner > 1\n    if shape[0] == 1:\n        # Increase outer dimension if it's 1\n        new_shape = list(shape)\n        new_shape[0] = 3\n        tensor = torch.rand(new_shape, device=device, generator=rng) + 0.5\n    elif shape[-1] == 1:\n        # Increase inner dimension if it's 1\n        new_shape = list(shape)\n        new_shape[-1] = 4\n        tensor = torch.rand(new_shape, device=device, generator=rng) + 0.5\n    else:\n        # Original shape already has outer>1 and inner>1\n        tensor = torch.rand(shape, device=device, generator=rng) + 0.5\n    \n    # Make values distinct and positive to avoid zero masking and improve error detection\n    indices = torch.arange(1, torch.prod(torch.tensor(tensor.shape)).item() + 1,\n                          device=device).view(tensor.shape).to(dtype)\n    return tensor * indices",
+    "mutant_id": "L1_P90__arith_replace__1",
+    "kernel_name": "L1_P90"
+  },
+  {
+    "rule_name": "stride_amplification_for_index_calc",
+    "rule_description": "Generates tensors where the stride (inner_size) in dimension-indexing calculations is deliberately set to a value >1, making index calculations sensitive to arithmetic mutations in stride multiplication/division. This exposes bugs where arithmetic operators in index computations are mutated, particularly when the mutated operation would cause repeated writes (division) versus strided writes (multiplication).",
+    "applicable_operators": [
+      "arith_replace",
+      "binary_operator_replace",
+      "constant_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Construct a multi-dimensional tensor where:\n    # - The target dimension (for operations like cumprod) is not the last dimension\n    # - The inner_size (product of dimensions after target dim) is >1\n    # This ensures stride != 1 in index calculations\n    \n    # We'll create a 3D tensor by default, as it's sufficient to expose the issue\n    # but can be generalized to higher dimensions\n    outer = rng.randint(2, 5)          # dimensions before target\n    target_dim_size = rng.randint(3, 6) # target dimension size\n    inner = rng.randint(2, 5)          # dimensions after target (must be >1)\n    \n    # Optional: with 25% probability, create 4D tensor for additional coverage\n    if rng.random() < 0.25:\n        outer2 = rng.randint(2, 4)\n        shape = (outer2, outer, target_dim_size, inner)\n    else:\n        shape = (outer, target_dim_size, inner)\n    \n    # Fill with distinct, easily traceable values\n    total_elements = torch.prod(torch.tensor(shape)).item()\n    data = torch.arange(1, total_elements + 1, dtype=dtype, device=device).view(shape)\n    \n    # Optional: add small random perturbations to avoid perfect regularity\n    # while maintaining distinctness\n    if dtype.is_floating_point:\n        noise = torch.randn_like(data) * 0.01\n        data = data + noise\n    \n    return data",
+    "mutant_id": "L1_P90__arith_replace__6",
+    "kernel_name": "L1_P90"
+  },
+  {
+    "rule_name": "boundary_expansion_3d_input",
+    "rule_description": "Generates 3D tensors where the innermost dimension is >1 and launch configuration may create extra threads. This exposes boundary condition mutations by ensuring threads with indices at or beyond the original boundary execute, revealing differences in masking logic. Values are set to be distinct to detect out-of-bounds writes or race conditions.",
+    "applicable_operators": [
+      "mask_boundary",
+      "mask_expansion",
+      "guard_removal"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Ensure we have at least 3 dimensions for this rule\n    if len(shape) < 3:\n        # If original shape has fewer dims, expand to 3D with inner_size=2\n        # Outer size = max(2, shape[0] if exists else 2)\n        # Dim size = shape[1] if exists else 2\n        # Inner size = 2 (critical for boundary exposure)\n        outer = shape[0] if len(shape) > 0 else 2\n        dim = shape[1] if len(shape) > 1 else 2\n        inner = 2  # Force inner dimension >1\n        shape = (max(2, outer), max(2, dim), inner)\n    else:\n        # Keep outer and middle dimensions but ensure inner dimension >= 2\n        shape = (max(2, shape[0]), max(2, shape[1]), max(2, shape[2]))\n    \n    # Generate distinct values to detect incorrect writes\n    total_elements = shape[0] * shape[1] * shape[2]\n    # Create a sequence of distinct values\n    if dtype.is_floating_point:\n        # For floating point, use incrementing sequence\n        data = torch.arange(total_elements, dtype=dtype, device=device).view(shape)\n    else:\n        # For integer types, use modulo to stay in type range\n        max_val = min(torch.iinfo(dtype).max, 1000) if hasattr(torch, 'iinfo') else 100\n        data = torch.randint(0, max_val, (total_elements,), dtype=dtype, device=device, generator=rng)\n        data = data.view(shape)\n    \n    return data",
+    "mutant_id": "L1_P91__mask_boundary__2",
+    "kernel_name": "L1_P91"
+  },
+  {
+    "rule_name": "inner_dimension_parallelization",
+    "rule_description": "Targets kernels with inner-dimension parallelization patterns where indexing depends on threadIdx.x modulo inner_size. Ensures inner_size > 1 so that inner_idx varies across threads, exposing arithmetic mutations in index calculations that would be hidden when inner_size=1 (where inner_idx always equals 0). Uses structured values that depend on position to detect offset miscalculations.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "expr_replace",
+      "var_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Determine if we should apply this rule based on shape characteristics\n    # Only apply if we can create at least 3 dimensions with inner_size > 1\n    if len(shape) < 3:\n        # Reshape to add dimensions if needed, preserving total elements\n        # Target shape: [outer, middle, inner] with inner > 1\n        total_elements = math.prod(shape)\n        # Find a factorization with inner > 1\n        inner = 2  # Minimum inner dimension to expose the issue\n        middle = 3  # Reasonable middle dimension\n        outer = total_elements // (inner * middle)\n        if outer == 0:\n            # Fallback if tensor is too small\n            outer = 1\n            middle = total_elements // inner\n            if middle == 0:\n                # Very small tensor, use minimal 3D shape\n                middle = 1\n                inner = total_elements\n        shape = (outer, middle, inner)\n    else:\n        # Already 3D+, ensure inner dimension > 1\n        if shape[-1] == 1:\n            # Reshape the last two dimensions to make inner > 1\n            new_shape = list(shape)\n            if len(shape) >= 2:\n                # Combine last two dimensions then split with inner > 1\n                combined = shape[-2] * shape[-1]\n                # Find factors where inner > 1\n                for inner in range(2, int(math.sqrt(combined)) + 1):\n                    if combined % inner == 0:\n                        new_shape[-2:] = [combined // inner, inner]\n                        break\n                else:\n                    # Prime case, make inner dimension 2 by adjusting previous dim\n                    if combined > 2:\n                        new_shape[-2:] = [(combined + 1) // 2, 2]\n                    else:\n                        new_shape[-2:] = [1, 2]\n            shape = tuple(new_shape)\n    \n    # Create tensor with structured pattern: value = 1000*outer + 100*middle + inner\n    # This makes each position uniquely identifiable and detects offset errors\n    tensor = torch.zeros(shape, device=device, dtype=dtype)\n    \n    if len(shape) == 3:\n        outer, middle, inner = shape\n        for o in range(outer):\n            for m in range(middle):\n                for i in range(inner):\n                    # Scale factors ensure uniqueness across dimensions\n                    tensor[o, m, i] = 1000 * o + 100 * m + i\n    elif len(shape) == 4:\n        # Handle 4D case similarly\n        d1, d2, d3, d4 = shape\n        for a in range(d1):\n            for b in range(d2):\n                for c in range(d3):\n                    for d in range(d4):\n                        tensor[a, b, c, d] = 10000 * a + 1000 * b + 100 * c + d\n    else:\n        # General n-dimensional case: linear index in row-major order\n        idx = 0\n        for coords in torch.ndindex(shape):\n            tensor[coords] = idx\n            idx += 1\n    \n    # For boolean masks (if dtype is bool), create alternating pattern\n    if dtype == torch.bool:\n        # Alternating pattern along the middle dimension\n        tensor = torch.ones(shape, device=device, dtype=torch.bool)\n        if len(shape) >= 2:\n            middle_dim = -2 if len(shape) > 2 else -1\n            for idx in range(shape[middle_dim]):\n                if idx % 2 == 1:\n                    if len(shape) == 3:\n                        tensor[:, idx, :] = False\n                    elif len(shape) == 2:\n                        tensor[:, idx] = False\n                    else:\n                        # General case: set all elements where middle_dim = idx to False\n                        slice_obj = [slice(None)] * len(shape)\n                        slice_obj[middle_dim] = idx\n                        tensor[tuple(slice_obj)] = False\n    \n    return tensor",
+    "mutant_id": "L1_P93__arith_replace__4",
+    "kernel_name": "L1_P93"
+  },
+  {
+    "rule_name": "grid_dimension_boundary_tests",
+    "rule_description": "This rule generates inputs where the total number of elements equals or is slightly less than the thread block size, specifically targeting mutations in grid dimension calculations. It exploits integer division truncation to cause different block counts between original and mutated kernels, leading to uninitialized outputs in mutants.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "negate_condition"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    # Target boundary where total_elements equals or is less than typical block size (256)\n    # Create tensor with exactly 256 elements regardless of requested shape\n    # Use 2D shape [1, 256] to match typical kernel expectations\n    total_elements = 256\n    target_shape = [1, total_elements]\n    \n    # Generate random data with the target shape\n    # Using normal distribution for typical loss function inputs\n    tensor = torch.randn(target_shape, dtype=dtype, device=device)\n    return tensor",
+    "mutant_id": "L1_P96__arith_replace__12",
+    "kernel_name": "L1_P96"
+  },
+  {
+    "rule_name": "reduction_order_sensitive_pattern",
+    "rule_description": "Generates inputs with alternating positive/negative values and strategically placed large-magnitude elements to exploit floating-point associativity differences in parallel reductions. The pattern is sensitive to how threads are grouped in reduction kernels, making it effective for detecting mutations that change block/warp sizes or reduction tree structures.",
+    "applicable_operators": [
+      "const_perturb",
+      "warp_size_change",
+      "block_size_change",
+      "reduction_tree_alter"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    total_elements = math.prod(shape)\n    \n    # Base pattern parameters\n    base_val = 1.33333333  # Repeating decimal for binary rounding effects\n    scale = 1e-4\n    \n    # Create tensor with pattern sensitive to reduction order\n    flat_tensor = torch.zeros(total_elements, dtype=dtype, device=device)\n    \n    # Use common block/warp sizes as potential alignment points\n    alignment_points = [32, 64, 128, 256, 512, 1024]  # Common GPU thread configurations\n    \n    # For each element, create pattern based on position relative to alignment points\n    for idx in range(total_elements):\n        # Determine if this index aligns with any common thread boundary\n        is_boundary = any((idx + 1) % align == 0 for align in alignment_points)\n        \n        # Create alternating sign pattern\n        sign = 1.0 if (idx % 2 == 0) else -1.0\n        \n        if is_boundary:\n            # Make boundary elements significant contributors\n            # These elements will be combined differently in reduction trees\n            val = sign * base_val * 100.0\n        else:\n            # Vary magnitude slightly for cancellation effects\n            val = sign * base_val * (1.0 + scale * (idx % 17))\n        \n        flat_tensor[idx] = val\n    \n    # Reshape to original shape\n    result_tensor = flat_tensor.reshape(shape)\n    \n    # Add small random perturbations to break symmetry\n    # Use provided RNG for reproducibility\n    noise = torch.randn_like(result_tensor, generator=rng) * 1e-7\n    result_tensor += noise\n    \n    return result_tensor",
+    "mutant_id": "L1_P96__const_perturb__4",
+    "kernel_name": "L1_P96"
+  },
+  {
+    "rule_name": "minimal_reduction_workload",
+    "rule_description": "Targets kernels with grid-stride reduction patterns by creating inputs with total elements ≤ typical block size (e.g., 256). This forces the original kernel to launch exactly one block while mutants that reduce block count by one may launch zero blocks, causing silent computation failures.",
+    "applicable_operators": [
+      "launch_config_mutate",
+      "grid_mutate",
+      "block_mutate"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Force total elements to be ≤256 to target reduction kernels with block size 256\n    # Use small non-zero values to ensure detectable output differences\n    total_elements = rng.integers(1, 257)  # 1-256 elements\n    # Create shape that produces exactly total_elements\n    if len(shape) > 1:\n        # Keep first dimension as 1, adjust last dimension to reach target\n        new_shape = [1] * (len(shape)-1) + [total_elements]\n    else:\n        new_shape = [total_elements]\n    \n    # Generate non-zero values to ensure reduction produces detectable result\n    # Use simple pattern: constant value between 1.0 and 3.0\n    value = 1.0 + 2.0 * rng.random()\n    return torch.full(new_shape, value, dtype=dtype, device=device)",
+    "mutant_id": "L1_P96__launch_config_mutate__1",
+    "kernel_name": "L1_P96"
+  },
+  {
+    "rule_name": "relop_oob_poisoned_adjacent_memory",
+    "rule_description": "Targets mutations that cause out-of-bounds accesses by poisoning memory adjacent to intermediate tensors with non-zero values. Creates allocation fragmentation to make adjacent memory locations predictable and fills them with large values that produce observable differences if accessed out-of-bounds. This is particularly effective for reduction kernels where out-of-bounds accesses might normally read zero-valued memory.",
+    "applicable_operators": [
+      "relop_replace",
+      "array_index_replace",
+      "constant_replace",
+      "boundary_condition"
+    ],
+    "policy_code": "import torch\nimport math\n\ndef policy(shape, dtype, device, rng):\n    # Clear cache to make allocation order predictable\n    torch.cuda.empty_cache()\n    \n    # Create and free a large tensor to fragment memory\n    fragmentation_size = 1000000  # Adjust based on available GPU memory\n    dummy = torch.zeros(fragmentation_size, device=device, dtype=dtype)\n    del dummy\n    torch.cuda.empty_cache()\n    \n    # Generate main input tensors with non-zero values\n    # Use the rng for reproducibility but ensure non-zero outputs\n    if dtype in [torch.float32, torch.float64, torch.float16]:\n        # Generate values that produce non-zero outputs for common operations\n        input1 = torch.randn(shape, device=device, dtype=dtype, generator=rng) * 10.0\n        input2 = torch.randn(shape, device=device, dtype=dtype, generator=rng) * 10.0\n    else:\n        # For integer types\n        input1 = torch.randint(1, 100, shape, device=device, dtype=dtype, generator=rng)\n        input2 = torch.randint(1, 100, shape, device=device, dtype=dtype, generator=rng)\n    \n    # Estimate potential intermediate tensor sizes that might be accessed out-of-bounds\n    # Common patterns: reduction blocks, padding, alignment boundaries\n    total_elements = 1\n    for dim in shape:\n        total_elements *= dim\n    \n    # Try multiple common block sizes for reductions\n    block_sizes = [128, 256, 512, 1024]\n    for block_size in block_sizes:\n        reduction_blocks = (total_elements + block_size - 1) // block_size\n        \n        # Create poisoned memory region that might be adjacent to intermediate tensors\n        # Use a size that covers potential out-of-bounds accesses\n        poison_size = max(reduction_blocks + 100, 1024)\n        poison_value = 1e6  # Large value that creates observable differences\n        \n        if dtype in [torch.float32, torch.float64, torch.float16]:\n            poison = torch.full((poison_size,), poison_value, dtype=dtype, device=device)\n        else:\n            poison = torch.full((poison_size,), int(poison_value), dtype=dtype, device=device)\n        \n        # Keep reference to prevent immediate reuse\n        _ = poison[0]  # Simple reference to keep tensor alive\n    \n    return [input1, input2]",
+    "mutant_id": "L1_P96__relop_replace__8",
+    "kernel_name": "L1_P96"
+  },
+  {
+    "rule_name": "critical_norm_epsilon_regime",
+    "rule_description": "Generates two identical tensors where the L2 norm per sample is in a critical regime between typical epsilon values (1e-9 to 1e-1). This targets mutations that modify numerical stability epsilon values, as the original and mutant will produce significantly different outputs when norms are comparable to the epsilon thresholds.",
+    "applicable_operators": [
+      "epsilon_modify",
+      "epsilon_insert",
+      "epsilon_delete"
+    ],
+    "policy_code": "import torch\nimport numpy as np\n\ndef policy(shape, dtype, device, rng):\n    # Assume shape is (batch, features) for a single tensor\n    batch, features = shape[-2], shape[-1]\n    # Sample target norm per sample in log space between 1e-9 and 1e-1\n    log_norm = rng.uniform(np.log(1e-9), np.log(1e-1))\n    target_norm = np.exp(log_norm)\n    # Compute constant value to achieve this norm per sample: norm = sqrt(features * c^2)\n    c = float(target_norm / np.sqrt(features))\n    # Create identical tensors with the computed constant\n    tensor = torch.full(shape, c, dtype=dtype, device=device)\n    return [tensor, tensor.clone()]",
+    "mutant_id": "L1_P97__epsilon_modify__0",
+    "kernel_name": "L1_P97"
+  },
+  {
+    "rule_name": "non_divisible_shape_boundary_exposure",
+    "rule_description": "Generates input shapes where dimension sizes are not multiples of common vectorization strides (e.g., 1024). Sets extreme values exclusively at boundary positions that would be processed in the original kernel but skipped in boundary-tightening mutants. This forces divergence in final outputs by making boundary elements dominate the computation.",
+    "applicable_operators": [
+      "mask_boundary",
+      "relax_boundary",
+      "shift_boundary",
+      "wrap_boundary"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Use original shape but modify the last dimension to be non-divisible by common strides\n    # Common vectorization strides: 256*4=1024, 128*4=512, 256*2=512\n    common_strides = [1024, 512, 256]\n    \n    modified_shape = list(shape)\n    if len(modified_shape) >= 2:\n        last_dim = modified_shape[-1]\n        # Find a non-divisible size slightly larger than original\n        for stride in common_strides:\n            if last_dim % stride == 0:\n                # Make non-divisible by adding 1 (or small prime)\n                modified_shape[-1] = last_dim + 1\n                break\n        # If already non-divisible, keep as is\n    \n    # Create zero tensors\n    predictions = torch.zeros(modified_shape, device=device, dtype=dtype)\n    targets = torch.zeros(modified_shape, device=device, dtype=dtype)\n    \n    # Set only boundary elements to extreme values\n    # For boundary-tightening mutants: set elements at idx = N-1 (last valid)\n    predictions.view(-1, modified_shape[-1])[:, -1] = 1e6\n    targets.view(-1, modified_shape[-1])[:, -1] = 1e6\n    \n    # For boundary-relaxing mutants: also set idx = N (first out-of-bounds if any)\n    # This covers multiple boundary mutation types\n    \n    return [predictions, targets]",
+    "mutant_id": "L1_P97__mask_boundary__2",
+    "kernel_name": "L1_P97"
+  },
+  {
+    "rule_name": "dtype_mismatch_precision_edge",
+    "rule_description": "Generates tensors with dtypes that differ from the expected computation type (typically float32) to expose mutations that remove explicit type casts. This creates precision differences and potential kernel failures when mixed dtypes are used in computations without proper promotion. The rule produces large magnitude values to amplify floating-point precision discrepancies.",
+    "applicable_operators": [
+      "cast_remove",
+      "cast_change",
+      "operator_replacement"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Generate random tensor with potentially mismatched dtype\n    # Use half precision when expected is float32, or float64 when expected is float16\n    if dtype == torch.float32:\n        target_dtype = torch.float16\n    elif dtype == torch.float16:\n        target_dtype = torch.float64\n    elif dtype == torch.float64:\n        target_dtype = torch.float32\n    else:\n        # For integer types, switch to floating point\n        target_dtype = torch.float32\n    \n    # Generate random data with large magnitude to amplify precision differences\n    tensor = torch.randn(shape, dtype=target_dtype, device=device, generator=rng)\n    tensor = tensor * 100.0  # Scale to create noticeable precision differences\n    \n    return tensor.contiguous()",
+    "mutant_id": "L1_P99__cast_remove__0",
+    "kernel_name": "L1_P99"
+  },
+  {
+    "rule_name": "mixed_precision_large_magnitude",
+    "rule_description": "Generates tensors with mixed floating-point precisions (e.g., float32/float64) and large magnitude values to expose precision-loss bugs. When a mutation removes type casts, this causes dtype mismatches in kernels expecting uniform precision, leading to runtime errors or significant numerical differences.",
+    "applicable_operators": [
+      "cast_remove"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    # If original dtype is float32, switch to float64 (or vice versa)\n    if dtype == torch.float32:\n        new_dtype = torch.float64\n    elif dtype == torch.float64:\n        new_dtype = torch.float32\n    else:\n        # For non-float types, keep original dtype\n        new_dtype = dtype\n    \n    # Generate random values with large magnitude to amplify precision differences\n    tensor = torch.randn(shape, dtype=new_dtype, device=device, generator=rng)\n    # Scale by large factor (1e6) to make precision differences more pronounced\n    return tensor * 1e6",
+    "mutant_id": "L1_P99__cast_remove__1",
+    "kernel_name": "L1_P99"
+  },
+  {
+    "rule_name": "higher_precision_inputs",
+    "rule_description": "Generates tensors with dtypes of higher precision than typical (e.g., float64 for float32 contexts). This reveals mutations that remove explicit casts by exposing precision differences or kernel compatibility issues when higher-precision data flows through computations designed for lower precision.",
+    "applicable_operators": [
+      "cast_remove",
+      "cast_type_change",
+      "arithmetic_replacement"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Map common target dtypes to higher-precision alternatives\n    precision_map = {\n        torch.float16: torch.float32,\n        torch.float32: torch.float64,\n        torch.bfloat16: torch.float32,\n        torch.int32: torch.int64,\n        torch.int16: torch.int32,\n    }\n    \n    # Use higher precision if available, otherwise fall back to original\n    target_dtype = precision_map.get(dtype, dtype)\n    \n    # Generate base tensor with random values in a large range to amplify precision differences\n    base = torch.randn(shape, dtype=target_dtype, device='cpu', generator=rng) * 1000000.0\n    \n    # Add tiny perturbations that get lost when converting to lower precision\n    if target_dtype in [torch.float32, torch.float64]:\n        # For floating types: add noise below the precision threshold of original dtype\n        eps = torch.finfo(dtype).eps if hasattr(torch.finfo(dtype), 'eps') else 1e-7\n        perturbation = torch.randn(shape, dtype=target_dtype, device='cpu', generator=rng) * (eps / 1000.0)\n        base = base + perturbation\n    elif target_dtype in [torch.int32, torch.int64]:\n        # For integer types: ensure values exceed typical range of original dtype\n        max_val = torch.iinfo(dtype).max if hasattr(torch.iinfo(dtype), 'max') else 2**31-1\n        base = base % (max_val * 2)  # Values potentially beyond original dtype's range\n    \n    # Move to target device, preserving higher precision dtype\n    return base.to(device)",
+    "mutant_id": "L1_P99__cast_remove__2",
+    "kernel_name": "L1_P99"
+  },
+  {
+    "rule_name": "boundary_dominant_last_element",
+    "rule_description": "This rule targets boundary-guard mutations by making the last element of the guarded dimension the sole contributor to the output. It sets all other elements to zero and the last element to a non‑zero value that dominates any subsequent reduction (e.g., sum, squared distance). For kernels processing multiple tensors (e.g., contrastive loss), apply the same pattern independently to each input, choosing values that create an asymmetry when the last element is skipped.",
+    "applicable_operators": [
+      "mask_boundary",
+      "relax_boundary",
+      "mask_wrap"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    tensor = torch.zeros(shape, dtype=dtype, device=device)\n    # Set the last element of the last dimension to a dominating non‑zero value\n    tensor[..., -1] = torch.tensor(1.0, dtype=dtype, device=device)\n    return tensor",
+    "mutant_id": "L1_P99__mask_boundary__2",
+    "kernel_name": "L1_P99"
+  }
+]

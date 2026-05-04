@@ -1,0 +1,150 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      15|     const int outer_size,
+      16|     const int inner_size
+      17| ) {
+      18|     // Each thread block handles one output position
+      19|     const int tid = threadIdx.x;
+      20|     const int bid = blockIdx.x;
+      21|     
+      22|     // Calculate which output position this block handles
+      23|     const int outer_idx = bid / inner_size;
+      24|     const int inner_idx = bid % inner_size;
+      25|     
+      26|     // Shared memory for block reduction
+>>>   27|     __shared__ T shared_sums[256];
+      28|     
+      29|     // Each thread accumulates its portion
+      30|     T sum = static_cast<T>(0);
+      31|     for (int i = tid; i < reduction_dim_size; i += blockDim.x) {
+      32|         int idx = (outer_idx * reduction_dim_size + i) * inner_size + inner_idx;
+      33|         sum += input[idx];
+      34|     }
+      35|     
+      36|     shared_sums[tid] = sum;
+      37|     __syncthreads();
+      38|     
+      39|     // Parallel reduction within block
+```
+
+## Mutated Code (around mutation site)
+```
+      15|     const int outer_size,
+      16|     const int inner_size
+      17| ) {
+      18|     // Each thread block handles one output position
+      19|     const int tid = threadIdx.x;
+      20|     const int bid = blockIdx.x;
+      21|     
+      22|     // Calculate which output position this block handles
+      23|     const int outer_idx = bid / inner_size;
+      24|     const int inner_idx = bid % inner_size;
+      25|     
+      26|     // Shared memory for block reduction
+>>>   27|     __shared__ T shared_sums[257];
+      28|     
+      29|     // Each thread accumulates its portion
+      30|     T sum = static_cast<T>(0);
+      31|     for (int i = tid; i < reduction_dim_size; i += blockDim.x) {
+      32|         int idx = (outer_idx * reduction_dim_size + i) * inner_size + inner_idx;
+      33|         sum += input[idx];
+      34|     }
+      35|     
+      36|     shared_sums[tid] = sum;
+      37|     __syncthreads();
+      38|     
+      39|     // Parallel reduction within block
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 27
+- Original fragment: `256`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Force the kernel to use blockDim.x = 257 or larger, causing out-of-bounds access in the original (256-element array) but not in the mutant (257-element array). This requires changing the launch configuration, not just input values. However, since input dimensions indirectly determine block count (bid), we can design input shapes where reduction_dim_size forces the kernel to be launched with blockDim.x > 256, or we can directly test with different block sizes if launch parameters are configurable.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Keep outer_size=16, inner_size=256, but set reduction_dim_size=257
+    # This might cause the kernel to use blockDim.x=257 if block size equals reduction_dim_size
+    # However, typical kernels use fixed block size (e.g., 256). To truly test, we need to modify
+    # launch parameters, which are not part of input. As a proxy, we set values so that thread
+    # index 256 (if used) would contribute differently.
+    # Since we cannot change block size via input, we instead test with a different shape
+    # that forces the kernel to launch with blockDim.x=257 if the kernel uses dynamic block size.
+    # But the kernel snippet suggests blockDim.x is fixed. Thus, this test is speculative.
+    # Instead, we design input where thread index 256 (if block size were 257) would write to
+    # shared_sums[256] in mutant but cause out-of-bounds in original.
+    # We'll create input where the last thread (if block size 257) reads a unique value.
+    shape = (16, 257, 256)  # change reduction_dim_size to 257
+    tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+    # Set values so that each thread reads a unique, thread-dependent value
+    # This amplifies differences if thread 256 is active
+    for i in range(shape[1]):  # reduction_dim_size
+        # Each thread i reads a value equal to its thread index (if blockDim.x >= 257)
+        # This will cause thread 256 to read 256 in mutant, but crash or ignore in original
+        tensor[:, i, :] = i
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Force the reduction to access index 256 by ensuring blockDim.x=256 AND the reduction pattern uses indices up to blockDim.x. We'll create input where every thread contributes a unique non-zero value, making reduction steps access all indices. Use input shape that leads to exactly 256 threads per block (common default).
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Shape matches specification: [16, 256, 256]
+    # Assuming kernel launch uses blockDim.x = 256 (common for reductions)
+    shape = (16, 256, 256)
+    tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+    # Fill with pattern where each thread's contribution is unique and non-zero
+    # This maximizes chance that reduction accesses all indices
+    # Use linear values across reduction dimension
+    for i in range(shape[1]):  # reduction_dim_size
+        tensor[:, i, :] = i + 1.0  # +1 to avoid zeros
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

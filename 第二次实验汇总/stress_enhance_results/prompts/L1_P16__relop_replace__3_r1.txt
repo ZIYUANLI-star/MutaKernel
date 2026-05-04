@@ -1,0 +1,450 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 45 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized matrix multiplication with tiling
+matmul_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+const int TILE_SIZE = 32;
+
+__global__ void matmul_transpose_kernel(
+    const float* A,  // shape: [K, M]
+    const float* B,  // shape: [K, N]
+    float* C,        // shape: [M, N]
+    int M, int K, int N) {
+    
+    // Shared memory for tiles
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    
+    // Row and column of C to compute
+    int row = by * TILE_SIZE + ty;
+    int col = bx * TILE_SIZE + tx;
+    
+    float sum = 0.0f;
+    
+    // Loop over tiles
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        // Load A tile (transposed access: A[K][M] -> As[M][K])
+        int A_row = t * TILE_SIZE + tx;
+        int A_col = row;
+        if (A_row < K && A_col < M) {
+            As[ty][tx] = A[A_row * M + A_col];  // A is stored as [K][M]
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+        
+        // Load B tile
+        int B_row = t * TILE_SIZE + ty;
+        int B_col = col;
+        if (B_row < K && B_col < N) {
+            Bs[ty][tx] = B[B_row * N + B_col];  // B is stored as [K][N]
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+        
+        __syncthreads();
+        
+        // Compute partial sum
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+        
+        __syncthreads();
+    }
+    
+    // Write result
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor matmul_transpose_cuda(torch::Tensor A, torch::Tensor B) {
+    // A: [K, M], B: [K, N]
+    int K = A.size(0);
+    int M = A.size(1);
+    int N = B.size(1);
+    
+    // Output: [M, N]
+    auto C = torch::zeros({M, N}, A.options());
+    
+    // Configure grid and block dimensions
+    dim3 block(TILE_SIZE, TILE_SIZE);
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    
+    // Launch kernel
+    matmul_transpose_kernel<<<grid, block>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
+        M, K, N
+    );
+    
+    return C;
+}
+"""
+
+matmul_transpose_cpp_source = """
+torch::Tensor matmul_transpose_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+# Compile the inline CUDA code
+matmul_transpose = load_inline(
+    name="matmul_transpose",
+    cpp_sources=matmul_transpose_cpp_source,
+    cuda_sources=matmul_transpose_source,
+    functions=["matmul_transpose_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with custom CUDA kernel for matrix multiplication with transpose
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul_transpose = matmul_transpose
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs optimized matrix multiplication C = A^T * B
+        
+        Args:
+            A: Input tensor of shape (K, M).
+            B: Input tensor of shape (K, N).
+            
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return self.matmul_transpose.matmul_transpose_cuda(A, B)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized matrix multiplication with tiling
+matmul_transpose_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+const int TILE_SIZE = 32;
+
+__global__ void matmul_transpose_kernel(
+    const float* A,  // shape: [K, M]
+    const float* B,  // shape: [K, N]
+    float* C,        // shape: [M, N]
+    int M, int K, int N) {
+    
+    // Shared memory for tiles
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    
+    // Row and column of C to compute
+    int row = by * TILE_SIZE + ty;
+    int col = bx * TILE_SIZE + tx;
+    
+    float sum = 0.0f;
+    
+    // Loop over tiles
+    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        // Load A tile (transposed access: A[K][M] -> As[M][K])
+        int A_row = t * TILE_SIZE + tx;
+        int A_col = row;
+        if (A_row < K && A_col < M) {
+            As[ty][tx] = A[A_row * M + A_col];  // A is stored as [K][M]
+        } else {
+            As[ty][tx] = 0.0f;
+        }
+        
+        // Load B tile
+        int B_row = t * TILE_SIZE + ty;
+        int B_col = col;
+        if (B_row <= K && B_col < N) {
+            Bs[ty][tx] = B[B_row * N + B_col];  // B is stored as [K][N]
+        } else {
+            Bs[ty][tx] = 0.0f;
+        }
+        
+        __syncthreads();
+        
+        // Compute partial sum
+        for (int k = 0; k < TILE_SIZE; ++k) {
+            sum += As[ty][k] * Bs[k][tx];
+        }
+        
+        __syncthreads();
+    }
+    
+    // Write result
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor matmul_transpose_cuda(torch::Tensor A, torch::Tensor B) {
+    // A: [K, M], B: [K, N]
+    int K = A.size(0);
+    int M = A.size(1);
+    int N = B.size(1);
+    
+    // Output: [M, N]
+    auto C = torch::zeros({M, N}, A.options());
+    
+    // Configure grid and block dimensions
+    dim3 block(TILE_SIZE, TILE_SIZE);
+    dim3 grid((N + TILE_SIZE - 1) / TILE_SIZE, (M + TILE_SIZE - 1) / TILE_SIZE);
+    
+    // Launch kernel
+    matmul_transpose_kernel<<<grid, block>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
+        M, K, N
+    );
+    
+    return C;
+}
+"""
+
+matmul_transpose_cpp_source = """
+torch::Tensor matmul_transpose_cuda(torch::Tensor A, torch::Tensor B);
+"""
+
+# Compile the inline CUDA code
+matmul_transpose = load_inline(
+    name="matmul_transpose",
+    cpp_sources=matmul_transpose_cpp_source,
+    cuda_sources=matmul_transpose_source,
+    functions=["matmul_transpose_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with custom CUDA kernel for matrix multiplication with transpose
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.matmul_transpose = matmul_transpose
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs optimized matrix multiplication C = A^T * B
+        
+        Args:
+            A: Input tensor of shape (K, M).
+            B: Input tensor of shape (K, N).
+            
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return self.matmul_transpose.matmul_transpose_cuda(A, B)
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 45
+- Original fragment: `<`
+- node_type: cuda_Lt
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[4096, 1024], dtype=torch.float32
+  arg[1]: Tensor shape=[4096, 2048], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 45
+- Original fragment: `<`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - relop_boundary_hit: passed
+  - relop_boundary_hit: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - near_zero: passed
+  - near_zero: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [4096, 1024], 'dtype': 'torch.float32', 'min': -4.908847808837891, 'max': 5.37119197845459, 'mean': 0.000211030594073236, 'has_nan': False, 'has_inf': False}, {'shape': [4096, 2048], 'dtype': 'torch.float32', 'min': -4.986915588378906, 'max': 5.169291973114014, 'mean': -0.00011102547432528809, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_large_magnitude_1', 'seed': 10101, 'tensors': [{'shape': [4096, 1024], 'dtype': 'torch.float32', 'min': -4866.79345703125, 'max': 5496.4072265625, 'mean': -1.3918335437774658, 'has_nan': False, 'has_inf': False}, {'shape': [4096, 2048], 'dtype': 'torch.float32', 'min': -4888.26806640625, 'max': 5558.6640625, 'mean': 0.5020545721054077, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: possibly_killable
+- Confidence: 0.95
+- Reasoning: The mutation changes the boundary condition for loading B tiles from `B_row < K` to `B_row <= K`. When K is exactly divisible by TILE_SIZE (32), the last tile iteration has B_row = K (since t = K/TILE_SIZE - 1, B_row = (K/TILE_SIZE - 1)*32 + ty, and for ty=31, B_row = K-1, which is < K). However, when K is NOT a multiple of TILE_SIZE, the loop iterates over ceil(K/TILE_SIZE) tiles. In the last tile, B_row can equal K for some threads (when ty >= K % TILE_SIZE). The original code treats B_row == 
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 45 / 45 rounds. Result: ALL SURVIVED (bitwise identical)
+  - sparse_extreme seed=42: survived
+  - sparse_extreme seed=43: survived
+  - sparse_extreme seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - near_overflow seed=47: survived
+  - denormals seed=48: survived
+  - denormals seed=49: survived
+  - denormals seed=50: survived
+  - all_negative seed=51: survived
+  - all_negative seed=52: survived
+  - all_negative seed=53: survived
+  - all_positive seed=54: survived
+  - all_positive seed=55: survived
+  - all_positive seed=56: survived
+  - mixed_extremes seed=57: survived
+  - mixed_extremes seed=58: survived
+  - mixed_extremes seed=59: survived
+  - alternating_sign seed=60: survived
+  - alternating_sign seed=61: survived
+  - alternating_sign seed=62: survived
+  - uniform_constant seed=63: survived
+  - uniform_constant seed=64: survived
+  - uniform_constant seed=65: survived
+  - head_heavy seed=66: survived
+  - head_heavy seed=67: survived
+  - head_heavy seed=68: survived
+  - tail_heavy seed=69: survived
+  - tail_heavy seed=70: survived
+  - tail_heavy seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- reduction_adversarial: reduction_adversarial
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

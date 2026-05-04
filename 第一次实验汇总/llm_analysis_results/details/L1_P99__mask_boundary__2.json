@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P99__mask_boundary__2",
+  "kernel_name": "L1_P99",
+  "operator_name": "mask_boundary",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survives because all previous attempts created inputs where the missing last element's contribution was either identical between positive/negative pairs or canceled out in the loss computation. The kernel computes squared Euclidean distances separately for anchor-positive and anchor-negative pairs, then likely uses these in a contrastive loss (e.g., Triplet Loss: max(0, margin + pos_dist - neg_dist)). For the mutant to be killed, the last element must create an asymmetry in the loss that the reduction and subsequent operations don't mask. Previous attempts failed because they either made the last element contribute equally to both distances (canceling in loss) or the values were extreme enough to cause NaN/inf in both original and mutant, making them equivalent in failure mode.",
+  "killable": true,
+  "kill_strategy": "Exploit the non-linear nature of the contrastive loss by making the last element's omission flip the sign of (pos_dist - neg_dist) relative to the margin. Specifically, craft inputs where the last element alone makes pos_dist > neg_dist + margin in the original (loss > 0), but with it omitted, pos_dist < neg_dist + margin in the mutant (loss = 0). Use moderate values to avoid overflow and ensure the difference is detectable.",
+  "recommendations": "When designing inputs for mutation killing in loss-based kernels, focus on making the mutation affect the final loss value, not just intermediate distances. Consider the loss function's non-linearities (e.g., max(0, ...)). Use moderate values to avoid floating-point special cases (NaN/inf) that can mask differences. If the margin is a kernel parameter, include its effect in the test values. Also, verify that the kernel actually computes a contrastive loss with margin; if not, adjust strategy to target whatever uses pos_dist and neg_dist.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survives because the stress tests only varied input values, not shapes. With feature_dim=4096, the mutation changes the condition from 'idx < 4096' to 'idx < 4095', causing the last element (index 4095) to be skipped. However, in the loop structure, 'i' increments by 'blockDim.x * ELEMENTS_PER_THREAD'. Since 4096 is likely a multiple of the thread block's coverage (typically 128 threads × 32 elements/thread = 4096), the last iteration's 'i' value equals 4096 - ELEMENTS_PER_THREAD, making 'i + j' reach exactly 4095 only in the last iteration. The mutant skips index 4095, but all other indices (0-4094) are processed identically. The stress tests missed this because they didn't test where the last element's exclusion causes a measurable difference in the final loss output.",
+      "kill_strategy": "Design inputs where the last feature element (index 4095) carries significant, asymmetric information compared to other elements. Specifically, set anchor[..., 4095] = 1, positive[..., 4095] = 0, negative[..., 4095] = 0, while keeping all other elements zero. This makes the positive distance entirely from the last element (which mutant skips), while the negative distance is zero. The original will compute non-zero distances; mutant will compute zero distances for both, leading to different loss values.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    batch_size, feature_dim = 128, 4096\n    anchor = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    positive = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    negative = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    \n    # Only last element differs: anchor=1, positive=0, negative=0\n    anchor[:, -1] = 1.0  # Last element = 1\n    # Positive and negative remain 0 everywhere\n    \n    return [anchor, positive, negative]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survives because previous tests didn't account for the GPU kernel's execution pattern. The mutation skips the last feature element (index 4095), but this is only executed by the last thread in the last warp. If feature_dim (4096) is perfectly divisible by warp_size (32) and ELEMENTS_PER_THREAD, the skipped element might not affect the final reduction if the warp reduction doesn't properly accumulate contributions from all threads. The mutant's behavior matches the original when the last thread's skipped contribution is numerically insignificant or when other threads' contributions mask the difference due to floating-point non-associativity in the reduction order.",
+      "kill_strategy": "Force the last feature element (index 4095) to carry a unique, large-magnitude value that cannot be masked by other elements, and ensure it's processed by a thread whose contributions cannot be compensated by other threads. Use extreme values to exploit floating-point sensitivity in the reduction, and also test with a non-power-of-two feature dimension to alter thread mapping.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Test two scenarios in one batch\n    batch_size = 128\n    \n    # First half of batch: original dimension 4096\n    feature_dim1 = 4096\n    anchor1 = torch.zeros(batch_size//2, feature_dim1, dtype=torch.float32, device=device)\n    positive1 = torch.zeros(batch_size//2, feature_dim1, dtype=torch.float32, device=device)\n    negative1 = torch.zeros(batch_size//2, feature_dim1, dtype=torch.float32, device=device)\n    \n    # Only last element differs dramatically\n    anchor1[:, -1] = 1e20\n    negative1[:, -1] = -1e20  # Creates huge squared difference for negative pair too\n    \n    # Second half of batch: non-power-of-two dimension 4095\n    feature_dim2 = 4095\n    anchor2 = torch.zeros(batch_size//2, feature_dim2, dtype=torch.float32, device=device)\n    positive2 = torch.zeros(batch_size//2, feature_dim2, dtype=torch.float32, device=device)\n    negative2 = torch.zeros(batch_size//2, feature_dim2, dtype=torch.float32, device=device)\n    \n    # Last element differs dramatically\n    anchor2[:, -1] = 1e20\n    negative2[:, -1] = -1e20\n    \n    # Concatenate both scenarios\n    anchor = torch.cat([anchor1, anchor2], dim=0)\n    positive = torch.cat([positive1, positive2], dim=0)\n    negative = torch.cat([negative1, negative2], dim=0)\n    \n    return [anchor, positive, negative]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "llm_generate: Sizes of tensors must match except in dimension 0. Expected size 4096 but got size 4095 for tensor number 1 in the list."
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutant survives because all previous attempts created inputs where the missing last element's contribution was either identical between positive/negative pairs or canceled out in the loss computation. The kernel computes squared Euclidean distances separately for anchor-positive and anchor-negative pairs, then likely uses these in a contrastive loss (e.g., Triplet Loss: max(0, margin + pos_dist - neg_dist)). For the mutant to be killed, the last element must create an asymmetry in the loss that the reduction and subsequent operations don't mask. Previous attempts failed because they either made the last element contribute equally to both distances (canceling in loss) or the values were extreme enough to cause NaN/inf in both original and mutant, making them equivalent in failure mode.",
+      "kill_strategy": "Exploit the non-linear nature of the contrastive loss by making the last element's omission flip the sign of (pos_dist - neg_dist) relative to the margin. Specifically, craft inputs where the last element alone makes pos_dist > neg_dist + margin in the original (loss > 0), but with it omitted, pos_dist < neg_dist + margin in the mutant (loss = 0). Use moderate values to avoid overflow and ensure the difference is detectable.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    batch_size, feature_dim = 128, 4096\n    # All zeros except last feature\n    anchor = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    positive = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    negative = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    \n    # Last element values that create asymmetric distances\n    # Anchor differs more from positive than from negative (by square effect)\n    anchor[:, -1] = 1.0          # Large difference to positive\n    positive[:, -1] = 0.0        # Zero -> squared diff = 1.0\n    negative[:, -1] = 0.9        # Close to anchor -> squared diff = 0.01\n    \n    # Ensure other elements are zero (already set)\n    return [anchor, positive, negative]\n",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=8.999999e-01, mean_diff=8.999999e-01, ref_range=[1.9000e+00,1.9000e+00], mut_range=[1.0000e+00,1.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 3,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "boundary_dominant_last_element",
+    "rule_description": "This rule targets boundary-guard mutations by making the last element of the guarded dimension the sole contributor to the output. It sets all other elements to zero and the last element to a non‑zero value that dominates any subsequent reduction (e.g., sum, squared distance). For kernels processing multiple tensors (e.g., contrastive loss), apply the same pattern independently to each input, choosing values that create an asymmetry when the last element is skipped.",
+    "applicable_operators": [
+      "mask_boundary",
+      "relax_boundary",
+      "mask_wrap"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    tensor = torch.zeros(shape, dtype=dtype, device=device)\n    # Set the last element of the last dimension to a dominating non‑zero value\n    tensor[..., -1] = torch.tensor(1.0, dtype=dtype, device=device)\n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    batch_size, feature_dim = 128, 4096\n    # All zeros except last feature\n    anchor = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    positive = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    negative = torch.zeros(batch_size, feature_dim, dtype=torch.float32, device=device)\n    \n    # Last element values that create asymmetric distances\n    # Anchor differs more from positive than from negative (by square effect)\n    anchor[:, -1] = 1.0          # Large difference to positive\n    positive[:, -1] = 0.0        # Zero -> squared diff = 1.0\n    negative[:, -1] = 0.9        # Close to anchor -> squared diff = 0.01\n    \n    # Ensure other elements are zero (already set)\n    return [anchor, positive, negative]\n"
+}

@@ -1,0 +1,44 @@
+{
+  "mutant_id": "L1_P39__epsilon_modify__0",
+  "kernel_name": "L1_P39",
+  "operator_name": "epsilon_modify",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutation survives because the epsilon value (1e-2 vs 1e-8) only affects the normalization scale when the sum of squares (sdata[0]) is extremely small. For the fixed input shape [16, 16384], stress tests used random values but couldn't produce sum-of-squares in the critical regime where epsilon dominates. Specifically, with 16384 elements, even tiny values like 1e-7 produce sum-of-squares ~16384×(1e-7)² ≈ 1.6e-10, which is still much smaller than 1e-8, making both epsilons dominate. However, the output becomes effectively zero for all elements in this regime, masking differences. The mutation only matters when sum-of-squares is between ~1e-8 and ~1e-2, but random distributions rarely hit this narrow window precisely.",
+  "killable": true,
+  "kill_strategy": "Create a vector where the sum of squares is precisely controlled to be between 1e-8 and 1e-2, making the epsilon term significant but not dominant. Use a single non-zero element with carefully chosen magnitude, so the scale factor differs substantially between original (1/sqrt(x+1e-8)) and mutant (1/sqrt(x+1e-2)).",
+  "recommendations": "1. Kernel robustness: Use relative epsilon ε·max(1, sum_squares) instead of absolute epsilon to avoid sensitivity to magnitude. 2. Test suite improvement: Include structured tests with precisely controlled sum-of-squares magnitudes, not just random distributions. 3. Consider testing with varied input shapes (especially smaller dimensions) where single-element contributions are more significant.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutation survives because the epsilon value (1e-2 vs 1e-8) only affects the normalization scale when the sum of squares (sdata[0]) is extremely small. For the fixed input shape [16, 16384], stress tests used random values but couldn't produce sum-of-squares in the critical regime where epsilon dominates. Specifically, with 16384 elements, even tiny values like 1e-7 produce sum-of-squares ~16384×(1e-7)² ≈ 1.6e-10, which is still much smaller than 1e-8, making both epsilons dominate. However, the output becomes effectively zero for all elements in this regime, masking differences. The mutation only matters when sum-of-squares is between ~1e-8 and ~1e-2, but random distributions rarely hit this narrow window precisely.",
+      "kill_strategy": "Create a vector where the sum of squares is precisely controlled to be between 1e-8 and 1e-2, making the epsilon term significant but not dominant. Use a single non-zero element with carefully chosen magnitude, so the scale factor differs substantially between original (1/sqrt(x+1e-8)) and mutant (1/sqrt(x+1e-2)).",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    \n    # Create zero tensor\n    x = torch.zeros(batch_size, dim, device=device, dtype=torch.float32)\n    \n    # For batch 0, set exactly one element to sqrt(1e-5) = ~0.003162\n    # This makes sum-of-squares = (0.003162)^2 = 1e-5\n    target_sum_sq = 1e-5\n    single_val = math.sqrt(target_sum_sq)  # ~0.003162\n    x[0, 0] = single_val\n    \n    # For other batches, set random values that won't trigger epsilon sensitivity\n    # to ensure other outputs remain identical\n    for b in range(1, batch_size):\n        x[b] = torch.randn(dim, device=device) * 0.1 + 1.0  # Norm ~sqrt(16384×1)≈128\n    \n    return [x]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=9.683930e-01, mean_diff=3.696234e-06, ref_range=[0.0000e+00,1.0000e+00], mut_range=[0.0000e+00,3.1607e-02]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "epsilon_sensitivity_targeting",
+    "rule_description": "Generates inputs where the sum of squares along the normalized dimension falls within epsilon-sensitive regimes. Specifically targets values comparable to the epsilon values used in numerical stability guards (e.g., between 1e-8 and 1e-2). Creates controlled scenarios where epsilon variations produce measurable output differences.",
+    "applicable_operators": [
+      "epsilon_modify",
+      "constant_change",
+      "arithmetic_replacement",
+      "div_mul_replacement"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Assume shape follows (batch, dim) pattern for normalization kernels\n    if len(shape) != 2:\n        # For other shapes, create a simple 2D case\n        batch_size = 16\n        dim = 16384\n    else:\n        batch_size, dim = shape\n    \n    x = torch.zeros(batch_size, dim, device=device, dtype=dtype)\n    \n    # Select target sum-of-squares values in epsilon-sensitive range\n    # Cover multiple orders of magnitude around typical epsilon values\n    target_ss_candidates = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2]\n    \n    # Use rng to select one target value for the sensitive batch\n    ss_target = target_ss_candidates[rng.randint(0, len(target_ss_candidates))]\n    \n    # For batch 0: create epsilon-sensitive pattern\n    # Option 1: Single non-zero element (simplest)\n    if rng.random() < 0.5:\n        single_val = math.sqrt(ss_target)\n        x[0, 0] = single_val\n    else:\n        # Option 2: Multiple small elements that sum to target\n        # Distribute target sum across multiple elements\n        n_elements = rng.randint(2, min(10, dim))\n        val_per_element = math.sqrt(ss_target / n_elements)\n        for i in range(n_elements):\n            x[0, i] = val_per_element\n    \n    # For remaining batches: create non-sensitive patterns\n    # with norms large enough to dominate epsilon\n    for b in range(1, batch_size):\n        # Create random vectors with norm >> epsilon\n        # Norm ~ sqrt(dim) to ensure sum-squares ~ O(dim)\n        random_vec = torch.randn(dim, device=device, dtype=dtype) * 0.1 + 1.0\n        x[b] = random_vec\n    \n    return [x]"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    \n    # Create zero tensor\n    x = torch.zeros(batch_size, dim, device=device, dtype=torch.float32)\n    \n    # For batch 0, set exactly one element to sqrt(1e-5) = ~0.003162\n    # This makes sum-of-squares = (0.003162)^2 = 1e-5\n    target_sum_sq = 1e-5\n    single_val = math.sqrt(target_sum_sq)  # ~0.003162\n    x[0, 0] = single_val\n    \n    # For other batches, set random values that won't trigger epsilon sensitivity\n    # to ensure other outputs remain identical\n    for b in range(1, batch_size):\n        x[b] = torch.randn(dim, device=device) * 0.1 + 1.0  # Norm ~sqrt(16384×1)≈128\n    \n    return [x]"
+}

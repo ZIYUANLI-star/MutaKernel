@@ -1,0 +1,152 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      10| 
+      11| template<typename T>
+      12| __global__ void fused_cross_entropy_kernel(
+      13|     const T* __restrict__ logits,
+      14|     const long* __restrict__ targets,
+      15|     T* __restrict__ loss,
+      16|     int batch_size,
+      17|     int num_classes,
+      18|     float label_smoothing
+      19| ) {
+      20|     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      21|     
+>>>   22|     if (idx >= batch_size) return;
+      23|     
+      24|     const int target_idx = targets[idx];
+      25|     const T* row_logits = &logits[idx * num_classes];
+      26|     
+      27|     // Online softmax computation
+      28|     T max_val = row_logits[0];
+      29|     for (int i = 1; i < num_classes; i++) {
+      30|         if (row_logits[i] > max_val) {
+      31|             max_val = row_logits[i];
+      32|         }
+      33|     }
+      34|     
+```
+
+## Mutated Code (around mutation site)
+```
+      10| 
+      11| template<typename T>
+      12| __global__ void fused_cross_entropy_kernel(
+      13|     const T* __restrict__ logits,
+      14|     const long* __restrict__ targets,
+      15|     T* __restrict__ loss,
+      16|     int batch_size,
+      17|     int num_classes,
+      18|     float label_smoothing
+      19| ) {
+      20|     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      21|     
+>>>   22|     if (idx >= batch_size + 1) return;
+      23|     
+      24|     const int target_idx = targets[idx];
+      25|     const T* row_logits = &logits[idx * num_classes];
+      26|     
+      27|     // Online softmax computation
+      28|     T max_val = row_logits[0];
+      29|     for (int i = 1; i < num_classes; i++) {
+      30|         if (row_logits[i] > max_val) {
+      31|             max_val = row_logits[i];
+      32|         }
+      33|     }
+      34|     
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 22
+- Original fragment: `idx >= batch_size`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[4096, 10], dtype=torch.float32
+  arg[1]: shape=[4096], dtype=torch.int64
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the batch size to a value not divisible by the block size (e.g., 1, 255, 4097). This forces the kernel launch to have more threads than batch_size, causing the thread with idx=batch_size to be launched. In the mutant, this thread proceeds and performs out-of-bounds memory accesses on `targets`, `logits`, and `loss`, likely leading to a CUDA memory error or silent memory corruption that can be detected via output comparison or runtime error.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    batch_size = 1
+    num_classes = 10
+    # Random logits (any distribution works, but extremes may amplify differences)
+    logits = torch.randn(batch_size, num_classes, device=device, dtype=torch.float32) * 1000
+    # Target indices within valid range
+    targets = torch.zeros(batch_size, device=device, dtype=torch.int64)
+    return [logits, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Force thread idx = batch_size to execute AND cause it to write to memory that affects subsequent valid computations via shared memory corruption or atomic operations. Since the kernel doesn't have shared memory or atomics, focus on making the out-of-bounds read return a specific value that causes extreme loss values (NaN/Inf) when processed through the softmax and cross-entropy calculations, which will propagate to the valid output elements via the kernel's internal computations.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use a batch size that ensures thread idx=batch_size is launched
+    # Assume typical launch: gridDim.x = ceil(batch_size / blockDim.x), blockDim.x = 256
+    # Choose batch_size = 255 (256*1 - 1) to ensure thread 255 is launched and thread 256 (idx=batch_size) is out-of-bounds
+    batch_size = 255
+    num_classes = 10
+    
+    # Allocate tensors with padding for out-of-bounds access
+    # The kernel accesses logits[batch_size * num_classes] and targets[batch_size]
+    # So allocate extra elements and fill them with values causing extreme behavior
+    logits = torch.randn(batch_size + 1, num_classes, device=device, dtype=torch.float32)
+    targets = torch.randint(0, num_classes, (batch_size + 1,), device=device, dtype=torch.int64)
+    
+    # For the out-of-bounds row (idx = batch_size), set logits to cause NaN:
+    # Use a huge value in one column to cause exp(huge) -> inf, then inf/inf -> NaN
+    logits[batch_size, 0] = 1e10  # Large value causes overflow in exp
+    logits[batch_size, 1:] = -1e10  # Other values very negative
+    
+    # For the valid rows, use normal values but ensure the loss output is sensitive
+    # to memory corruption (though unlikely here)
+    logits[:batch_size] = torch.randn(batch_size, num_classes, device=device) * 0.1
+    targets[:batch_size] = torch.randint(0, num_classes, (batch_size,), device=device)
+    
+    # Return exactly the expected shapes (framework will allocate loss)
+    return [logits[:batch_size, :], targets[:batch_size]]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P17__relop_replace__7",
+  "kernel_name": "L1_P17",
+  "operator_name": "relop_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant changes the boundary condition from `col < N` to `col <= N`, allowing writes at column index `col = N`. However, in CUDA grid-stride loops, the thread's column index is computed as `col = blockIdx.x * TILE_SIZE + threadIdx.x`. With the original input shape (N=2048) and typical TILE_SIZE values (like 16, 32, 64), N is exactly divisible by TILE_SIZE. This means the maximum computed `col` value is `N - 1`, so the condition `col <= N` behaves identically to `col < N`—no thread ever has `col == N`. Thus, the mutant is semantically equivalent to the original for these specific dimensions.",
+  "killable": true,
+  "kill_strategy": "Use input dimensions where N is NOT a multiple of TILE_SIZE. This ensures that the last block in the x‑direction contains threads with `col = N` (due to overshoot), which the mutant will write to (causing out‑of‑bounds access), while the original kernel correctly excludes them. The exact TILE_SIZE must be known or guessed; common values are 16, 32, 64. Choosing N = 2047 (one less than a power‑of‑two) avoids being a multiple of most tile sizes.",
+  "recommendations": "The test suite should vary input dimensions, not just values, to catch shape‑dependent mutants. Specifically, include shapes where dimensions are not multiples of common tile sizes (e.g., 1023, 2047, 4095) and where they are just above a multiple (e.g., 1025, 2049). The kernel itself is correct, but testing should cover edge‑case shapes to ensure boundary conditions are properly validated.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant changes the boundary condition from `col < N` to `col <= N`, allowing writes at column index `col = N`. However, in CUDA grid-stride loops, the thread's column index is computed as `col = blockIdx.x * TILE_SIZE + threadIdx.x`. With the original input shape (N=2048) and typical TILE_SIZE values (like 16, 32, 64), N is exactly divisible by TILE_SIZE. This means the maximum computed `col` value is `N - 1`, so the condition `col <= N` behaves identically to `col < N`—no thread ever has `col == N`. Thus, the mutant is semantically equivalent to the original for these specific dimensions.",
+      "kill_strategy": "Use input dimensions where N is NOT a multiple of TILE_SIZE. This ensures that the last block in the x‑direction contains threads with `col = N` (due to overshoot), which the mutant will write to (causing out‑of‑bounds access), while the original kernel correctly excludes them. The exact TILE_SIZE must be known or guessed; common values are 16, 32, 64. Choosing N = 2047 (one less than a power‑of‑two) avoids being a multiple of most tile sizes.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    M = 1024\n    K = 4096\n    N = 2047  # Changed to break tile-size alignment\n    # Use random values to ensure non‑zero writes; the values themselves are not critical.\n    A = torch.randn(M, K, device=device, dtype=torch.float32)\n    B = torch.randn(N, K, device=device, dtype=torch.float32)  # Note: shape [2047, 4096]\n    return [A, B]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.175872e+02, mean_diff=2.422097e-02, ref_range=[-3.2816e+02,3.2297e+02], mut_range=[-3.2816e+02,3.2297e+02]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "misaligned_grid_boundary",
+    "rule_description": "Targets kernels that use grid-stride loops with power‑of‑two tile sizes. By setting problem dimensions to be one less than a multiple of common tile sizes (e.g., 16, 32, 64), the last block of threads will compute indices that exactly equal the dimension boundary. This exposes relational-operator mutants (like < → ≤) that cause out‑of‑bounds accesses.",
+    "applicable_operators": [
+      "relop_replace",
+      "relop_negation",
+      "relop_exchange"
+    ],
+    "policy_code": "import torch\nimport numpy as np\n\ndef policy(shape, dtype, device, rng):\n    # This rule assumes the kernel is a matrix multiplication that expects two inputs:\n    #   A of shape (M, K)\n    #   B of shape (N, K)\n    # The critical dimension is N, which controls the column index boundary.\n    \n    # Choose N so it is NOT a multiple of common tile sizes.\n    # 2047 = 2048 - 1, where 2048 is divisible by 16, 32, 64, 128, 256, 512, 1024, 2048.\n    # This ensures that for any of these tile sizes, the last block will have a thread\n    # with column index exactly equal to N.\n    M = 1024\n    K = 4096\n    N = 2047  # critical: one less than a power‑of‑two multiple of common tile sizes\n    \n    # Use random data; exact values are irrelevant as long as they are non‑zero.\n    A = torch.randn(M, K, device=device, dtype=dtype)\n    B = torch.randn(N, K, device=device, dtype=dtype)\n    return [A, B]"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    M = 1024\n    K = 4096\n    N = 2047  # Changed to break tile-size alignment\n    # Use random values to ensure non‑zero writes; the values themselves are not critical.\n    A = torch.randn(M, K, device=device, dtype=torch.float32)\n    B = torch.randn(N, K, device=device, dtype=torch.float32)  # Note: shape [2047, 4096]\n    return [A, B]"
+}

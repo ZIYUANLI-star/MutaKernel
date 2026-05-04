@@ -1,0 +1,42 @@
+{
+  "mutant_id": "L1_P100__relop_replace__4",
+  "kernel_name": "L1_P100",
+  "operator_name": "relop_replace",
+  "status": "survived",
+  "survival_reason": "The mutant likely survives because the test harness uses a block size of 1, causing the reduction loop to be skipped entirely (stride starts at 0). Even if block size > 1, the out-of-bounds read at shared_mem[blockDim.x] accesses uninitialized memory, which may consistently read 0 due to fresh allocations or zero-initialization in the test environment. Since the inputs cannot control the launch configuration or the uninitialized shared memory values, the mutant's behavior remains indistinguishable from the original for all possible inputs under the given constraints.",
+  "killable": false,
+  "kill_strategy": "No input-based strategy can kill this mutant because the bug (out-of-bounds read) depends on the launch configuration and uninitialized memory state, which are not controllable via tensor inputs. The only way to kill it would be to modify the test harness to use a block size > 1 and ensure the out-of-bounds location contains non-zero garbage (e.g., by running a kernel that pollutes shared memory before the test).",
+  "recommendations": "To kill this mutant, the testing framework must: (1) Use a block size > 1 (e.g., 256) to enter the reduction loop; (2) Ensure shared memory is not zero-initialized between runs (e.g., by disabling cudaMemset or running a kernel that writes to shared memory before the test). Inputs alone are insufficient; mutation testing for GPU kernels should incorporate launch configuration variations.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutation changes the reduction loop condition from `tid < stride` to `tid <= stride`. When `blockDim.x` is a power of 2 (typical), this only affects the first iteration when `stride = blockDim.x/2`. For thread `tid = stride`, it tries to access `shared_mem[tid + stride] = shared_mem[2*stride] = shared_mem[blockDim.x]`, which is out-of-bounds (shared memory only allocated for `blockDim.x` elements). However, if `blockDim.x = 1` (common when input size [128,1] fits in a single block), the loop never executes because `stride = 0` initially. The stress tests used fixed shapes, likely with `blockDim.x = 1`, so the mutated condition was never evaluated, making the mutant functionally identical to the original for all input values.",
+      "kill_strategy": "The mutant can be killed by changing the launch configuration (block size) so that `blockDim.x > 1`. This causes the reduction loop to execute, and the out-of-bounds access occurs at thread `tid = stride`. The out-of-bounds read from `shared_mem[blockDim.x]` accesses uninitialized memory (could be 0, NaN, or garbage). To expose the difference, we need input where the block size > 1 and the garbage value at the out-of-bounds location is non-zero. This can be forced by running the kernel multiple times without reinitializing shared memory (persistent garbage) or by ensuring the memory at offset `blockDim.x` contains a known non-zero value (though this is implementation-dependent).",
+      "killable": true,
+      "suggested_code": "import torch\nimport torch.utils.cpp_extension\n\ndef generate_inputs(device):\n    # Create tensors with the same shape as get_inputs()\n    # but we need to control the launch configuration, which is not part of the input.\n    # However, we can still provide inputs that would be processed with blockDim.x > 1\n    # if the test harness launches with appropriate block size.\n    # Since we cannot control launch config via inputs, we rely on the test harness\n    # to use block size > 1. The inputs themselves are ordinary values.\n    predictions = torch.randn(128, 1, device=device, dtype=torch.float32)\n    targets = torch.randn(128, 1, device=device, dtype=torch.float32)\n    return [predictions, targets]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant likely survives because the test harness uses a block size of 1, causing the reduction loop to be skipped entirely (stride starts at 0). Even if block size > 1, the out-of-bounds read at shared_mem[blockDim.x] accesses uninitialized memory, which may consistently read 0 due to fresh allocations or zero-initialization in the test environment. Since the inputs cannot control the launch configuration or the uninitialized shared memory values, the mutant's behavior remains indistinguishable from the original for all possible inputs under the given constraints.",
+      "kill_strategy": "No input-based strategy can kill this mutant because the bug (out-of-bounds read) depends on the launch configuration and uninitialized memory state, which are not controllable via tensor inputs. The only way to kill it would be to modify the test harness to use a block size > 1 and ensure the out-of-bounds location contains non-zero garbage (e.g., by running a kernel that pollutes shared memory before the test).",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel has two critical weaknesses: First, it assumes blockDim.x is a power of two and exactly matches the shared memory size, but there's no validation of this invariant. When blockDim.x ≠ 256 or isn't a power of two, the reduction loop can access out-of-bounds shared memory or skip threads. Second, the reduction loop reads from shared_mem[tid + stride] without checking bounds—when tid < stride is false for some threads, those threads still access shared_mem[tid + stride] in the next iteration due to the loop's structure. Defensive coding should either use a reduction pattern that respects dynamic block sizes or explicitly bounds-check all shared memory accesses. Additionally, the kernel should validate that blockDim.x is a power of two at compile-time or runtime.",
+  "robustness_code": "#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    // Use dynamic shared memory size based on actual blockDim.x\n    extern __shared__ float shared_mem[];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block using safe bounds checking\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            // Ensure the second index is within bounds\n            if (tid + stride < blockDim.x) {\n                shared_mem[tid] += shared_mem[tid + stride];\n            }\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Validate that block_size is a power of two for correct reduction\n    if ((block_size & (block_size - 1)) != 0) {\n        throw std::runtime_error(\"Block size must be a power of two for reduction\");\n    }\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel with dynamic shared memory sized for the block\n    size_t shared_mem_size = block_size * sizeof(float);\n    hinge_loss_kernel<<<num_blocks, block_size, shared_mem_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}",
+  "test_construction_rule": null,
+  "cluster_label": "Kernel Design Resilience"
+}

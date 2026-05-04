@@ -1,0 +1,171 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      75|     
+      76|     if (size == 0) {
+      77|         return output;
+      78|     }
+      79|     
+      80|     // Optimal block size for modern GPUs
+      81|     const int block_size = 256;
+      82|     const int max_blocks = 256;
+      83|     int grid_size = (size + block_size - 1) / block_size;
+      84|     grid_size = grid_size > max_blocks ? max_blocks : grid_size;
+      85|     
+      86|     // Use vectorized kernel for large tensors
+>>>   87|     if (size >= 4096 && (size % 4) == 0) {
+      88|         int vectorized_grid = (size / 4 + block_size - 1) / block_size;
+      89|         vectorized_grid = vectorized_grid > max_blocks ? max_blocks : vectorized_grid;
+      90|         
+      91|         AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "elu_cuda", [&] {
+      92|             elu_kernel_vectorized4<scalar_t><<<vectorized_grid, block_size>>>(
+      93|                 input_contig.data_ptr<scalar_t>(),
+      94|                 output.data_ptr<scalar_t>(),
+      95|                 static_cast<scalar_t>(alpha),
+      96|                 size
+      97|             );
+      98|         });
+      99|     } else {
+```
+
+## Mutated Code (around mutation site)
+```
+      75|     
+      76|     if (size == 0) {
+      77|         return output;
+      78|     }
+      79|     
+      80|     // Optimal block size for modern GPUs
+      81|     const int block_size = 256;
+      82|     const int max_blocks = 256;
+      83|     int grid_size = (size + block_size - 1) / block_size;
+      84|     grid_size = grid_size > max_blocks ? max_blocks : grid_size;
+      85|     
+      86|     // Use vectorized kernel for large tensors
+>>>   87|     if (size >= 4097 && (size % 4) == 0) {
+      88|         int vectorized_grid = (size / 4 + block_size - 1) / block_size;
+      89|         vectorized_grid = vectorized_grid > max_blocks ? max_blocks : vectorized_grid;
+      90|         
+      91|         AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "elu_cuda", [&] {
+      92|             elu_kernel_vectorized4<scalar_t><<<vectorized_grid, block_size>>>(
+      93|                 input_contig.data_ptr<scalar_t>(),
+      94|                 output.data_ptr<scalar_t>(),
+      95|                 static_cast<scalar_t>(alpha),
+      96|                 size
+      97|             );
+      98|         });
+      99|     } else {
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 87
+- Original fragment: `4096`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input tensor shape to have total size 4096 (divisible by 4). At this size, the original condition (size >= 4096) selects the vectorized kernel, while the mutant (size >= 4097) falls back to the non-vectorized kernel. A difference may arise due to floating-point rounding differences between the two kernel implementations (vectorized vs. scalar). Use input values sensitive to rounding: a mix of denormals, zeros, and values near the ELU boundary (x=0) to maximize the chance of divergence.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Shape yielding total size 4096 (divisible by 4)
+    shape = [1, 4096]
+    # Create tensor with mixed values to stress rounding
+    tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+    # Fill with a pattern:
+    # 1. Denormal numbers (subnormals) that may be handled differently
+    denormal = torch.tensor(1.0e-45, dtype=torch.float32, device=device)  # Smallest positive denormal for float32
+    tensor[0, :1024] = denormal  # First quarter: positive denormal
+    tensor[0, 1024:2048] = -denormal  # Second quarter: negative denormal
+    # 2. Exact zeros to test the ELU boundary
+    tensor[0, 2048:3072] = 0.0
+    # 3. Values just above and below zero to trigger different ELU branches
+    tensor[0, 3072:3584] = 1.0e-7  # Small positive
+    tensor[0, 3584:4096] = -1.0e-7  # Small negative
+    # 4. Set a few extreme values to cause overflow/underflow in exp()
+    tensor[0, 0] = -1000.0  # Large negative -> exp(-1000) underflows to 0
+    tensor[0, 1] = 100.0   # Large positive -> no saturation in ELU
+    # Return list of one tensor as expected by forward()
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Test size=4096 with values that cause floating-point exceptions (NaN, infinity) or exploit potential differences in instruction scheduling between vectorized and scalar kernels. Use extremely large values to cause overflow in intermediate calculations, and ensure the values are carefully aligned to memory boundaries to potentially expose cache/access pattern differences.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Shape yielding total size exactly 4096 (divisible by 4)
+    shape = [1, 4096]
+    tensor = torch.zeros(shape, dtype=torch.float32, device=device)
+    
+    # Pattern: Insert special values at vector boundaries (every 4 elements)
+    for i in range(0, 4096, 4):
+        # First element in each vector group: NaN
+        tensor[0, i] = float('nan')
+        # Second element: Positive infinity
+        tensor[0, i+1] = float('inf')
+        # Third element: Negative infinity
+        tensor[0, i+2] = -float('inf')
+        # Fourth element: Extreme value causing exp() overflow
+        tensor[0, i+3] = 1000.0  # exp(1000) overflows to inf
+    
+    # Additionally, set a few specific indices to test edge cases:
+    # Index 0: -0.0 (signed zero)
+    tensor[0, 0] = -0.0
+    # Index 1: Smallest positive denormal
+    tensor[0, 1] = torch.tensor(1.0e-45, dtype=torch.float32, device=device)
+    # Index 2: Largest positive normal * 2 (overflow to inf)
+    tensor[0, 2] = 3.5e38
+    
+    # Last vector group: Values that might trigger different rounding
+    # in vectorized vs scalar exp() implementations
+    tensor[0, 4092] = -87.0  # exp(-87) ~ 1.2e-38 (near underflow)
+    tensor[0, 4093] = -88.0  # exp(-88) ~ 6.1e-39 (might underflow to 0)
+    tensor[0, 4094] = 0.0    # Exact zero
+    tensor[0, 4095] = -0.0   # Negative zero
+    
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

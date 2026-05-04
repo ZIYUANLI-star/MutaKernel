@@ -1,0 +1,112 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      32|     }
+      33|     
+      34|     // First thread writes block sum to global memory
+      35|     if (tid == 0) {
+      36|         loss[blockIdx.x] = shared_mem[0];
+      37|     }
+      38| }
+      39| 
+      40| torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+      41|     auto size = predictions.numel();
+      42|     
+      43|     const int block_size = 256;
+>>>   44|     const int num_blocks = (size + block_size - 1) / block_size;
+      45|     
+      46|     // Allocate device memory for block sums
+      47|     auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));
+      48|     
+      49|     // Launch kernel
+      50|     hinge_loss_kernel<<<num_blocks, block_size>>>(
+      51|         predictions.data_ptr<float>(),
+      52|         targets.data_ptr<float>(),
+      53|         block_sums.data_ptr<float>(),
+      54|         size
+      55|     );
+      56|     
+```
+
+## Mutated Code (around mutation site)
+```
+      32|     }
+      33|     
+      34|     // First thread writes block sum to global memory
+      35|     if (tid == 0) {
+      36|         loss[blockIdx.x] = shared_mem[0];
+      37|     }
+      38| }
+      39| 
+      40| torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+      41|     auto size = predictions.numel();
+      42|     
+      43|     const int block_size = 256;
+>>>   44|     const int num_blocks = (size + block_size + 1) / block_size;
+      45|     
+      46|     // Allocate device memory for block sums
+      47|     auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));
+      48|     
+      49|     // Launch kernel
+      50|     hinge_loss_kernel<<<num_blocks, block_size>>>(
+      51|         predictions.data_ptr<float>(),
+      52|         targets.data_ptr<float>(),
+      53|         block_sums.data_ptr<float>(),
+      54|         size
+      55|     );
+      56|     
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 44
+- Original fragment: `-`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 1], dtype=torch.float32
+  arg[1]: shape=[128, 1], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input size so that the ceiling division formula yields a different number of blocks between original and mutant. Specifically, choose size such that (size + block_size) is exactly divisible by block_size, causing the original formula to produce N blocks while mutant produces N+1 blocks. With extra blocks, the mutant kernel will launch additional threads that process out-of-bounds elements (if boundary checks are incomplete) or write extra zeros to block_sums, altering the final reduction result.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Use size=256 (multiple of block_size=256) to trigger block count difference
+    # Shape [256, 1] gives 256 elements total
+    predictions = torch.tensor([[1.0], [-1.0]] * 128, dtype=torch.float32, device=device)
+    targets = torch.tensor([[1.0], [-1.0]] * 128, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

@@ -1,0 +1,115 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      97|         const int block_size = 256;
+      98|         int grid_size = (size + block_size * VEC_SIZE - 1) / (block_size * VEC_SIZE);
+      99|         
+     100|         softplus_vectorized_kernel<float, VEC_SIZE><<<grid_size, block_size>>>(
+     101|             input.data_ptr<float>(),
+     102|             output.data_ptr<float>(),
+     103|             size,
+     104|             beta
+     105|         );
+     106|     } else if (input.scalar_type() == torch::kFloat16) {
+     107|         const int VEC_SIZE = 8;
+     108|         const int block_size = 256;
+>>>  109|         int grid_size = (size + block_size * VEC_SIZE - 1) / (block_size * VEC_SIZE);
+     110|         
+     111|         softplus_vectorized_kernel<half, VEC_SIZE><<<grid_size, block_size>>>(
+     112|             reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+     113|             reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+     114|             size,
+     115|             beta
+     116|         );
+     117|     } else {
+     118|         AT_ERROR("Unsupported data type for softplus_cuda");
+     119|     }
+     120|     
+     121|     return output;
+```
+
+## Mutated Code (around mutation site)
+```
+      97|         const int block_size = 256;
+      98|         int grid_size = (size + block_size * VEC_SIZE - 1) / (block_size * VEC_SIZE);
+      99|         
+     100|         softplus_vectorized_kernel<float, VEC_SIZE><<<grid_size, block_size>>>(
+     101|             input.data_ptr<float>(),
+     102|             output.data_ptr<float>(),
+     103|             size,
+     104|             beta
+     105|         );
+     106|     } else if (input.scalar_type() == torch::kFloat16) {
+     107|         const int VEC_SIZE = 8;
+     108|         const int block_size = 256;
+>>>  109|         int grid_size = (size + block_size / VEC_SIZE - 1) / (block_size * VEC_SIZE);
+     110|         
+     111|         softplus_vectorized_kernel<half, VEC_SIZE><<<grid_size, block_size>>>(
+     112|             reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+     113|             reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+     114|             size,
+     115|             beta
+     116|         );
+     117|     } else {
+     118|         AT_ERROR("Unsupported data type for softplus_cuda");
+     119|     }
+     120|     
+     121|     return output;
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 109
+- Original fragment: `*`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use a tensor size where `size % (block_size * VEC_SIZE)` is non-zero and specifically where the remainder causes the mutant's grid size to be one less than the original. This happens when `size = N*2048 + r` with `1 ≤ r ≤ 2016`. At r=2017, both would round up again. Choose r=1 (size=2049) to maximize the difference: original grid=2 blocks, mutant grid=1 block. The mutant will under-launch blocks, leaving the last 1 element unprocessed in output.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Create float16 tensor with size 2049 elements
+    # Shape [1, 2049] gives total size 2049
+    size = 2049
+    x = torch.randn(size, device=device, dtype=torch.float16).reshape(1, -1)
+    # Set last element to a distinctive value for easy detection
+    x[0, -1] = 1000.0  # Large value for clear softplus difference
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

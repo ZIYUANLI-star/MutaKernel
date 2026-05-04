@@ -1,0 +1,115 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      31|     
+      32|     if (idx < size) {
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      36|         T tanh_val = fast_tanh<T>(inner);
+      37|         output[idx] = T(0.5f) * x * (T(1.0f) + tanh_val);
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+>>>   43|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      44|     
+      45|     if (idx < size) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+      50|         output[idx] = __float2half(0.5f * x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+```
+
+## Mutated Code (around mutation site)
+```
+      31|     
+      32|     if (idx < size) {
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      36|         T tanh_val = fast_tanh<T>(inner);
+      37|         output[idx] = T(0.5f) * x * (T(1.0f) + tanh_val);
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+>>>   43|     int idx = blockIdx.x * blockDim.z + threadIdx.x;
+      44|     
+      45|     if (idx < size) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+      50|         output[idx] = __float2half(0.5f * x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 43
+- Original fragment: `blockDim.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[2000, 2000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: We need to change the launch configuration such that blockDim.z ≠ blockDim.x. This can be achieved by using a 3D grid where blockDim.z is explicitly set to a value different from blockDim.x. Since we cannot directly control kernel launch parameters in the test, we must vary input shape to force a different launch configuration. Specifically, we need a shape where the kernel's caller uses a 3D block with blockDim.z > 1. We'll create a tensor with dimensions that are likely to trigger a 3D block (e.g., large 3D shape). The PyTorch CUDA kernel launcher may use 3D blocks for large tensors, but we can't guarantee. However, we can manually test by launching the kernel directly with specific block dimensions - but the test framework likely uses a standard launcher. Instead, we choose a shape with size not divisible by typical blockDim.x (256), and small enough to trigger a different block configuration, but we must ensure blockDim.z is explicitly set in the kernel launch. Since we can't control that, we instead rely on the fact that if the total threads per block is less than the input size, the kernel will launch with multiple blocks, and the index calculation difference will manifest when blockIdx.x * blockDim.z wraps incorrectly. To expose this, we need an input size that is NOT a multiple of blockDim.x, and where blockDim.z is different. We'll assume the kernel launcher uses dim3 block(256,1,1) - so blockDim.z=1. To kill, we must change the block configuration, which requires modifying the kernel launch code, not just input. But since we can't modify launch, we must rely on the possibility that for certain shapes, the launcher might use a different blockDim.z. This is unlikely. However, we can still kill by using a shape where the grid dimension calculation causes blockIdx.x to overflow when multiplied by blockDim.z. If we make the input size smaller than the block size, then only one block is launched (gridDim.x=1). Then idx = 0*blockDim.z + threadIdx.x = threadIdx.x, which is the same as original (0*blockDim.x + threadIdx.x) because both multiplications are zero. So we need multiple blocks. Let's choose size = 257 with blockDim.x=256, gridDim.x=2. Then original: threads 0-255: idx = 0*256+threadIdx.x = threadIdx.x (0-255); threads 256-511: idx=1*256+threadIdx.x = 256+threadIdx.x (256-511). Mutant: threads 0-255: idx=0*1+threadIdx.x = threadIdx.x (0-255); threads 256-511: idx=1*1+threadIdx.x = 1+threadIdx.x (257-512). The mutant's second block writes to indices 257-512, while original writes to 256-511. The index 256 is written by original but not mutant, index 512 is written by mutant but out-of-bounds (if size=257, idx>=257 are skipped). So output at index 256 will differ. We'll use size=257 with random values to ensure difference.
+- Suggested code:
+```python
+import torch
+import math
+def generate_inputs(device):
+    # Shape [257, 1] gives total 257 elements, which with blockDim.x=256 requires 2 blocks.
+    # This will expose the index miscalculation in the second block.
+    shape = [257, 1]
+    # Random values to ensure non-constant output
+    tensor = torch.randn(shape, device=device, dtype=torch.float32)
+    # Ensure no extreme values that might cause NaN/inf, but keep variability
+    tensor = tensor.clamp(-10.0, 10.0)
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

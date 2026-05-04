@@ -1,0 +1,1714 @@
+{
+  "kernel": {
+    "problem_id": 47,
+    "level": 1,
+    "problem_name": "L1_P47",
+    "language": "cuda"
+  },
+  "summary": {
+    "total": 13,
+    "killed": 7,
+    "survived": 3,
+    "stillborn": 0,
+    "strict_equivalent": 0,
+    "candidate_equivalent": 3,
+    "equivalent": 3,
+    "mutation_score": 0.5385,
+    "mutation_score_optimistic": 0.7,
+    "score_by_category": {
+      "A": 0.6667,
+      "B": 0.4286,
+      "C": 0.0,
+      "D": 0.0
+    }
+  },
+  "mutants": [
+    {
+      "id": "L1_P47__arith_replace__1",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L22",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 830.8045864105225,
+      "site": {
+        "line_start": 22,
+        "line_end": 22,
+        "original_code": "+",
+        "node_type": "cuda_Add"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x - threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)"
+    },
+    {
+      "id": "L1_P47__arith_replace__9",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L57",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 823.2994079589844,
+      "site": {
+        "line_start": 57,
+        "line_end": 57,
+        "original_code": "+",
+        "node_type": "cuda_Add"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim - 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)"
+    },
+    {
+      "id": "L1_P47__arith_replace__4",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L26",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 734.6436977386475,
+      "site": {
+        "line_start": 26,
+        "line_end": 26,
+        "original_code": "*",
+        "node_type": "cuda_Mult"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size / inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)"
+    },
+    {
+      "id": "L1_P47__relop_replace__2",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L30",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 881.671667098999,
+      "site": {
+        "line_start": 30,
+        "line_end": 30,
+        "original_code": "<",
+        "node_type": "cuda_Lt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx <= reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)"
+    },
+    {
+      "id": "L1_P47__relop_replace__5",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L44",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 1158.722162246704,
+      "site": {
+        "line_start": 44,
+        "line_end": 44,
+        "original_code": ">=",
+        "node_type": "cuda_GtE"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim > ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "equiv_detail": {
+        "mutant_id": "L1_P47__relop_replace__5",
+        "operator": "relop_replace",
+        "line_start": 44,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P47",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/47_Sum_reduction_over_a_dimension.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "eb2e19352c373b19",
+          "cuda_norm_hash_mut": "567cebe52da2044f",
+          "py_norm_hash_orig": "6becf13bd9ff876c",
+          "py_norm_hash_mut": "e0c13c2ace8e5e2a",
+          "mutation_site_line": 44,
+          "original_fragment": ">=",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 27,
+              "original": "if (dim < 0 || dim >= ndim) {",
+              "mutated": "if (dim < 0 || dim > ndim) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": false,
+          "equiv_runs": 100,
+          "operator_name": "relop_replace",
+          "time_ms": 600134,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [],
+          "tested_policies": [],
+          "total_rounds": 0,
+          "first_input_summary": null,
+          "last_input_summary": null,
+          "error": "worker_timeout_or_crash",
+          "divergence": {},
+          "verdict": "not_equivalent"
+        },
+        "decided_at": "layer2"
+      }
+    },
+    {
+      "id": "L1_P47__relop_replace__1",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L24",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation changes the boundary condition from `inner_idx >= inner_size` to `inner_idx > inner_size`. This allows threads with `inner_idx == inner_size` to execute the kernel body when they should h",
+      "kill_input_seed": null,
+      "execution_time_ms": 1162.6665592193604,
+      "site": {
+        "line_start": 24,
+        "line_end": 24,
+        "original_code": ">=",
+        "node_type": "cuda_GtE"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx > inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "equiv_detail": {
+        "mutant_id": "L1_P47__relop_replace__1",
+        "operator": "relop_replace",
+        "line_start": 24,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P47",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/47_Sum_reduction_over_a_dimension.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "eb2e19352c373b19",
+          "cuda_norm_hash_mut": "3873a9b3cee0b80f",
+          "py_norm_hash_orig": "6becf13bd9ff876c",
+          "py_norm_hash_mut": "2fb38ee20d1080ff",
+          "mutation_site_line": 24,
+          "original_fragment": ">=",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 15,
+              "original": "if (outer_idx >= outer_size || inner_idx >= inner_size) return;",
+              "mutated": "if (outer_idx >= outer_size || inner_idx > inner_size) return;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "relop_replace",
+          "time_ms": 4890,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.793313980102539,
+                "mean": -0.0003390001365914941,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4866.79345703125,
+                "max": 5496.4072265625,
+                "mean": -1.677351474761963,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation changes the boundary condition from `inner_idx >= inner_size` to `inner_idx > inner_size`. This allows threads with `inner_idx == inner_size` to execute the kernel body when they should have returned. Since `inner_idx` ranges from 0 to `(inner_size + threads_per_block - 1)/threads_per_block * threads_per_block - 1`, there will be threads with `inner_idx == inner_size` when `inner_size` is not a multiple of `threads_per_block`. With the fixed shape [16, 256, 256] and reduction dimension 1, `inner_size = 256`. Since `threads_per_block = 256`, `inner_size` is exactly divisible, so no out-of-bounds threads are launched. However, if we change the reduction dimension to 0 or 2, `inner_size` becomes 256*256=65536 or 16*256=4096 respectively, neither divisible by 256, creating threads with `inner_idx == inner_size` that will incorrectly execute.",
+          "kill_strategy": "Change the reduction dimension to 0 or 2 while keeping the same tensor shape [16, 256, 256]. This changes `inner_size` to a value not divisible by 256, causing threads with `inner_idx == inner_size` to execute and potentially write out-of-bounds or compute with invalid memory accesses.",
+          "suggested_test": {
+            "description": "Test with reduction dimension 0 (instead of 1) to make inner_size = 65536, which is not divisible by 256. This will launch threads with inner_idx = 65536 that should return but instead execute the kernel body.",
+            "python_code": "def generate_inputs(device):\n    # Same shape [16, 256, 256]\n    shape = [16, 256, 256]\n    # But reduce over dimension 0 instead of 1\n    # Create random input values\n    x = torch.randn(shape, device=device, dtype=torch.float32)\n    return (x, 0)  # Note: forward() expects tensor and dim"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation changes the boundary condition from `inner_idx >= inner_size` to `inner_idx > inner_size`. This allows threads with `inner_idx == inner_size` to execute the kernel body when they should have returned. Since `inner_idx` ranges from 0 to `(inner_size + threads_per_block - 1)/threads_per_block * threads_per_block - 1`, there will be threads with `inner_idx == inner_size` when `inner_size` is not a multiple of `threads_per_block`. With the fixed shape [16, 256, 256] and reduction dimension 1, `inner_size = 256`. Since `threads_per_block = 256`, `inner_size` is exactly divisible, so no out-of-bounds threads are launched. However, if we change the reduction dimension to 0 or 2, `inner_size` becomes 256*256=65536 or 16*256=4096 respectively, neither divisible by 256, creating threads with `inner_idx == inner_size` that will incorrectly execute.\",\n  \"kill_strategy\": \"Change the reduction dimension to",
+          "time_ms": 40411,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: relop_replace\n- All runs bitwise identical: **True**\n- Time taken: 4890ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P47__index_replace__2",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L22",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 1063.0693435668945,
+      "site": {
+        "line_start": 22,
+        "line_end": 22,
+        "original_code": "blockIdx.y",
+        "node_type": "cuda_dim|x"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.x * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)"
+    },
+    {
+      "id": "L1_P47__index_replace__6",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L22",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 1037.4200344085693,
+      "site": {
+        "line_start": 22,
+        "line_end": 22,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.y;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)"
+    },
+    {
+      "id": "L1_P47__index_replace__3",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L22",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3633ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 887.0158195495605,
+      "site": {
+        "line_start": 22,
+        "line_end": 22,
+        "original_code": "blockIdx.y",
+        "node_type": "cuda_dim|z"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.z * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "equiv_detail": {
+        "mutant_id": "L1_P47__index_replace__3",
+        "operator": "index_replace",
+        "line_start": 22,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P47",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/47_Sum_reduction_over_a_dimension.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "eb2e19352c373b19",
+          "cuda_norm_hash_mut": "49cc3720775da579",
+          "py_norm_hash_orig": "6becf13bd9ff876c",
+          "py_norm_hash_mut": "3b76c2f11708d437",
+          "mutation_site_line": 22,
+          "original_fragment": "blockIdx.y",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 14,
+              "original": "const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;",
+              "mutated": "const int inner_idx = blockIdx.z * blockDim.x + threadIdx.x;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "index_replace",
+          "time_ms": 3633,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.793313980102539,
+                "mean": -0.0003390001365914941,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4.866793632507324,
+                "max": 10000.0,
+                "mean": 0.007858924567699432,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes `blockIdx.y` to `blockIdx.z` in the kernel's inner_idx calculation. However, examining the kernel launch configuration shows `dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block)` - only the x and y dimensions of the grid are set; z is implicitly 1. Since `blockIdx.z` is always 0 for all launched blocks, the mutant's `inner_idx = 0 * blockDim.x + threadIdx.x = threadIdx.x`, which is identical to the original's calculation when `blockIdx.y = 0`. The original kernel only uses blockIdx.y for the second grid dimension, which is exactly what's configured. Therefore, the mutant is functionally identical to the original for all possible input values within the fixed shape constraints.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes `blockIdx.y` to `blockIdx.z` in the kernel's inner_idx calculation. However, examining the kernel launch configuration shows `dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block)` - only the x and y dimensions of the grid are set; z is implicitly 1. Since `blockIdx.z` is always 0 for all launched blocks, the mutant's `inner_idx = 0 * blockDim.x + threadIdx.x = threadIdx.x`, which is identical to the original's calculation when `blockIdx.y = 0`. The original kernel only uses blockIdx.y for the second grid dimension, which is exactly what's configured. Therefore, the mutant is functionally identical to the original for all possible input values within the fixed shape constraints.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}\n```",
+          "time_ms": 18192,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: index_replace\n- All runs bitwise identical: **True**\n- Time taken: 3633ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P47__mask_boundary__2",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L24",
+      "status": "survived",
+      "error_message": "LLM rejected equiv (was candidate_equivalent, conf=0.95): The mutation changes the boundary check from 'inner_idx >= inner_size' to 'inner_idx > inner_size'. This allows threads with inner_idx == inner_size to execute the kernel body when they should have re",
+      "kill_input_seed": null,
+      "execution_time_ms": 864.661455154419,
+      "site": {
+        "line_start": 24,
+        "line_end": 24,
+        "original_code": "inner_idx >= inner_size",
+        "node_type": "ge>"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx > inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "equiv_detail": {
+        "mutant_id": "L1_P47__mask_boundary__2",
+        "operator": "mask_boundary",
+        "line_start": 24,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P47",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/47_Sum_reduction_over_a_dimension.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "eb2e19352c373b19",
+          "cuda_norm_hash_mut": "3873a9b3cee0b80f",
+          "py_norm_hash_orig": "6becf13bd9ff876c",
+          "py_norm_hash_mut": "2fb38ee20d1080ff",
+          "mutation_site_line": 24,
+          "original_fragment": "inner_idx >= inner_size",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 15,
+              "original": "if (outer_idx >= outer_size || inner_idx >= inner_size) return;",
+              "mutated": "if (outer_idx >= outer_size || inner_idx > inner_size) return;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "mask_boundary",
+          "time_ms": 3562,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.793313980102539,
+                "mean": -0.0003390001365914941,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4866.79345703125,
+                "max": 5496.4072265625,
+                "mean": -1.677351474761963,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer3",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "possibly_killable",
+          "confidence": 0.95,
+          "reasoning": "The mutation changes the boundary check from 'inner_idx >= inner_size' to 'inner_idx > inner_size'. This allows threads with inner_idx == inner_size to execute the kernel body when they should have returned early. Since inner_idx is calculated as blockIdx.y * blockDim.x + threadIdx.x, and the grid is configured with blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block), there will be threads where inner_idx == inner_size when inner_size is not a multiple of threads_per_block. These threads will perform out-of-bounds memory accesses at input_ptr[reduce_idx * inner_size] and write to output[outer_idx * inner_size + inner_size], causing undefined behavior. Layer 2's random value tests may have missed this because the out-of-bounds accesses could read/write memory that happens to contain zeros or values that don't affect the final output comparison.",
+          "kill_strategy": "Create inputs where the memory immediately after the allocated tensors contains non-zero values that would be read by the out-of-bounds accesses, or where the out-of-bounds writes corrupt other data that affects the final output. Use a tensor size where inner_size is not a multiple of threads_per_block (256) to ensure threads with inner_idx == inner_size exist.",
+          "suggested_test": {
+            "description": "Test with inner_size = 257 (not a multiple of 256) to ensure threads with inner_idx == inner_size execute. Fill input tensor with distinct values and allocate extra memory after it to detect out-of-bounds reads.",
+            "python_code": "def generate_inputs(device):\n    # inner_size = 257 ensures threads with inner_idx == inner_size exist\n    # because (257 + 255) // 256 = 2 blocks, with threads 0-255 in block 0 and 256-511 in block 1\n    # thread with inner_idx=257 will execute in the mutant but not in original\n    shape = (16, 256, 257)  # outer=16, reduce=256, inner=257\n    \n    # Create input with pattern that makes out-of-bounds reads noticeable\n    input_tensor = torch.zeros(shape, device=device, dtype=torch.float32)\n    \n    # Fill with pattern: each element = 1000*outer + 100*reduce + inner\n    for o in range(shape[0]):\n        for r in range(shape[1]):\n            for i in range(shape[2]):\n                input_tensor[o, r, i] = o * 1000.0 + r * 100.0 + i\n    \n    # Allocate extra memory after input to detect out-of-bounds reads\n    # This simulates what might happen in real scenarios\n    extra_mem = torch.randn(1000, device=device, dtype=torch.float32)\n    \n    return (input_tensor,)"
+          },
+          "raw_response": "```json\n{\n  \"verdict\": \"possibly_killable\",\n  \"confidence\": 0.95,\n  \"reasoning\": \"The mutation changes the boundary check from 'inner_idx >= inner_size' to 'inner_idx > inner_size'. This allows threads with inner_idx == inner_size to execute the kernel body when they should have returned early. Since inner_idx is calculated as blockIdx.y * blockDim.x + threadIdx.x, and the grid is configured with blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block), there will be threads where inner_idx == inner_size when inner_size is not a multiple of threads_per_block. These threads will perform out-of-bounds memory accesses at input_ptr[reduce_idx * inner_size] and write to output[outer_idx * inner_size + inner_size], causing undefined behavior. Layer 2's random value tests may have missed this because the out-of-bounds accesses could read/write memory that happens to contain zeros or values that don't affect the final output comparison.\",\n  \"kill_strategy\": \"Create inputs w",
+          "time_ms": 51532,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: mask_boundary\n- All runs bitwise identical: **True**\n- Time taken: 3562ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "reverted to SURVIVED (was candidate_equivalent)"
+        }
+      }
+    },
+    {
+      "id": "L1_P47__mask_boundary__1",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L24",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3905ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 746.7567920684814,
+      "site": {
+        "line_start": 24,
+        "line_end": 24,
+        "original_code": "outer_idx >= outer_size",
+        "node_type": "ge_rhs+1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size + 1 || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "equiv_detail": {
+        "mutant_id": "L1_P47__mask_boundary__1",
+        "operator": "mask_boundary",
+        "line_start": 24,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P47",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/47_Sum_reduction_over_a_dimension.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "eb2e19352c373b19",
+          "cuda_norm_hash_mut": "21c5492ecc8df7a1",
+          "py_norm_hash_orig": "6becf13bd9ff876c",
+          "py_norm_hash_mut": "508bcbbe2fe1ada8",
+          "mutation_site_line": 24,
+          "original_fragment": "outer_idx >= outer_size",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 15,
+              "original": "if (outer_idx >= outer_size || inner_idx >= inner_size) return;",
+              "mutated": "if (outer_idx >= outer_size + 1 || inner_idx >= inner_size) return;"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "mask_boundary",
+          "time_ms": 3905,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.793313980102539,
+                "mean": -0.0003390001365914941,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4866.79345703125,
+                "max": 5496.4072265625,
+                "mean": -1.677351474761963,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the boundary check from `outer_idx >= outer_size` to `outer_idx >= outer_size + 1`. However, the kernel launch configuration `dim3 blocks(outer_size, ...)` ensures that `blockIdx.x` (which becomes `outer_idx`) ranges from 0 to `outer_size-1`. Since `outer_idx` is always less than `outer_size`, the condition `outer_idx >= outer_size + 1` is always false. Therefore, the mutated guard never triggers, and all threads execute exactly as in the original kernel. This is a dead code mutation that cannot affect execution regardless of input values, as the grid dimensions are computed from the fixed input tensor shape.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the boundary check from `outer_idx >= outer_size` to `outer_idx >= outer_size + 1`. However, the kernel launch configuration `dim3 blocks(outer_size, ...)` ensures that `blockIdx.x` (which becomes `outer_idx`) ranges from 0 to `outer_size-1`. Since `outer_idx` is always less than `outer_size`, the condition `outer_idx >= outer_size + 1` is always false. Therefore, the mutated guard never triggers, and all threads execute exactly as in the original kernel. This is a dead code mutation that cannot affect execution regardless of input values, as the grid dimensions are computed from the fixed input tensor shape.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}\n```",
+          "time_ms": 15031,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: mask_boundary\n- All runs bitwise identical: **True**\n- Time taken: 3905ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P47__mask_boundary__5",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L44",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 4150ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 662.9638671875,
+      "site": {
+        "line_start": 44,
+        "line_end": 44,
+        "original_code": "dim >= ndim",
+        "node_type": "ge_rhs+1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim + 1) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "equiv_detail": {
+        "mutant_id": "L1_P47__mask_boundary__5",
+        "operator": "mask_boundary",
+        "line_start": 44,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P47",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/47_Sum_reduction_over_a_dimension.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "eb2e19352c373b19",
+          "cuda_norm_hash_mut": "7d30cefc1f71177a",
+          "py_norm_hash_orig": "6becf13bd9ff876c",
+          "py_norm_hash_mut": "03b6bea9c9aed380",
+          "mutation_site_line": 44,
+          "original_fragment": "dim >= ndim",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 27,
+              "original": "if (dim < 0 || dim >= ndim) {",
+              "mutated": "if (dim < 0 || dim >= ndim + 1) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "mask_boundary",
+          "time_ms": 4150,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "head_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "tail_heavy",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.793313980102539,
+                "mean": -0.0003390001365914941,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  256,
+                  256
+                ],
+                "dtype": "torch.float32",
+                "min": -4866.79345703125,
+                "max": 5496.4072265625,
+                "mean": -1.677351474761963,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the boundary check from `dim >= ndim` to `dim >= ndim + 1`. For the fixed input shape [16, 256, 256] (ndim=3), the only way to trigger this exception is if `dim` equals 3 after the `if (dim < 0) dim += ndim` adjustment. However, with ndim=3, valid dim values after adjustment are 0, 1, or 2. The condition `dim >= ndim + 1` (i.e., `dim >= 4`) can never be satisfied because after adjustment, dim is guaranteed to be in the range [-2, 2] when dim < 0, or [0, 2] when dim ≥ 0. The mutation therefore creates a dead condition that is unreachable for any valid input dimension given the fixed shape. Layer 2's 100+ random value tests correctly found no difference because the execution path is identical.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "```json\n{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the boundary check from `dim >= ndim` to `dim >= ndim + 1`. For the fixed input shape [16, 256, 256] (ndim=3), the only way to trigger this exception is if `dim` equals 3 after the `if (dim < 0) dim += ndim` adjustment. However, with ndim=3, valid dim values after adjustment are 0, 1, or 2. The condition `dim >= ndim + 1` (i.e., `dim >= 4`) can never be satisfied because after adjustment, dim is guaranteed to be in the range [-2, 2] when dim < 0, or [0, 2] when dim ≥ 0. The mutation therefore creates a dead condition that is unreachable for any valid input dimension given the fixed shape. Layer 2's 100+ random value tests correctly found no difference because the execution path is identical.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}\n```",
+          "time_ms": 21101,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: mask_boundary\n- All runs bitwise identical: **True**\n- Time taken: 4150ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P47__launch_config_mutate__0",
+      "operator_name": "launch_config_mutate",
+      "operator_category": "B",
+      "description": "Perturb grid/block sizing expressions (// BLOCK, triton.cdiv) by ±1 @ L75",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 720.5111980438232,
+      "site": {
+        "line_start": 75,
+        "line_end": 75,
+        "original_code": "(inner_size + threads_per_block - 1) / threads_per_block",
+        "node_type": "-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized sum reduction with keepdim=True\nsum_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <stdio.h>\n\ntemplate<typename scalar_t>\n__global__ void sum_reduction_kernel(\n    const scalar_t* input,\n    scalar_t* output,\n    const int outer_size,\n    const int reduce_size,\n    const int inner_size\n) {\n    // Each thread handles one element in the output\n    const int outer_idx = blockIdx.x;\n    const int inner_idx = blockIdx.y * blockDim.x + threadIdx.x;\n    \n    if (outer_idx >= outer_size || inner_idx >= inner_size) return;\n    \n    const scalar_t* input_ptr = input + outer_idx * reduce_size * inner_size + inner_idx;\n    scalar_t sum = 0;\n    \n    // Sequential reduction across reduce dimension\n    for (int reduce_idx = 0; reduce_idx < reduce_size; reduce_idx++) {\n        sum += input_ptr[reduce_idx * inner_size];\n    }\n    \n    output[outer_idx * inner_size + inner_idx] = sum;\n}\n\ntorch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {\n    // Get tensor dimensions\n    auto sizes = input.sizes();\n    int ndim = input.dim();\n    \n    // Validate dimension\n    if (dim < 0) dim += ndim;\n    if (dim < 0 || dim >= ndim) {\n        throw std::runtime_error(\"Invalid reduction dimension\");\n    }\n    \n    // Calculate sizes for the reduction\n    int outer_size = 1;\n    for (int i = 0; i < dim; i++) {\n        outer_size *= sizes[i];\n    }\n    \n    int reduce_size = sizes[dim];\n    \n    int inner_size = 1;\n    for (int i = dim + 1; i < ndim; i++) {\n        inner_size *= sizes[i];\n    }\n    \n    // Prepare output tensor with keepdim=True\n    std::vector<int64_t> output_sizes;\n    for (int i = 0; i < ndim; i++) {\n        if (i == dim) {\n            output_sizes.push_back(1);\n        } else {\n            output_sizes.push_back(sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Launch kernel configuration\n    const int threads_per_block = 256;\n    dim3 blocks(outer_size, (inner_size + threads_per_block - 1) / threads_per_block - 1);\n    \n    // Dispatch based on data type\n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), \"sum_reduction_cuda\", [&] {\n        sum_reduction_kernel<scalar_t><<<blocks, threads_per_block>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            outer_size,\n            reduce_size,\n            inner_size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nsum_reduction_cpp_source = \"torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim);\"\n\n# Compile the inline CUDA code\nsum_reduction = load_inline(\n    name=\"sum_reduction\",\n    cpp_sources=sum_reduction_cpp_source,\n    cuda_sources=sum_reduction_source,\n    functions=[\"sum_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs sum reduction over a specified dimension\n    using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): Dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.sum_reduction = sum_reduction\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies optimized sum reduction over the specified dimension.\n\n        Args:\n            x (torch.Tensor): Input tensor of shape (..., dim, ...).\n\n        Returns:\n            torch.Tensor: Output tensor after sum reduction, shape (..., 1, ...).\n        \"\"\"\n        if x.is_cuda:\n            return self.sum_reduction.sum_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.sum(x, dim=self.dim, keepdim=True)"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "mutant_id": "L1_P17__arith_replace__7",
+  "kernel_name": "L1_P17",
+  "operator_name": "arith_replace",
+  "status": "survived",
+  "survival_reason": "Previous attempts failed likely because the mutant's out-of-bounds memory access read uncontrolled or zero values, causing no observable difference in output. The mutant condition (t / TILE_SIZE + threadIdx.x) < K is true for many threads where the original (t * TILE_SIZE + threadIdx.x) < K is false, leading to loads from out-of-bounds indices. If those out-of-bounds reads return zero or garbage that doesn't affect the final dot product, the mutant survives. To kill it, we must ensure the out-of-bounds index lands within allocated memory (e.g., in the next row) and contains a non-zero value that affects the output via a non-zero corresponding B element.",
+  "killable": true,
+  "kill_strategy": "Force the mutant to load a non-zero value from the next row of A when the original would zero-pad, while ensuring the corresponding B value is non-zero. Choose small M, N, and K such that for a specific tile and thread, the original condition fails (index >= K) but the mutant condition holds, and the index points to a controlled location in the second row of A. Set B's second row to non-zero so the product differs.",
+  "recommendations": "When designing tests for memory-bound mutations, ensure out-of-bounds accesses land in controlled memory regions (e.g., adjacent rows) and that the affected computations propagate to observable outputs. Use small matrices to isolate specific threads and tiles, and choose K not a multiple of TILE_SIZE to create partial tiles, but also ensure the out-of-bounds index is valid within the overall allocation.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survives because the original input shape (K=4096) is a multiple of the typical TILE_SIZE (e.g., 16, 32, 64). For such 'perfectly aligned' shapes, both the original condition `(t * TILE_SIZE + threadIdx.x) < K` and the mutated condition `(t / TILE_SIZE + threadIdx.x) < K` evaluate to true for all valid threads throughout the tiled loop. This happens because: (1) The original condition ensures each tile's column index stays within bounds; (2) The mutated condition `t/TILE_SIZE` grows very slowly (max ~K/TILE_SIZE²) and combined with `threadIdx.x` (≤TILE_SIZE-1) remains far less than K (4096). Thus, no thread ever takes the zero-padding branch, making the mutant behavior identical.",
+      "kill_strategy": "Change the input shape so that K is NOT a multiple of TILE_SIZE (e.g., K=33). This creates a partially filled last tile where the original condition `(t*TILE_SIZE + threadIdx.x) < K` becomes false for some threads, forcing zero-padding. The mutated condition `(t/TILE_SIZE + threadIdx.x) < K` remains true for all threads, causing out-of-bounds memory access. For row-major layout, this reads values from the next row of A, producing different numerical results.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use K=33 (not a multiple of common tile sizes 16,32,64)\n    M, K, N = 2, 33, 2\n    # Create A with distinct values per row: row0 = [0..32], row1 = [100..132]\n    A = torch.arange(M * K, dtype=torch.float32, device=device).reshape(M, K)\n    A[1] += 100  # Row 1: 100,101,...,132\n    # B can be any matrix; use simple values for clarity\n    B = torch.ones(N, K, dtype=torch.float32, device=device) * 2.0\n    return [A, B]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survived previous tests because the out-of-bounds memory access caused by the mutated condition likely read from adjacent memory still within the tensor's allocation (e.g., next row). Since the test used small dimensions and contiguous memory, the read values may have been valid numbers that didn't cause crashes or numerical differences detectable in the output. The mutant's condition (t/TILE_SIZE + threadIdx.x) < K is true for more threads than the original when K is not a multiple of TILE_SIZE, leading to extra reads that may still land in valid memory regions, producing the same output as the original due to the specific input pattern.",
+      "kill_strategy": "Force the out-of-bounds read to access uninitialized or zero-padded memory by using a larger K that is not a multiple of TILE_SIZE and ensuring the out-of-bounds index for row0 reads from a different controlled row, while for row1 it reads from a zero-padded region. Use M=3 so that row2 provides known zeros, and set values so that only row0's last tile thread reads a different value (1000 vs 0), creating a detectable output difference.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    M = 3\n    K = 4095  # One less than 4096 to create partial last tile\n    N = 2\n    A = torch.zeros(M, K, dtype=torch.float32, device=device)\n    A[0] = 1.0\n    A[1] = 1000.0\n    A[2] = 0.0\n    B = torch.ones(N, K, dtype=torch.float32, device=device)\n    return [A, B]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "Previous attempts failed likely because the mutant's out-of-bounds memory access read uncontrolled or zero values, causing no observable difference in output. The mutant condition (t / TILE_SIZE + threadIdx.x) < K is true for many threads where the original (t * TILE_SIZE + threadIdx.x) < K is false, leading to loads from out-of-bounds indices. If those out-of-bounds reads return zero or garbage that doesn't affect the final dot product, the mutant survives. To kill it, we must ensure the out-of-bounds index lands within allocated memory (e.g., in the next row) and contains a non-zero value that affects the output via a non-zero corresponding B element.",
+      "kill_strategy": "Force the mutant to load a non-zero value from the next row of A when the original would zero-pad, while ensuring the corresponding B value is non-zero. Choose small M, N, and K such that for a specific tile and thread, the original condition fails (index >= K) but the mutant condition holds, and the index points to a controlled location in the second row of A. Set B's second row to non-zero so the product differs.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    M = 2\n    N = 2\n    K = 65\n    A = torch.zeros(M, K, dtype=torch.float32, device=device)\n    A[1, 0] = 100.0  # Non-zero value at second row, first column\n    B = torch.zeros(N, K, dtype=torch.float32, device=device)\n    B[1, :] = 2.0    # Entire second row non-zero\n    return [A, B]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel lacks proper bounds checking for global memory accesses. In the tile loading loops, the index calculations assume the original arithmetic operators are correct, but mutations can cause out-of-bounds reads that may not crash but produce incorrect results. The kernel should use clamp-to-edge semantics or explicitly check indices against tensor dimensions before accessing memory. Additionally, the code should compute thread indices once and reuse them to avoid redundant calculations that could be mutated independently. The current approach of setting out-of-bounds values to zero only masks errors rather than preventing them.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define custom CUDA kernel for optimized matrix multiplication\nmatmul_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cublas_v2.h>\n\n// Tile size for shared memory optimization\n#define TILE_SIZE 32\n\n__global__ void matmul_kernel(const float* A, const float* B, float* C, \n                              int M, int N, int K) {\n    // Shared memory for tiles\n    __shared__ float As[TILE_SIZE][TILE_SIZE];\n    __shared__ float Bs[TILE_SIZE][TILE_SIZE];\n    \n    // Compute thread positions once\n    const int thread_row = threadIdx.y;\n    const int thread_col = threadIdx.x;\n    const int block_row = blockIdx.y;\n    const int block_col = blockIdx.x;\n    \n    // Compute global positions with explicit bounds checking\n    const int global_row = block_row * TILE_SIZE + thread_row;\n    const int global_col = block_col * TILE_SIZE + thread_col;\n    \n    float sum = 0.0f;\n    \n    // Loop over tiles\n    for (int t = 0; t < (K + TILE_SIZE - 1) / TILE_SIZE; ++t) {\n        // Compute indices with explicit bounds checking\n        const int a_col_idx = t * TILE_SIZE + thread_col;\n        const int b_row_idx = t * TILE_SIZE + thread_row;\n        \n        // Load tile from A with proper bounds checking\n        if (global_row < M && a_col_idx < K) {\n            As[thread_row][thread_col] = A[global_row * K + a_col_idx];\n        } else {\n            As[thread_row][thread_col] = 0.0f;\n        }\n        \n        // Load tile from B (transposed) with proper bounds checking\n        if (global_col < N && b_row_idx < K) {\n            Bs[thread_row][thread_col] = B[global_col * K + b_row_idx];\n        } else {\n            Bs[thread_row][thread_col] = 0.0f;\n        }\n        \n        __syncthreads();\n        \n        // Compute partial sum\n        #pragma unroll\n        for (int k = 0; k < TILE_SIZE; ++k) {\n            sum += As[thread_row][k] * Bs[k][thread_col];\n        }\n        \n        __syncthreads();\n    }\n    \n    // Write result with explicit bounds checking\n    if (global_row < M && global_col < N) {\n        C[global_row * N + global_col] = sum;\n    }\n}\n\ntorch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B) {\n    // Validate dimensions\n    TORCH_CHECK(A.dim() == 2, \"A must be 2D\");\n    TORCH_CHECK(B.dim() == 2, \"B must be 2D\");\n    TORCH_CHECK(A.size(1) == B.size(1), \"Inner dimensions must match\");\n    \n    // Get dimensions\n    int M = A.size(0);\n    int K = A.size(1);\n    int N = B.size(0);\n    \n    // Create output tensor\n    auto C = torch::zeros({M, N}, A.options());\n    \n    // Configure kernel launch parameters\n    dim3 blockDim(TILE_SIZE, TILE_SIZE);\n    dim3 gridDim((N + TILE_SIZE - 1) / TILE_SIZE, \n                 (M + TILE_SIZE - 1) / TILE_SIZE);\n    \n    // Launch kernel with error checking\n    cudaError_t err = cudaGetLastError();\n    matmul_kernel<<<gridDim, blockDim>>>(\n        A.data_ptr<float>(),\n        B.data_ptr<float>(),\n        C.data_ptr<float>(),\n        M, N, K\n    );\n    err = cudaGetLastError();\n    TORCH_CHECK(err == cudaSuccess, \n                \"CUDA kernel launch failed: \", cudaGetErrorString(err));\n    \n    return C;\n}\n\"\"\"\n\nmatmul_cpp_source = \"torch::Tensor matmul_cuda(torch::Tensor A, torch::Tensor B);\"\n\n# Compile the inline CUDA code\nmatmul_cuda = load_inline(\n    name=\"matmul_cuda\",\n    cpp_sources=matmul_cpp_source,\n    cuda_sources=matmul_source,\n    functions=[\"matmul_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"-lcublas\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model with custom CUDA kernel for matrix multiplication\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.matmul_cuda = matmul_cuda\n    \n    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Performs optimized matrix multiplication using custom CUDA kernel.\n        \n        Args:\n            A: Input tensor of shape (M, K).\n            B: Input tensor of shape (N, K).\n            \n        Returns:\n            Output tensor of shape (M, N).\n        \"\"\"\n        return self.matmul_cuda.matmul_cuda(A, B)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Out-of-Bounds Access Non-Observability"
+}

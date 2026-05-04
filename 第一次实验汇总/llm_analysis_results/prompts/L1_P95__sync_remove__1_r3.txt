@@ -1,0 +1,195 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      72|     if (idx < batch_size) {
+      73|         val = per_sample_loss[idx];
+      74|     }
+      75|     
+      76|     shared[tid] = val;
+      77|     __syncthreads();
+      78|     
+      79|     // Block reduction
+      80|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      81|         if (tid < stride) {
+      82|             shared[tid] += shared[tid + stride];
+      83|         }
+>>>   84|         __syncthreads();
+      85|     }
+      86|     
+      87|     if (tid == 0) {
+      88|         atomicAdd(final_loss, shared[0] / batch_size);
+      89|     }
+      90| }
+      91| 
+      92| torch::Tensor fused_cross_entropy_cuda(
+      93|     torch::Tensor logits,
+      94|     torch::Tensor targets,
+      95|     float label_smoothing = 0.0
+      96| ) {
+```
+
+## Mutated Code (around mutation site)
+```
+      72|     if (idx < batch_size) {
+      73|         val = per_sample_loss[idx];
+      74|     }
+      75|     
+      76|     shared[tid] = val;
+      77|     __syncthreads();
+      78|     
+      79|     // Block reduction
+      80|     for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      81|         if (tid < stride) {
+      82|             shared[tid] += shared[tid + stride];
+      83|         }
+>>>   84|     }
+      85|     
+      86|     if (tid == 0) {
+      87|         atomicAdd(final_loss, shared[0] / batch_size);
+      88|     }
+      89| }
+      90| 
+      91| torch::Tensor fused_cross_entropy_cuda(
+      92|     torch::Tensor logits,
+      93|     torch::Tensor targets,
+      94|     float label_smoothing = 0.0
+      95| ) {
+      96|     const int batch_size = logits.size(0);
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 84
+- Original fragment: `__syncthreads();`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[4096, 10], dtype=torch.float32
+  arg[1]: shape=[4096], dtype=torch.int64
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To kill the mutant, we must force the kernel to launch with a block size > warp size (e.g., 64, 128, 256). This causes the reduction to span multiple warps. Without __syncthreads(), warps may execute asynchronously, leading to race conditions where some threads read stale shared memory values from other warps. The error can be amplified by using input values where the reduction order matters—specifically, by creating a 'checkerboard' pattern of large and small magnitudes across warps, causing floating-point non-associativity to produce different sums.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    batch_size = 4096
+    num_classes = 10
+    
+    # Ensure block size > 32 (assume kernel launches with blockDim.x = 256)
+    # Create per-sample loss pattern: first half of each warp large positive,
+    # second half small negative to exploit floating-point non-associativity
+    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)
+    targets = torch.randint(0, num_classes, (batch_size,), dtype=torch.int64, device=device)
+    
+    # Simulate per-sample losses directly (kernel computes these from logits/targets)
+    # We engineer logits to produce desired loss pattern:
+    # For indices where (idx % 256) < 128: loss ≈ 1e10
+    # For others: loss ≈ -1e-10
+    # This ensures cross-warp reduction order matters.
+    for i in range(batch_size):
+        if (i % 256) < 128:
+            # Make correct class logit huge -> loss near 0 (but we want large positive)
+            # Instead, set all logits to zero and adjust targets to produce large loss
+            # Simpler: manipulate logits to get large cross-entropy loss
+            logits[i, :] = 0.0
+            # With all logits equal, loss = -log(1/10) ≈ 2.3026 (not huge)
+            # To get huge loss, make correct class logit very negative
+            logits[i, targets[i]] = -1e10  # This yields loss ~1e10
+        else:
+            # Make correct class logit huge positive -> loss near 0 (small negative)
+            logits[i, targets[i]] = 1e10
+            logits[i, (targets[i] + 1) % num_classes] = 0.0
+    
+    return [logits, targets]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Create a pattern where each thread's value depends on its thread ID, and design the reduction tree so that without synchronization, threads will consistently read stale values from specific locations. Use values that form a geometric progression where order matters critically, and ensure the block size is large enough (>= 64) to span multiple warps. Make the values highly sensitive to addition order by using powers of two that overflow/underflow when added in wrong order.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    batch_size = 4096
+    num_classes = 10
+    
+    # Assume block size is 256 (common for reductions)
+    block_size = 256
+    
+    # Create logits such that per_sample_loss = 2^(thread_id % block_size)
+    # We'll create targets that make loss calculation yield desired values
+    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)
+    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    
+    # For each sample, set logits to produce loss = 2^(thread_id)
+    # cross_entropy loss = -log(softmax) where softmax = exp(logit_correct)/sum(exp(logits))
+    # We can set all incorrect logits to 0, correct class logit = L, where
+    # loss = -log(exp(L)/(exp(L) + (num_classes-1)*exp(0))) = -log(exp(L)/(exp(L) + K-1))
+    # Solve for L given desired loss value v: L = log((K-1)/(exp(-v) - 1))
+    # For stability, we'll use v = 2^(tid % 256) but clamp to reasonable range
+    
+    K = num_classes
+    for i in range(batch_size):
+        tid = i % block_size
+        # desired loss value between 1 and 2^8 for stability
+        desired_loss = 2.0 ** (tid % 8)  # 1, 2, 4, ..., 128
+        
+        # Compute required logit for correct class
+        # Solve: desired_loss = -log(exp(L)/(exp(L) + K-1))
+        # => exp(-desired_loss) = exp(L)/(exp(L) + K-1)
+        # => exp(L) * (1 - exp(-desired_loss)) = (K-1) * exp(-desired_loss)
+        # => L = log((K-1) * exp(-desired_loss) / (1 - exp(-desired_loss)))
+        
+        exp_neg_v = math.exp(-desired_loss)
+        if exp_neg_v >= 1.0:  # shouldn't happen with positive desired_loss
+            L = 100.0
+        else:
+            L = math.log((K-1) * exp_neg_v / (1.0 - exp_neg_v))
+        
+        # Set all logits to 0 initially
+        logits[i, :] = 0.0
+        # Set correct class (target) to computed L
+        target_class = i % num_classes
+        targets[i] = target_class
+        logits[i, target_class] = L
+    
+    return [logits, targets]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

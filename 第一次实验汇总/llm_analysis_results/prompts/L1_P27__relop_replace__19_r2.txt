@@ -1,0 +1,113 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      92|         const int block_size = 256;
+      93|         int grid_size = (size / 8 + block_size - 1) / block_size;
+      94|         
+      95|         if (grid_size < 32) grid_size = 32;
+      96|         
+      97|         AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "selu_cuda_optimized", [&] {
+      98|             if (input.scalar_type() == torch::kFloat16) {
+      99|                 selu_kernel_optimized<half><<<grid_size, block_size>>>(
+     100|                     reinterpret_cast<half*>(input.data_ptr<torch::Half>()),
+     101|                     reinterpret_cast<half*>(output.data_ptr<torch::Half>()),
+     102|                     size
+     103|                 );
+>>>  104|             } else if (input.scalar_type() == torch::kBFloat16) {
+     105|                 // For BF16, convert to float, process, convert back
+     106|                 auto input_float = input.to(torch::kFloat32);
+     107|                 auto output_float = torch::empty_like(input_float);
+     108|                 
+     109|                 const int block_size_f = 256;
+     110|                 int grid_size_f = (size / 4 + block_size_f - 1) / block_size_f;
+     111|                 if (grid_size_f < 32) grid_size_f = 32;
+     112|                 
+     113|                 selu_kernel_float32<<<grid_size_f, block_size_f>>>(
+     114|                     input_float.data_ptr<float>(),
+     115|                     output_float.data_ptr<float>(),
+     116|                     size
+```
+
+## Mutated Code (around mutation site)
+```
+      92|         const int block_size = 256;
+      93|         int grid_size = (size / 8 + block_size - 1) / block_size;
+      94|         
+      95|         if (grid_size < 32) grid_size = 32;
+      96|         
+      97|         AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "selu_cuda_optimized", [&] {
+      98|             if (input.scalar_type() == torch::kFloat16) {
+      99|                 selu_kernel_optimized<half><<<grid_size, block_size>>>(
+     100|                     reinterpret_cast<half*>(input.data_ptr<torch::Half>()),
+     101|                     reinterpret_cast<half*>(output.data_ptr<torch::Half>()),
+     102|                     size
+     103|                 );
+>>>  104|             } else if (input.scalar_type() != torch::kBFloat16) {
+     105|                 // For BF16, convert to float, process, convert back
+     106|                 auto input_float = input.to(torch::kFloat32);
+     107|                 auto output_float = torch::empty_like(input_float);
+     108|                 
+     109|                 const int block_size_f = 256;
+     110|                 int grid_size_f = (size / 4 + block_size_f - 1) / block_size_f;
+     111|                 if (grid_size_f < 32) grid_size_f = 32;
+     112|                 
+     113|                 selu_kernel_float32<<<grid_size_f, block_size_f>>>(
+     114|                     input_float.data_ptr<float>(),
+     115|                     output_float.data_ptr<float>(),
+     116|                     size
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 104
+- Original fragment: `==`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by using BF16 (torch.bfloat16) input. For BF16 inputs: Original code executes the BF16 conversion path (lines 105-116) correctly. Mutant code sees `input.scalar_type() != torch::kBFloat16` is FALSE for BF16, so it skips the conversion path and falls through to the default dispatch macro branch (which handles float/double/half). Since BF16 is not in AT_DISPATCH_FLOATING_TYPES_AND_HALF's type list, this will either throw an error or execute incorrect kernel code (undefined behavior).
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Create BF16 tensor (the exact shape from specification, but dtype changed)
+    tensor = torch.randn(16, 16384, dtype=torch.bfloat16, device=device)
+    # Use values that stress SELU's nonlinearity (alpha=1.67326, scale=1.0507)
+    # Mix positive and negative values to exercise both branches of SELU
+    tensor = tensor * 2.0  # expand range
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

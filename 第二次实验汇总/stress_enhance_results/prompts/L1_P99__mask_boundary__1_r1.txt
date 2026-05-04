@@ -1,0 +1,549 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized triplet margin loss with fused operations
+triplet_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+constexpr int THREADS_PER_BLOCK = 256;
+constexpr int ELEMENTS_PER_THREAD = 8;
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void triplet_margin_loss_fused_kernel(
+    const float* __restrict__ anchor,
+    const float* __restrict__ positive,
+    const float* __restrict__ negative,
+    float* __restrict__ output,
+    float margin,
+    int batch_size,
+    int feature_dim
+) {
+    __shared__ float shared_pos[32];
+    __shared__ float shared_neg[32];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const float* anchor_ptr = anchor + batch_idx * feature_dim;
+    const float* positive_ptr = positive + batch_idx * feature_dim;
+    const float* negative_ptr = negative + batch_idx * feature_dim;
+    
+    // Vectorized distance computation with fused sqrt and margin
+    float pos_dist = 0.0f;
+    float neg_dist = 0.0f;
+    
+    // Process multiple elements per thread for better memory coalescing
+    for (int i = tid * ELEMENTS_PER_THREAD; i < feature_dim; i += blockDim.x * ELEMENTS_PER_THREAD) {
+        #pragma unroll
+        for (int j = 0; j < ELEMENTS_PER_THREAD; j++) {
+            int idx = i + j;
+            if (idx < feature_dim) {
+                float diff_pos = anchor_ptr[idx] - positive_ptr[idx];
+                float diff_neg = anchor_ptr[idx] - negative_ptr[idx];
+                pos_dist += diff_pos * diff_pos;
+                neg_dist += diff_neg * diff_neg;
+            }
+        }
+    }
+    
+    // Warp-level reduction
+    pos_dist = warp_reduce_sum(pos_dist);
+    neg_dist = warp_reduce_sum(neg_dist);
+    
+    // Store warp results in shared memory
+    if (lane_id == 0) {
+        shared_pos[warp_id] = pos_dist;
+        shared_neg[warp_id] = neg_dist;
+    }
+    __syncthreads();
+    
+    // Final reduction in first warp
+    if (warp_id == 0) {
+        float final_pos = lane_id < (blockDim.x / 32) ? shared_pos[lane_id] : 0.0f;
+        float final_neg = lane_id < (blockDim.x / 32) ? shared_neg[lane_id] : 0.0f;
+        
+        final_pos = warp_reduce_sum(final_pos);
+        final_neg = warp_reduce_sum(final_neg);
+        
+        // Thread 0 computes final loss with sqrt and margin
+        if (lane_id == 0) {
+            float pos_sqrt = sqrtf(final_pos);
+            float neg_sqrt = sqrtf(final_neg);
+            float loss = fmaxf(0.0f, pos_sqrt - neg_sqrt + margin);
+            output[batch_idx] = loss;
+        }
+    }
+}
+
+torch::Tensor triplet_margin_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin
+) {
+    // Input validation
+    TORCH_CHECK(anchor.device().is_cuda(), "anchor must be a CUDA tensor");
+    TORCH_CHECK(positive.device().is_cuda(), "positive must be a CUDA tensor");
+    TORCH_CHECK(negative.device().is_cuda(), "negative must be a CUDA tensor");
+    TORCH_CHECK(anchor.dtype() == torch::kFloat32, "anchor must be float32");
+    TORCH_CHECK(positive.dtype() == torch::kFloat32, "positive must be float32");
+    TORCH_CHECK(negative.dtype() == torch::kFloat32, "negative must be float32");
+    
+    auto batch_size = anchor.size(0);
+    auto feature_dim = anchor.numel() / batch_size;
+    
+    TORCH_CHECK(positive.sizes() == anchor.sizes(),
+                "positive must have same shape as anchor");
+    TORCH_CHECK(negative.sizes() == anchor.sizes(),
+                "negative must have same shape as anchor");
+    
+    // Allocate output buffer
+    auto output = torch::empty({batch_size}, anchor.options());
+    
+    // Launch fused kernel: computes distances, sqrt, and margin in one pass
+    dim3 grid(batch_size);
+    dim3 block(THREADS_PER_BLOCK);
+    
+    triplet_margin_loss_fused_kernel<<<grid, block>>>(
+        anchor.data_ptr<float>(),
+        positive.data_ptr<float>(),
+        negative.data_ptr<float>(),
+        output.data_ptr<float>(),
+        margin,
+        batch_size,
+        feature_dim
+    );
+    
+    // Return mean of all losses
+    return output.mean();
+}
+"""
+
+triplet_loss_cpp_source = """
+torch::Tensor triplet_margin_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin
+);
+"""
+
+# Compile the inline CUDA code
+triplet_loss_module = load_inline(
+    name="triplet_margin_loss",
+    cpp_sources=triplet_loss_cpp_source,
+    cuda_sources=triplet_loss_source,
+    functions=["triplet_margin_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-ffast-math"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Triplet Margin Loss with fully fused custom CUDA kernel.
+    
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin=1.0):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+        self.triplet_loss_cuda = triplet_loss_module.triplet_margin_loss_cuda
+
+    def forward(self, anchor, positive, negative):
+        # Ensure tensors are on CUDA and have correct dtype
+        anchor = anchor.contiguous().cuda().float()
+        positive = positive.contiguous().cuda().float()
+        negative = negative.contiguous().cuda().float()
+        
+        return self.triplet_loss_cuda(anchor, positive, negative, self.margin)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized triplet margin loss with fused operations
+triplet_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+constexpr int THREADS_PER_BLOCK = 256;
+constexpr int ELEMENTS_PER_THREAD = 8;
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset /= 2) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__global__ void triplet_margin_loss_fused_kernel(
+    const float* __restrict__ anchor,
+    const float* __restrict__ positive,
+    const float* __restrict__ negative,
+    float* __restrict__ output,
+    float margin,
+    int batch_size,
+    int feature_dim
+) {
+    __shared__ float shared_pos[32];
+    __shared__ float shared_neg[32];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    
+    if (batch_idx >= batch_size + 1) return;
+    
+    const float* anchor_ptr = anchor + batch_idx * feature_dim;
+    const float* positive_ptr = positive + batch_idx * feature_dim;
+    const float* negative_ptr = negative + batch_idx * feature_dim;
+    
+    // Vectorized distance computation with fused sqrt and margin
+    float pos_dist = 0.0f;
+    float neg_dist = 0.0f;
+    
+    // Process multiple elements per thread for better memory coalescing
+    for (int i = tid * ELEMENTS_PER_THREAD; i < feature_dim; i += blockDim.x * ELEMENTS_PER_THREAD) {
+        #pragma unroll
+        for (int j = 0; j < ELEMENTS_PER_THREAD; j++) {
+            int idx = i + j;
+            if (idx < feature_dim) {
+                float diff_pos = anchor_ptr[idx] - positive_ptr[idx];
+                float diff_neg = anchor_ptr[idx] - negative_ptr[idx];
+                pos_dist += diff_pos * diff_pos;
+                neg_dist += diff_neg * diff_neg;
+            }
+        }
+    }
+    
+    // Warp-level reduction
+    pos_dist = warp_reduce_sum(pos_dist);
+    neg_dist = warp_reduce_sum(neg_dist);
+    
+    // Store warp results in shared memory
+    if (lane_id == 0) {
+        shared_pos[warp_id] = pos_dist;
+        shared_neg[warp_id] = neg_dist;
+    }
+    __syncthreads();
+    
+    // Final reduction in first warp
+    if (warp_id == 0) {
+        float final_pos = lane_id < (blockDim.x / 32) ? shared_pos[lane_id] : 0.0f;
+        float final_neg = lane_id < (blockDim.x / 32) ? shared_neg[lane_id] : 0.0f;
+        
+        final_pos = warp_reduce_sum(final_pos);
+        final_neg = warp_reduce_sum(final_neg);
+        
+        // Thread 0 computes final loss with sqrt and margin
+        if (lane_id == 0) {
+            float pos_sqrt = sqrtf(final_pos);
+            float neg_sqrt = sqrtf(final_neg);
+            float loss = fmaxf(0.0f, pos_sqrt - neg_sqrt + margin);
+            output[batch_idx] = loss;
+        }
+    }
+}
+
+torch::Tensor triplet_margin_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin
+) {
+    // Input validation
+    TORCH_CHECK(anchor.device().is_cuda(), "anchor must be a CUDA tensor");
+    TORCH_CHECK(positive.device().is_cuda(), "positive must be a CUDA tensor");
+    TORCH_CHECK(negative.device().is_cuda(), "negative must be a CUDA tensor");
+    TORCH_CHECK(anchor.dtype() == torch::kFloat32, "anchor must be float32");
+    TORCH_CHECK(positive.dtype() == torch::kFloat32, "positive must be float32");
+    TORCH_CHECK(negative.dtype() == torch::kFloat32, "negative must be float32");
+    
+    auto batch_size = anchor.size(0);
+    auto feature_dim = anchor.numel() / batch_size;
+    
+    TORCH_CHECK(positive.sizes() == anchor.sizes(),
+                "positive must have same shape as anchor");
+    TORCH_CHECK(negative.sizes() == anchor.sizes(),
+                "negative must have same shape as anchor");
+    
+    // Allocate output buffer
+    auto output = torch::empty({batch_size}, anchor.options());
+    
+    // Launch fused kernel: computes distances, sqrt, and margin in one pass
+    dim3 grid(batch_size);
+    dim3 block(THREADS_PER_BLOCK);
+    
+    triplet_margin_loss_fused_kernel<<<grid, block>>>(
+        anchor.data_ptr<float>(),
+        positive.data_ptr<float>(),
+        negative.data_ptr<float>(),
+        output.data_ptr<float>(),
+        margin,
+        batch_size,
+        feature_dim
+    );
+    
+    // Return mean of all losses
+    return output.mean();
+}
+"""
+
+triplet_loss_cpp_source = """
+torch::Tensor triplet_margin_loss_cuda(
+    torch::Tensor anchor,
+    torch::Tensor positive,
+    torch::Tensor negative,
+    float margin
+);
+"""
+
+# Compile the inline CUDA code
+triplet_loss_module = load_inline(
+    name="triplet_margin_loss",
+    cpp_sources=triplet_loss_cpp_source,
+    cuda_sources=triplet_loss_source,
+    functions=["triplet_margin_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-ffast-math"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Triplet Margin Loss with fully fused custom CUDA kernel.
+    
+    Parameters:
+        margin (float): The margin between the positive and negative samples.
+    """
+    def __init__(self, margin=1.0):
+        super(ModelNew, self).__init__()
+        self.margin = margin
+        self.triplet_loss_cuda = triplet_loss_module.triplet_margin_loss_cuda
+
+    def forward(self, anchor, positive, negative):
+        # Ensure tensors are on CUDA and have correct dtype
+        anchor = anchor.contiguous().cuda().float()
+        positive = positive.contiguous().cuda().float()
+        negative = negative.contiguous().cuda().float()
+        
+        return self.triplet_loss_cuda(anchor, positive, negative, self.margin)
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 39
+- Original fragment: `batch_idx >= batch_size`
+- node_type: ge_rhs+1
+
+## Input Specification (FIXED)
+forward() expects 3 argument(s):
+  arg[0]: Tensor shape=[128, 4096], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 4096], dtype=torch.float32
+  arg[2]: Tensor shape=[128, 4096], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 39
+- Original fragment: `batch_idx >= batch_size`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.637370586395264, 'mean': -0.0009141105692833662, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4.499828815460205, 'max': 4.793313980102539, 'mean': 0.00023611041251569986, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4.638796806335449, 'max': 4.77315616607666, 'mean': -0.00040868829819373786, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_large_magnitude_1', 'seed': 10101, 'tensors': [{'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4169.43603515625, 'max': 5140.97314453125, 'mean': -1.6916475296020508, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4866.79345703125, 'max': 5496.4072265625, 'mean': -1.6630561351776123, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4446.38232421875, 'max': 4649.91845703125, 'mean': -0.2814016044139862, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes the boundary check from `batch_idx >= batch_size` to `batch_idx >= batch_size + 1`. However, the kernel launch configuration uses `dim3 grid(batch_size)`, meaning blockIdx.x ranges from 0 to batch_size-1. With the fixed input shape [128, 4096], batch_size=128, so blockIdx.x ∈ [0,127]. Both conditions evaluate to false for all valid block indices (0-127), making the mutation dead code. The kernel execution path is identical for all possible block indices. No input values can 
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - sparse_extreme seed=42: survived
+  - sparse_extreme seed=43: survived
+  - sparse_extreme seed=44: survived
+  - sparse_extreme seed=45: survived
+  - sparse_extreme seed=46: survived
+  - near_overflow seed=47: survived
+  - near_overflow seed=48: survived
+  - near_overflow seed=49: survived
+  - near_overflow seed=50: survived
+  - near_overflow seed=51: survived
+  - near_zero seed=52: survived
+  - near_zero seed=53: survived
+  - near_zero seed=54: survived
+  - near_zero seed=55: survived
+  - near_zero seed=56: survived
+  - denormals seed=57: survived
+  - denormals seed=58: survived
+  - denormals seed=59: survived
+  - denormals seed=60: survived
+  - denormals seed=61: survived
+  - all_negative seed=62: survived
+  - all_negative seed=63: survived
+  - all_negative seed=64: survived
+  - all_negative seed=65: survived
+  - all_negative seed=66: survived
+  - all_positive seed=67: survived
+  - all_positive seed=68: survived
+  - all_positive seed=69: survived
+  - all_positive seed=70: survived
+  - all_positive seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- near_zero: values ~1e-7, tests near-zero sensitivity
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

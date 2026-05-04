@@ -1,0 +1,452 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized masked cumulative sum
+masked_cumsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void masked_cumsum_kernel(
+    const scalar_t* __restrict__ input,
+    const bool* __restrict__ mask,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    // Each block handles one outer position
+    const int64_t outer_idx = blockIdx.x;
+    if (outer_idx >= outer_size) return;
+    
+    // Each thread handles multiple inner positions with vectorized loads
+    const int64_t base_offset = outer_idx * dim_size * inner_size;
+    
+    // Process inner positions in parallel
+    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {
+        scalar_t cum_sum = 0;
+        
+        // Sequential scan along the cumulative dimension
+        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
+            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;
+            if (mask[offset]) {
+                cum_sum += input[offset];
+            }
+            output[offset] = cum_sum;
+        }
+    }
+}
+
+torch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {
+    // Validate inputs
+    TORCH_CHECK(input.sizes() == mask.sizes(), "Input and mask must have same shape");
+    TORCH_CHECK(mask.scalar_type() == torch::kBool, "Mask must be boolean tensor");
+    TORCH_CHECK(dim >= 0 && dim < input.dim(), "Dimension out of range");
+    
+    auto output = torch::empty_like(input);
+    
+    // Get tensor dimensions
+    auto sizes = input.sizes();
+    
+    // Calculate dimensions for kernel launch
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; i++) {
+        outer_size *= sizes[i];
+    }
+    
+    int64_t dim_size = sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); i++) {
+        inner_size *= sizes[i];
+    }
+    
+    // Launch kernel with optimized configuration
+    // Use maximum threads per block for better occupancy
+    const int block_size = 256;
+    dim3 grid_size(outer_size);
+    dim3 block_size_dim(min(block_size, (int)inner_size));
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(),
+        "masked_cumsum_kernel",
+        [&] {
+            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(
+                input.data_ptr<scalar_t>(),
+                mask.data_ptr<bool>(),
+                output.data_ptr<scalar_t>(),
+                outer_size,
+                dim_size,
+                inner_size
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+masked_cumsum_cpp_source = """
+torch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+masked_cumsum = load_inline(
+    name="masked_cumsum",
+    cpp_sources=masked_cumsum_cpp_source,
+    cuda_sources=masked_cumsum_source,
+    functions=["masked_cumsum_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a masked cumulative sum using custom CUDA kernel.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the masked cumulative sum.
+    """
+    
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.masked_cumsum = masked_cumsum
+    
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+            
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        """
+        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized masked cumulative sum
+masked_cumsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void masked_cumsum_kernel(
+    const scalar_t* __restrict__ input,
+    const bool* __restrict__ mask,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    // Each block handles one outer position
+    const int64_t outer_idx = blockIdx.x;
+    if (outer_idx >= outer_size + 1) return;
+    
+    // Each thread handles multiple inner positions with vectorized loads
+    const int64_t base_offset = outer_idx * dim_size * inner_size;
+    
+    // Process inner positions in parallel
+    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {
+        scalar_t cum_sum = 0;
+        
+        // Sequential scan along the cumulative dimension
+        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
+            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;
+            if (mask[offset]) {
+                cum_sum += input[offset];
+            }
+            output[offset] = cum_sum;
+        }
+    }
+}
+
+torch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {
+    // Validate inputs
+    TORCH_CHECK(input.sizes() == mask.sizes(), "Input and mask must have same shape");
+    TORCH_CHECK(mask.scalar_type() == torch::kBool, "Mask must be boolean tensor");
+    TORCH_CHECK(dim >= 0 && dim < input.dim(), "Dimension out of range");
+    
+    auto output = torch::empty_like(input);
+    
+    // Get tensor dimensions
+    auto sizes = input.sizes();
+    
+    // Calculate dimensions for kernel launch
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; i++) {
+        outer_size *= sizes[i];
+    }
+    
+    int64_t dim_size = sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); i++) {
+        inner_size *= sizes[i];
+    }
+    
+    // Launch kernel with optimized configuration
+    // Use maximum threads per block for better occupancy
+    const int block_size = 256;
+    dim3 grid_size(outer_size);
+    dim3 block_size_dim(min(block_size, (int)inner_size));
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(),
+        "masked_cumsum_kernel",
+        [&] {
+            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(
+                input.data_ptr<scalar_t>(),
+                mask.data_ptr<bool>(),
+                output.data_ptr<scalar_t>(),
+                outer_size,
+                dim_size,
+                inner_size
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+masked_cumsum_cpp_source = """
+torch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+masked_cumsum = load_inline(
+    name="masked_cumsum",
+    cpp_sources=masked_cumsum_cpp_source,
+    cuda_sources=masked_cumsum_source,
+    functions=["masked_cumsum_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a masked cumulative sum using custom CUDA kernel.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the masked cumulative sum.
+    """
+    
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.masked_cumsum = masked_cumsum
+    
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+            
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        """
+        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 21
+- Original fragment: `outer_idx >= outer_size`
+- node_type: ge_rhs+1
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 4000], dtype=torch.bool
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 21
+- Original fragment: `outer_idx >= outer_size`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [128, 4000], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.637370586395264, 'mean': -0.0007910541025921702, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4000], 'dtype': 'torch.bool', 'min': 0.0, 'max': 1.0, 'mean': 0.5007363557815552, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_large_magnitude_1', 'seed': 10101, 'tensors': [{'shape': [128, 4000], 'dtype': 'torch.float32', 'min': -4169.43603515625, 'max': 5140.97314453125, 'mean': -1.5204887390136719, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4000], 'dtype': 'torch.bool', 'min': 0.0, 'max': 1.0, 'mean': 0.5005019307136536, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes the boundary check from `outer_idx >= outer_size` to `outer_idx >= outer_size + 1`. However, the kernel launch configuration uses `grid_size(outer_size)`, meaning `blockIdx.x` ranges from 0 to `outer_size-1`. Since `outer_idx` is always less than `outer_size`, the condition `outer_idx >= outer_size + 1` is always false. Therefore, the mutated guard never triggers, and the execution path is identical to the original. This is a classic case of dead code mutation where the chan
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - sparse_extreme seed=42: survived
+  - sparse_extreme seed=43: survived
+  - sparse_extreme seed=44: survived
+  - sparse_extreme seed=45: survived
+  - sparse_extreme seed=46: survived
+  - near_overflow seed=47: survived
+  - near_overflow seed=48: survived
+  - near_overflow seed=49: survived
+  - near_overflow seed=50: survived
+  - near_overflow seed=51: survived
+  - near_zero seed=52: survived
+  - near_zero seed=53: survived
+  - near_zero seed=54: survived
+  - near_zero seed=55: survived
+  - near_zero seed=56: survived
+  - denormals seed=57: survived
+  - denormals seed=58: survived
+  - denormals seed=59: survived
+  - denormals seed=60: survived
+  - denormals seed=61: survived
+  - all_negative seed=62: survived
+  - all_negative seed=63: survived
+  - all_negative seed=64: survived
+  - all_negative seed=65: survived
+  - all_negative seed=66: survived
+  - all_positive seed=67: survived
+  - all_positive seed=68: survived
+  - all_positive seed=69: survived
+  - all_positive seed=70: survived
+  - all_positive seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- near_zero: values ~1e-7, tests near-zero sensitivity
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

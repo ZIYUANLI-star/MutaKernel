@@ -1,0 +1,518 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 45 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for argmax
+argmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <limits>
+
+template<typename scalar_t>
+__global__ void argmax_kernel(
+    const scalar_t* input,
+    int64_t* output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size,
+    const int64_t stride_outer,
+    const int64_t stride_dim,
+    const int64_t stride_inner
+) {
+    const int64_t outer_idx = blockIdx.x;
+    const int64_t inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) {
+        return;
+    }
+    
+    scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+    int64_t max_idx = 0;
+    
+    for (int64_t dim_idx = 0; dim_idx < dim_size; ++dim_idx) {
+        const int64_t input_idx = outer_idx * stride_outer + 
+                                 dim_idx * stride_dim + 
+                                 inner_idx * stride_inner;
+        scalar_t val = input[input_idx];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = dim_idx;
+        }
+    }
+    
+    const int64_t output_idx = outer_idx * inner_size + inner_idx;
+    output[output_idx] = max_idx;
+}
+
+torch::Tensor argmax_cuda(torch::Tensor input, int64_t dim) {
+    // Get tensor dimensions
+    auto sizes = input.sizes().vec();
+    const int64_t ndim = input.dim();
+    
+    // Handle negative dimension
+    if (dim < 0) {
+        dim = ndim + dim;
+    }
+    
+    // Calculate output shape
+    std::vector<int64_t> output_sizes;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i != dim) {
+            output_sizes.push_back(sizes[i]);
+        }
+    }
+    
+    // Create output tensor
+    auto output = torch::empty(
+        output_sizes,
+        torch::TensorOptions().dtype(torch::kLong).device(input.device())
+    );
+    
+    // Calculate sizes for kernel
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= sizes[i];
+    }
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) {
+        inner_size *= sizes[i];
+    }
+    
+    int64_t dim_size = sizes[dim];
+    
+    // Calculate strides
+    auto strides = input.strides().vec();
+    int64_t stride_outer = (dim > 0) ? strides[dim - 1] : 0;
+    int64_t stride_dim = strides[dim];
+    int64_t stride_inner = (dim < ndim - 1) ? strides[dim + 1] : 0;
+    
+    // Launch kernel
+    const int64_t block_size = 256;
+    dim3 block(block_size);
+    dim3 grid(outer_size, (inner_size + block_size - 1) / block_size);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(),
+        "argmax_cuda",
+        ([&] {
+            argmax_kernel<scalar_t><<<grid, block>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<int64_t>(),
+                outer_size,
+                dim_size,
+                inner_size,
+                stride_outer,
+                stride_dim,
+                stride_inner
+            );
+        })
+    );
+    
+    return output;
+}
+"""
+
+argmax_cpp_source = "torch::Tensor argmax_cuda(torch::Tensor input, int64_t dim);"
+
+# Compile the inline CUDA code for argmax
+argmax_module = load_inline(
+    name="argmax",
+    cpp_sources=argmax_cpp_source,
+    cuda_sources=argmax_source,
+    functions=["argmax_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Argmax over a specified dimension using custom CUDA kernel.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to perform argmax.
+
+        Args:
+            dim (int): The dimension to perform argmax over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.argmax_cuda = argmax_module.argmax_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies argmax over the specified dimension to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with argmax applied, with the specified dimension removed.
+        """
+        if x.is_cuda:
+            return self.argmax_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return torch.argmax(x, dim=self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for argmax
+argmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <limits>
+
+template<typename scalar_t>
+__global__ void argmax_kernel(
+    const scalar_t* input,
+    int64_t* output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size,
+    const int64_t stride_outer,
+    const int64_t stride_dim,
+    const int64_t stride_inner
+) {
+    const int64_t outer_idx = blockIdx.x;
+    const int64_t inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) {
+        return;
+    }
+    
+    scalar_t max_val = -std::numeric_limits<scalar_t>::infinity();
+    int64_t max_idx = 0;
+    
+    for (int64_t dim_idx = 0; dim_idx < dim_size; ++dim_idx) {
+        const int64_t input_idx = outer_idx * stride_outer + 
+                                 dim_idx * stride_dim + 
+                                 inner_idx * stride_inner;
+        scalar_t val = input[input_idx];
+        if (val > max_val) {
+            max_val = val;
+            max_idx = dim_idx;
+        }
+    }
+    
+    const int64_t output_idx = outer_idx * inner_size + inner_idx;
+    output[output_idx] = max_idx;
+}
+
+torch::Tensor argmax_cuda(torch::Tensor input, int64_t dim) {
+    // Get tensor dimensions
+    auto sizes = input.sizes().vec();
+    const int64_t ndim = input.dim();
+    
+    // Handle negative dimension
+    if (dim <= 0) {
+        dim = ndim + dim;
+    }
+    
+    // Calculate output shape
+    std::vector<int64_t> output_sizes;
+    for (int64_t i = 0; i < ndim; ++i) {
+        if (i != dim) {
+            output_sizes.push_back(sizes[i]);
+        }
+    }
+    
+    // Create output tensor
+    auto output = torch::empty(
+        output_sizes,
+        torch::TensorOptions().dtype(torch::kLong).device(input.device())
+    );
+    
+    // Calculate sizes for kernel
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= sizes[i];
+    }
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) {
+        inner_size *= sizes[i];
+    }
+    
+    int64_t dim_size = sizes[dim];
+    
+    // Calculate strides
+    auto strides = input.strides().vec();
+    int64_t stride_outer = (dim > 0) ? strides[dim - 1] : 0;
+    int64_t stride_dim = strides[dim];
+    int64_t stride_inner = (dim < ndim - 1) ? strides[dim + 1] : 0;
+    
+    // Launch kernel
+    const int64_t block_size = 256;
+    dim3 block(block_size);
+    dim3 grid(outer_size, (inner_size + block_size - 1) / block_size);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(),
+        "argmax_cuda",
+        ([&] {
+            argmax_kernel<scalar_t><<<grid, block>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<int64_t>(),
+                outer_size,
+                dim_size,
+                inner_size,
+                stride_outer,
+                stride_dim,
+                stride_inner
+            );
+        })
+    );
+    
+    return output;
+}
+"""
+
+argmax_cpp_source = "torch::Tensor argmax_cuda(torch::Tensor input, int64_t dim);"
+
+# Compile the inline CUDA code for argmax
+argmax_module = load_inline(
+    name="argmax",
+    cpp_sources=argmax_cpp_source,
+    cuda_sources=argmax_source,
+    functions=["argmax_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Argmax over a specified dimension using custom CUDA kernel.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to perform argmax.
+
+        Args:
+            dim (int): The dimension to perform argmax over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.argmax_cuda = argmax_module.argmax_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies argmax over the specified dimension to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with argmax applied, with the specified dimension removed.
+        """
+        if x.is_cuda:
+            return self.argmax_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return torch.argmax(x, dim=self.dim)
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 53
+- Original fragment: `<`
+- node_type: cuda_Lt
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 53
+- Original fragment: `<`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - relop_boundary_hit: passed
+  - relop_boundary_hit: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - near_zero: passed
+  - near_zero: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 256, 256], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.793313980102539, 'mean': -0.0003390001365914941, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_large_magnitude_1', 'seed': 10101, 'tensors': [{'shape': [16, 256, 256], 'dtype': 'torch.float32', 'min': -4866.79345703125, 'max': 5496.4072265625, 'mean': -1.677351474761963, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: possibly_killable
+- Confidence: 0.95
+- Reasoning: The mutation changes `if (dim < 0)` to `if (dim <= 0)`, affecting the negative dimension handling logic. When `dim = 0`, the original code does NOT apply the negative dimension adjustment, but the mutant DOES apply `dim = ndim + dim`. For a 3D tensor with shape [16, 256, 256], `ndim = 3`, so when `dim = 0`, the mutant would compute `dim = 3 + 0 = 3`. However, dimension 3 is out of bounds for a 3D tensor (valid dimensions are 0, 1, 2). This will cause the subsequent code to access `sizes[3]` whic
+- Kill strategy: Test with `dim = 0` as the model parameter. The mutation changes behavior specifically when the dimension argument is exactly 0, causing an out-of-bounds access. This is a value-level strategy that uses the same tensor shapes but targets the specific boundary case of the relational operator change.
+- Suggested test: Initialize the model with dim=0 and test with the fixed input shape [16, 256, 256]. The mutant will attempt to access dimension 3 (since ndim=3, dim=0 becomes 3 after adjustment), causing out-of-bound
+- Had executable code: True
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 45 / 45 rounds. Result: ALL SURVIVED (bitwise identical)
+  - sparse_extreme seed=42: survived
+  - sparse_extreme seed=43: survived
+  - sparse_extreme seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - near_overflow seed=47: survived
+  - denormals seed=48: survived
+  - denormals seed=49: survived
+  - denormals seed=50: survived
+  - all_negative seed=51: survived
+  - all_negative seed=52: survived
+  - all_negative seed=53: survived
+  - all_positive seed=54: survived
+  - all_positive seed=55: survived
+  - all_positive seed=56: survived
+  - mixed_extremes seed=57: survived
+  - mixed_extremes seed=58: survived
+  - mixed_extremes seed=59: survived
+  - alternating_sign seed=60: survived
+  - alternating_sign seed=61: survived
+  - alternating_sign seed=62: survived
+  - uniform_constant seed=63: survived
+  - uniform_constant seed=64: survived
+  - uniform_constant seed=65: survived
+  - head_heavy seed=66: survived
+  - head_heavy seed=67: survived
+  - head_heavy seed=68: survived
+  - tail_heavy seed=69: survived
+  - tail_heavy seed=70: survived
+  - tail_heavy seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- reduction_adversarial: reduction_adversarial
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

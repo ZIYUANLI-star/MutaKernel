@@ -1,0 +1,117 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      32|     }
+      33|     
+      34|     output[outer_idx * inner_size + inner_idx] = sum;
+      35| }
+      36| 
+      37| torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {
+      38|     // Get tensor dimensions
+      39|     auto sizes = input.sizes();
+      40|     int ndim = input.dim();
+      41|     
+      42|     // Validate dimension
+      43|     if (dim < 0) dim += ndim;
+>>>   44|     if (dim < 0 || dim >= ndim) {
+      45|         throw std::runtime_error("Invalid reduction dimension");
+      46|     }
+      47|     
+      48|     // Calculate sizes for the reduction
+      49|     int outer_size = 1;
+      50|     for (int i = 0; i < dim; i++) {
+      51|         outer_size *= sizes[i];
+      52|     }
+      53|     
+      54|     int reduce_size = sizes[dim];
+      55|     
+      56|     int inner_size = 1;
+```
+
+## Mutated Code (around mutation site)
+```
+      32|     }
+      33|     
+      34|     output[outer_idx * inner_size + inner_idx] = sum;
+      35| }
+      36| 
+      37| torch::Tensor sum_reduction_cuda(torch::Tensor input, int dim) {
+      38|     // Get tensor dimensions
+      39|     auto sizes = input.sizes();
+      40|     int ndim = input.dim();
+      41|     
+      42|     // Validate dimension
+      43|     if (dim < 0) dim += ndim;
+>>>   44|     if (dim < 0 || dim >= ndim + 1) {
+      45|         throw std::runtime_error("Invalid reduction dimension");
+      46|     }
+      47|     
+      48|     // Calculate sizes for the reduction
+      49|     int outer_size = 1;
+      50|     for (int i = 0; i < dim; i++) {
+      51|         outer_size *= sizes[i];
+      52|     }
+      53|     
+      54|     int reduce_size = sizes[dim];
+      55|     
+      56|     int inner_size = 1;
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 44
+- Original fragment: `dim >= ndim`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Test with invalid dimension `dim = ndim` (e.g., dim=3 for 3D tensor). The original will throw `std::runtime_error` while the mutant will pass validation (since 3 < 3+1) and proceed to compute with out-of-bounds memory access, likely causing a crash or incorrect output.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Create a tensor with same shape as specified: [16, 256, 256]
+    # But we need to also test with dim=3
+    # Since the test framework might call forward with fixed dim,
+    # we need to modify the test to pass dim=3 explicitly.
+    # This test generates the tensor only - the dim argument must be provided separately.
+    shape = [16, 256, 256]
+    torch.manual_seed(42)
+    tensor = torch.randn(shape, device=device, dtype=torch.float32)
+    return [tensor]
+
+# Note: The actual test should call sum_reduction_cuda(input, dim=3)
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

@@ -1,0 +1,151 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      80|     // Block reduction for sum
+      81|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      82|         if (tid < s) {
+      83|             sdata[tid] += sdata[tid + s];
+      84|         }
+      85|         __syncthreads();
+      86|     }
+      87|     
+      88|     float total_sum = sdata[0];
+      89|     float log_sum_exp = logf(total_sum) + global_max;
+      90|     
+      91|     // Step 3: Compute final log_softmax values
+>>>   92|     for (int i = tid; i < dim_size; i += blockDim.x) {
+      93|         float val = to_float<T>(batch_input[i]);
+      94|         batch_output[i] = from_float<T>(val - log_sum_exp);
+      95|     }
+      96| }
+      97| 
+      98| torch::Tensor log_softmax_cuda(torch::Tensor input, int dim) {
+      99|     auto input_contiguous = input.contiguous();
+     100|     auto output = torch::empty_like(input_contiguous);
+     101|     
+     102|     // Only support 2D tensors with dim=1 for now
+     103|     TORCH_CHECK(input_contiguous.dim() == 2, "Input must be 2D tensor");
+     104|     TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+```
+
+## Mutated Code (around mutation site)
+```
+      80|     // Block reduction for sum
+      81|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      82|         if (tid < s) {
+      83|             sdata[tid] += sdata[tid + s];
+      84|         }
+      85|         __syncthreads();
+      86|     }
+      87|     
+      88|     float total_sum = sdata[0];
+      89|     float log_sum_exp = logf(total_sum) + global_max;
+      90|     
+      91|     // Step 3: Compute final log_softmax values
+>>>   92|     for (int i = tid; i < dim_size; i += blockDim.y) {
+      93|         float val = to_float<T>(batch_input[i]);
+      94|         batch_output[i] = from_float<T>(val - log_sum_exp);
+      95|     }
+      96| }
+      97| 
+      98| torch::Tensor log_softmax_cuda(torch::Tensor input, int dim) {
+      99|     auto input_contiguous = input.contiguous();
+     100|     auto output = torch::empty_like(input_contiguous);
+     101|     
+     102|     // Only support 2D tensors with dim=1 for now
+     103|     TORCH_CHECK(input_contiguous.dim() == 2, "Input must be 2D tensor");
+     104|     TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 92
+- Original fragment: `blockDim.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by changing the kernel launch configuration to use 2D blocks where blockDim.y > 1 and does NOT evenly divide dim_size. This will cause some elements to be processed by multiple threads while others might be missed entirely, leading to incorrect outputs. However, since the test harness only varies input values and not launch configurations, we need to trigger the bug within the fixed launch setup. The key is to exploit floating-point non-associativity: if different threads compute `val - log_sum_exp` in different orders due to the race, tiny rounding differences could accumulate. By using extreme values where subtraction causes catastrophic cancellation or underflow, the order of operations matters.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use shape [16, 16384] as specified
+    batch_size, dim_size = 16, 16384
+    
+    # Create tensor with extreme values that cause cancellation
+    # Strategy: values are large positive numbers (e.g., 1e10) with tiny variations
+    # so that (val - log_sum_exp) is very small but non-zero
+    base = 1e10
+    variation = torch.randn(batch_size, dim_size, device=device) * 1e-5  # tiny noise
+    x = base + variation
+    
+    # Ensure numerical stability by shifting (log_sum_exp will be ~base + log(dim_size))
+    # The subtraction val - log_sum_exp will be ~variation - log(dim_size)
+    # This yields very small results where floating-point ordering matters
+    
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=9.704061e+00, mean_diff=9.704061e+00, ref_range=[-9.7041e+00,-9.7041e+00], mut_range=[0.0000e+00,0.0000e+00]
+
+### Round 2
+- Strategy: Exploit that with blockDim.y=1 and stride=1, threads will write to indices beyond their intended range due to the loop condition 'i < dim_size' and no thread synchronization in the final loop. Use extreme values where the loop bounds matter: create a tensor with non-uniform values where the final computation depends on which thread writes last. Since threads run in parallel with undefined order, the final output becomes non-deterministic. By using values with different magnitudes across columns, we can make different threads compute different results for the same index.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    batch_size, dim_size = 16, 16384
+    x = torch.zeros(batch_size, dim_size, device=device)
+    # Create alternating pattern: large positive then large negative
+    # This ensures log_sum_exp is large positive, making (negative_val - log_sum_exp) very negative
+    # Different threads will compute different values for the same i due to pattern
+    for b in range(batch_size):
+        for i in range(dim_size):
+            if i % 2 == 0:
+                x[b, i] = 1000.0  # Large positive
+            else:
+                x[b, i] = -1000.0  # Large negative
+    # Add small random noise to break symmetry
+    x += torch.randn_like(x) * 0.01
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

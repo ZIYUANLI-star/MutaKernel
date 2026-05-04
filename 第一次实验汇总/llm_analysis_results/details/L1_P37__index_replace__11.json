@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P37__index_replace__11",
+  "kernel_name": "L1_P37",
+  "operator_name": "index_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant likely survived because previous inputs either had uniform values (all ones) where double-counting differences were small relative to total norm, or the launch configuration inadvertently made gridDim.x equal to gridDim.z (e.g., 1D grid with gridDim.z=1 and gridDim.x=1). In the latter case, the mutant's stride becomes blockDim.x, which still partitions the input correctly for small total elements when only one block is used. The framework may also use block sizes that minimize overlap or the reduction across blocks may use atomic operations that sum partial results, potentially masking the double-counting effect when values are symmetric.",
+  "killable": true,
+  "kill_strategy": "Force a launch configuration with multiple blocks and non-uniform input values, ensuring that overlapping indices (which occur at multiples of blockDim.x) contain large magnitudes. This amplifies the double-counting error in the mutant. Choose total elements = 1025 to guarantee at least two blocks for any block size ≤1024, and set only the last element (index 1024) to an extreme value (1e6). The original will sum this value once, while the mutant will sum it multiple times across blocks, producing a norm difference of several orders of magnitude.",
+  "recommendations": "If this test still fails, the mutant may be unkillable due to the framework always launching with gridDim.x = gridDim.z, or the kernel may include additional synchronization/atomic operations that correct the double-counting. In such cases, inspect the full kernel code and launch parameters. Consider testing with odd total elements like 257 or 513 to vary block counts, or use random non-zero values only at indices that are multiples of common block sizes (256, 512).",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the kernel launch configuration likely uses a 1D grid where `gridDim.z` = 1, but the input shape (16,64,256,256) yields `gridDim.x` = 65536 (assuming blockDim.x=1024). With this configuration, both the original and mutant kernels compute the same norm for the tested value distributions. The original kernel's stride (`blockDim.x * gridDim.x`) equals the total number of threads, causing each thread to process one element. The mutant's stride (`blockDim.x * gridDim.z` = `blockDim.x`) causes each thread to process many elements, but due to the large input size and specific value patterns (e.g., uniform constants), the overlapping accesses in the mutant might still yield the same sum of squares. Additionally, the original kernel itself may be buggy for certain distributions, masking the difference.",
+      "kill_strategy": "Change the input shape so that `total_elements` is small and not a multiple of `blockDim.x`, causing the mutant's overlapping accesses to produce a different norm than the original. Specifically, use a total number of elements where `gridDim.x` > 1 (to make strides differ) and the input values are non-zero, leading to repeated summations in the mutant. A constant input (all ones) makes the expected norm easy to compute: the original should sum each element once, while the mutant will sum some elements multiple times, resulting in a larger norm.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Total elements = 1025, small enough to cause overlapping in mutant\n    # Shape is 4D to match the kernel's expectation (though it only cares about total_elements)\n    total_elements = 1025\n    shape = (1, 1, 1, total_elements)  # 4D tensor\n    # All ones: makes the norm difference easy to compute\n    data = torch.ones(shape, dtype=torch.float32, device=device)\n    return [data]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survives because the kernel launch configuration uses a 1D grid where gridDim.z = 1 by default. When gridDim.z = 1, the mutation 'gridDim.x → gridDim.z' changes stride from blockDim.x * gridDim.x to blockDim.x * 1. However, for small inputs where gridDim.x = 1 (as likely occurred in previous tests), both expressions evaluate to blockDim.x, making the mutant semantically identical to the original. Even when gridDim.x > 1, the mutant may still compute the same Frobenius norm because the parallel reduction's correctness depends only on covering all elements without duplication, not on the specific stride pattern, as long as the loop visits each element exactly once. The previous test with 1025 elements likely launched with gridDim.x = 1, so stride remained unchanged.",
+      "kill_strategy": "Force a 3D grid launch where gridDim.z > 1 and gridDim.x ≠ gridDim.z, using an input shape that the framework maps to a 3D grid. This ensures the mutant's stride differs from the original, potentially causing incorrect element coverage or duplication. Specifically, we need total_elements large enough that the framework chooses gridDim.z > 1, and values non-zero to detect norm differences.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use the exact shape from specification; large enough to potentially use 3D grid\n    shape = (16, 64, 256, 256)\n    # Random values to avoid symmetry that could hide errors\n    data = torch.rand(shape, dtype=torch.float32, device=device) * 2.0 - 1.0  # values in [-1, 1]\n    return [data]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutant likely survived because previous inputs either had uniform values (all ones) where double-counting differences were small relative to total norm, or the launch configuration inadvertently made gridDim.x equal to gridDim.z (e.g., 1D grid with gridDim.z=1 and gridDim.x=1). In the latter case, the mutant's stride becomes blockDim.x, which still partitions the input correctly for small total elements when only one block is used. The framework may also use block sizes that minimize overlap or the reduction across blocks may use atomic operations that sum partial results, potentially masking the double-counting effect when values are symmetric.",
+      "kill_strategy": "Force a launch configuration with multiple blocks and non-uniform input values, ensuring that overlapping indices (which occur at multiples of blockDim.x) contain large magnitudes. This amplifies the double-counting error in the mutant. Choose total elements = 1025 to guarantee at least two blocks for any block size ≤1024, and set only the last element (index 1024) to an extreme value (1e6). The original will sum this value once, while the mutant will sum it multiple times across blocks, producing a norm difference of several orders of magnitude.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    shape = (1, 1, 1, 1025)\n    data = torch.zeros(shape, dtype=torch.float32, device=device)\n    data[0, 0, 0, 1024] = 1000000.0  # 1e6\n    return [data]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.928932e-01, mean_diff=2.857494e-04, ref_range=[0.0000e+00,1.0000e+00], mut_range=[0.0000e+00,7.0711e-01]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 3,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "non_uniform_block_boundary_amplification",
+    "rule_description": "Generates inputs with a strategically placed large-magnitude value at an index that falls on a block boundary when using non-uniform grid dimensions. This amplifies indexing errors caused by thread/block dimension swaps, ensuring multiple blocks are launched and creating measurable discrepancies when overlapping or incorrect indices access the amplified value. The large value magnitude ensures detection even when reductions use atomic operations or symmetric values.",
+    "applicable_operators": [
+      "index_replace",
+      "grid_stride_loop_index_error",
+      "dimension_swap"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Create tensor with all zeros\n    tensor = torch.zeros(shape, dtype=dtype, device=device)\n    \n    # Place a large value at a strategic index likely to be on a block boundary\n    # Choose the last element along the innermost dimension for maximum boundary effect\n    idx = [0] * len(shape)\n    idx[-1] = shape[-1] - 1  # Last element of innermost dimension\n    \n    # Select amplification value based on dtype to avoid overflow\n    if dtype in [torch.float32, torch.float64]:\n        amp_value = 1000000.0  # 1e6\n    elif dtype in [torch.float16, torch.bfloat16]:\n        amp_value = 1000.0\n    elif dtype.is_floating_point:\n        amp_value = 1000000.0\n    else:\n        # For integer types, use maximum value that won't overflow in common operations\n        amp_value = min(1000000, torch.iinfo(dtype).max // 2)\n    \n    tensor[tuple(idx)] = amp_value\n    \n    # Ensure tensor requires at least 2 blocks in typical configurations\n    # by making innermost dimension > typical block size (1024)\n    if shape[-1] <= 1024:\n        # If shape too small, create new tensor with expanded innermost dimension\n        new_shape = list(shape)\n        new_shape[-1] = 1025  # Force >1024 to ensure multiple blocks\n        tensor = torch.zeros(new_shape, dtype=dtype, device=device)\n        tensor[tuple(idx)] = amp_value\n    \n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    shape = (1, 1, 1, 1025)\n    data = torch.zeros(shape, dtype=torch.float32, device=device)\n    data[0, 0, 0, 1024] = 1000000.0  # 1e6\n    return [data]"
+}

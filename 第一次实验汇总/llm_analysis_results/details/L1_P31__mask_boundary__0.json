@@ -1,0 +1,57 @@
+{
+  "mutant_id": "L1_P31__mask_boundary__0",
+  "kernel_name": "L1_P31",
+  "operator_name": "mask_boundary",
+  "status": "survived",
+  "survival_reason": "The mutant survived because the Input Specification fixes the tensor shape to [16, 16384], which has 262144 elements, a multiple of 4. The kernel's tail branch (handling remainder elements) is only executed when the total size is not a multiple of 4. Since the input size is always a multiple of 4, the mutated condition in the tail branch (line 60) is never reached. Thus, the mutation is in dead code for all valid inputs under the specification, making the mutant functionally identical to the original.",
+  "killable": false,
+  "kill_strategy": "No input works because the mutated code is dead under the fixed input shape. The only way to kill it would be to change the input shape to a non-multiple of 4 to force execution of the tail branch, but the Input Specification prohibits shape changes.",
+  "recommendations": "The mutation is equivalent (unkillable) under the given Input Specification. The mutation testing tool should flag this as an 'equivalent mutant' and exclude it from analysis. If the kernel is intended to handle arbitrary sizes, the test suite should be extended with varying input shapes (including non-multiples of 4) to cover the tail branch, but this requires relaxing the shape constraint.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the original input shape [16, 16384] has a total of 262144 elements, which is divisible by 4 (vector size). The kernel processes elements in vectors of 4, and the 'else' branch (containing the mutated guard) only handles the tail when the total number of elements is not a multiple of 4. Since the total is a multiple of 4, the 'else' branch is never executed, making the mutation effectively dead code. All stress tests only varied input values but kept the same shape, so they never triggered the mutated path.",
+      "kill_strategy": "Change the input shape so the total number of elements is not a multiple of 4, forcing execution of the tail-handling 'else' branch. The mutant will then skip processing the very last element (index size-1), leaving uninitialized memory in the output at that position, while the original will compute the ELU activation. By setting the last element to a distinctive value (e.g., very negative), the difference becomes observable.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Shape chosen so total elements (32770) is not divisible by 4\n    shape = [2, 16385]\n    total_elements = shape[0] * shape[1]\n    \n    # Random values for most elements\n    input_tensor = torch.randn(shape, device=device, dtype=torch.float32)\n    \n    # Set the last element to a very negative value to produce distinctive ELU output\n    input_tensor.view(-1)[-1] = -1000.0\n    \n    return [input_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survived because the previous test didn't trigger the specific boundary condition correctly. The mutation `elem_idx < size - 1` only affects processing when `elem_idx` equals `size - 1` (the last element). In the previous test with shape [2, 16385] (32770 elements), the last thread block processes indices 32768-32771, but only indices 32768 and 32769 are valid. The mutant skips index 32769 while the original processes it. However, the output tensor allocated with `torch.empty_like` may contain uninitialized memory, which could coincidentally match the expected ELU value at that position. The stress tests might use `torch.zeros` or other initialization patterns that mask the difference.",
+      "kill_strategy": "Create an input where the last element (index size-1) has a distinctive, non-zero value, and ensure the output is compared with exact equality (not approximate). Also, force the tail-handling branch to execute by making the total size not a multiple of 4, but specifically with remainder 1, so only the last element is processed in the tail branch. Use a large positive value for the last element to avoid ELU's non-linear region and make the output distinctive.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Total elements = 4*n + 1 to force tail branch with only last element\n    # 32769 = 8192*4 + 1\n    shape = [1, 32769]\n    total_elements = shape[0] * shape[1]\n    \n    # Initialize with zeros (or any pattern) to make uninitialized memory obvious\n    input_tensor = torch.zeros(shape, device=device, dtype=torch.float32)\n    \n    # Set last element to large positive value\n    input_tensor.view(-1)[-1] = 1000.0\n    \n    return [input_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutant survived because the Input Specification fixes the tensor shape to [16, 16384], which has 262144 elements, a multiple of 4. The kernel's tail branch (handling remainder elements) is only executed when the total size is not a multiple of 4. Since the input size is always a multiple of 4, the mutated condition in the tail branch (line 60) is never reached. Thus, the mutation is in dead code for all valid inputs under the specification, making the mutant functionally identical to the original.",
+      "kill_strategy": "No input works because the mutated code is dead under the fixed input shape. The only way to kill it would be to change the input shape to a non-multiple of 4 to force execution of the tail branch, but the Input Specification prohibits shape changes.",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel contains a tail branch that is dead code for specific input sizes (multiples of 4). This creates a robustness weakness because mutations in dead code cannot be detected during testing. The kernel should either eliminate such dead code entirely or ensure all branches are exercised during testing. A better design would use uniform grid-stride loops for all elements, avoiding special-case branches that become unreachable under certain input patterns. Additionally, the kernel lacks comprehensive validation of vectorization requirements before selecting execution paths.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nimport torch.nn.functional as F\nfrom torch.utils.cpp_extension import load_inline\n\n# Optimized ELU kernel with uniform grid-stride design\nelu_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_fp16.h>\n\ntemplate<typename scalar_t>\n__device__ __forceinline__ scalar_t elu_activation(scalar_t x, scalar_t alpha) {\n    return x >= scalar_t(0) ? x : alpha * (expf(x) - scalar_t(1));\n}\n\ntemplate<typename scalar_t>\n__global__ void elu_kernel_uniform(\n    const scalar_t* __restrict__ input,\n    scalar_t* __restrict__ output,\n    scalar_t alpha,\n    int64_t size) {\n    \n    const int64_t tid = blockIdx.x * blockDim.x + threadIdx.x;\n    const int64_t stride = blockDim.x * gridDim.x;\n    \n    // Single uniform grid-stride loop - no special cases\n    for (int64_t i = tid; i < size; i += stride) {\n        scalar_t val = input[i];\n        output[i] = elu_activation<scalar_t>(val, alpha);\n    }\n}\n\ntorch::Tensor elu_cuda(torch::Tensor input, float alpha) {\n    TORCH_CHECK(input.is_cuda(), \"input must be a CUDA tensor\");\n    \n    auto input_contig = input.contiguous();\n    auto output = torch::empty_like(input_contig);\n    \n    int64_t size = input_contig.numel();\n    \n    if (size == 0) {\n        return output;\n    }\n    \n    // Optimal block size for modern GPUs\n    const int block_size = 256;\n    const int max_blocks = 256;\n    int grid_size = (size + block_size - 1) / block_size;\n    grid_size = grid_size > max_blocks ? max_blocks : grid_size;\n    \n    // Always use the uniform kernel - simpler and equally efficient\n    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), \"elu_cuda\", [&] {\n        elu_kernel_uniform<scalar_t><<<grid_size, block_size>>>(\n            input_contig.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            static_cast<scalar_t>(alpha),\n            size\n        );\n    });\n    \n    return output;\n}\n\"\"\"\n\nelu_cpp_source = \"\"\"\ntorch::Tensor elu_cuda(torch::Tensor input, float alpha);\n\"\"\"\n\n# Compile with optimizations\nelu_module = load_inline(\n    name=\"elu_module\",\n    cpp_sources=elu_cpp_source,\n    cuda_sources=elu_source,\n    functions=[\"elu_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs ELU activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self, alpha: float = 1.0):\n        super(ModelNew, self).__init__()\n        self.alpha = alpha\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        if x.is_cuda:\n            return elu_module.elu_cuda(x, self.alpha)\n        else:\n            return F.elu(x, alpha=self.alpha)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Ineffective Mutation"
+}

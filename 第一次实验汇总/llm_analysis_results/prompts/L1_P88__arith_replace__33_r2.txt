@@ -1,0 +1,115 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+      43|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      44|     
+      45|     if (idx < size) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+>>>   50|         output[idx] = __float2half(0.5f * x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+      56|     auto size = input.numel();
+      57|     auto output = torch::empty_like(input);
+      58|     
+      59|     const int block_size = 256;
+      60|     const int num_blocks = (size + block_size - 1) / block_size;
+      61|     
+      62|     AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "gelu_cuda", [&] {
+```
+
+## Mutated Code (around mutation site)
+```
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+      43|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      44|     
+      45|     if (idx < size) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+>>>   50|         output[idx] = __float2half(0.5f / x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+      56|     auto size = input.numel();
+      57|     auto output = torch::empty_like(input);
+      58|     
+      59|     const int block_size = 256;
+      60|     const int num_blocks = (size + block_size - 1) / block_size;
+      61|     
+      62|     AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "gelu_cuda", [&] {
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 50
+- Original fragment: `*`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[2000, 2000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Execute the kernel with half-precision (torch.float16) input to force usage of the mutated template specialization. Include values that expose the arithmetic difference: x=0 causes division by zero (producing inf/NaN) versus multiplication by zero (producing 0), and values where 0.5/x differs from 0.5*x (e.g., x=2.0 or x=0.5). Also include |x|=1 where both expressions coincidentally match to verify they don't mask the difference.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    dtype = torch.float16
+    # Split 2000 rows into 4 segments of 500 each
+    part0 = torch.zeros(500, 2000, device=device, dtype=dtype)          # zeros -> division by zero in mutant
+    part1 = torch.ones(500, 2000, device=device, dtype=dtype)           # ones -> same result
+    part2 = torch.full((500, 2000), -1.0, device=device, dtype=dtype)   # -1 -> same result
+    part3 = torch.full((500, 2000), 2.0, device=device, dtype=dtype)    # 2 -> different result
+    input_tensor = torch.cat([part0, part1, part2, part3], dim=0)
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=nan, mean_diff=nan, ref_range=[-1.5894e-01,1.9551e+00], mut_range=[nan,nan]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

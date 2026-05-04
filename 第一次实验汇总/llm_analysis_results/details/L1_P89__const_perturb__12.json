@@ -1,0 +1,57 @@
+{
+  "mutant_id": "L1_P89__const_perturb__12",
+  "kernel_name": "L1_P89",
+  "operator_name": "const_perturb",
+  "status": "survived",
+  "survival_reason": "The mutation changes the index calculation in the down-sweep phase but likely only affects indices beyond the original input size (4000). The kernel pads to the next power-of-two (4096) and only writes back elements with indices < 4000. The mutant's out-of-bounds accesses in shared memory (e.g., index 5119 for padded size 4096) may be within allocated shared memory (e.g., larger allocation) but do not propagate errors to the first 4000 elements. Even for small power-of-two tests, the mutant's erroneous indices target positions outside the write-back range, leaving the output correct for the valid indices.",
+  "killable": false,
+  "kill_strategy": "The mutant appears unkillable because the mutation only corrupts indices in the padded region (≥4000) or out-of-bounds memory that does not affect the output. The write-back condition `if (ai < n) ...` and `if (bi < n) ...` restricts output to the first 4000 elements, which remain unaffected regardless of input pattern.",
+  "recommendations": "Review the kernel's shared memory allocation and write-back logic. If the mutation is truly unkillable, consider adjusting the mutation operator to target indices within the write-back range or modify the test harness to detect out-of-bounds accesses (e.g., using CUDA memcheck).",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the stress tests only varied input values for a fixed shape (128, 4000). This shape is not a power of two, and the kernel likely pads shared memory to the next power of two (4096). The mutation changes the index calculation for 'bi', causing out-of-bounds accesses that fall within the padded region. The write-back conditions 'if (ai < n)' and 'if (bi < n)' skip writes beyond the actual data size (n=4000), and the down-sweep operations on out-of-bounds indices do not affect the in-bounds elements due to the algorithm's structure and the specific launch configuration. Thus, for this non-power-of-two size, the mutant produces the same output as the original.",
+      "kill_strategy": "Use a small power-of-two input size (e.g., 8) with distinct, non-zero values. This ensures the down-sweep phase uses exact indices without padding, and the mutation will cause incorrect swap/add operations, leading to a wrong prefix sum. The original algorithm works correctly for power-of-two sizes, while the mutant will compute wrong indices and produce an incorrect result.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use a small power-of-two size: 8 elements.\n    # Shape is [1, 8] to match the kernel's expectation of 2D input (batch size 1).\n    # Values are consecutive integers for a clear expected scan result.\n    data = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], device=device).reshape(1, 8)\n    return [data]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survived the previous test with a small power-of-two input (n=8) because the mutation does not affect the down-sweep for tid=0, and for n=8 (padded to 8), the indices affected by the mutation (e.g., bi for tid=1 in the last iteration) may still fall within the padded shared memory region, leading to a correct scan by coincidence. The kernel likely uses padding to the next power-of-two (4096 for n=4000), and the mutation's effect might be masked in small power-of-two cases due to limited active threads and specific values. For non-power-of-two inputs, the padding and increased thread activity could expose the index miscalculation.",
+      "kill_strategy": "Use the exact required non-power-of-two shape [128, 4000] with random values to force the kernel to pad to 4096 per row. The mutation will cause incorrect bi indices for tid>0 in the down-sweep, especially in later iterations where offset is small, leading to out-of-bounds or wrong swaps that should propagate errors to the first 4000 elements. Random values increase sensitivity to any index errors.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    torch.manual_seed(12345)\n    data = torch.randn(128, 4000, device=device, dtype=torch.float32)\n    return [data]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutation changes the index calculation in the down-sweep phase but likely only affects indices beyond the original input size (4000). The kernel pads to the next power-of-two (4096) and only writes back elements with indices < 4000. The mutant's out-of-bounds accesses in shared memory (e.g., index 5119 for padded size 4096) may be within allocated shared memory (e.g., larger allocation) but do not propagate errors to the first 4000 elements. Even for small power-of-two tests, the mutant's erroneous indices target positions outside the write-back range, leaving the output correct for the valid indices.",
+      "kill_strategy": "The mutant appears unkillable because the mutation only corrupts indices in the padded region (≥4000) or out-of-bounds memory that does not affect the output. The write-back condition `if (ai < n) ...` and `if (bi < n) ...` restricts output to the first 4000 elements, which remain unaffected regardless of input pattern.",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel's vulnerability stems from two key issues: 1) Dead code (unused inclusive_scan_kernel) that remains untested but can harbor latent bugs, and 2) Lack of bounds checking in shared memory accesses during the up/down-sweep phases. The mutation caused out-of-bounds shared memory accesses that didn't affect output due to allocation sizes exceeding requirements. To fix this: always validate indices against the allocated shared memory size, explicitly handle non-power-of-two inputs by limiting operations to valid ranges, and remove dead code to eliminate untested mutation targets.",
+  "robustness_code": "#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cassert>\n\ntemplate<typename T>\n__global__ void row_scan_kernel(const T* input, T* output, int rows, int cols) {\n    int row = blockIdx.x;\n    int tid = threadIdx.x;\n    int block_size = blockDim.x;\n    \n    if (row >= rows) return;\n    \n    extern __shared__ T shared[];\n    \n    // Bounds-checked load into shared memory\n    for (int i = tid; i < cols; i += block_size) {\n        shared[i] = input[row * cols + i];\n    }\n    __syncthreads();\n    \n    // Perform sequential scan with explicit bounds\n    if (tid == 0) {\n        for (int i = 1; i < cols; i++) {\n            shared[i] += shared[i - 1];\n        }\n    }\n    __syncthreads();\n    \n    // Bounds-checked store\n    for (int i = tid; i < cols; i += block_size) {\n        output[row * cols + i] = shared[i];\n    }\n}\n\ntorch::Tensor parallel_scan_cuda(torch::Tensor x, int dim) {\n    TORCH_CHECK(x.is_cuda(), \"Input tensor must be on GPU\");\n    TORCH_CHECK(x.is_contiguous(), \"Input tensor must be contiguous\");\n    TORCH_CHECK(dim >= 0 && dim < x.dim(), \"Invalid dimension\");\n    \n    auto sizes = x.sizes();\n    int n = sizes[dim];\n    TORCH_CHECK(n > 0, \"Scan dimension must have size > 0\");\n    \n    int total_elements = x.numel();\n    int outer_elements = total_elements / n;\n    \n    auto x_reshaped = x.reshape({outer_elements, n}).contiguous();\n    auto out = torch::zeros_like(x_reshaped);\n    \n    int threads = min(256, ((n + 31) / 32) * 32);\n    int shared_mem_size = n * sizeof(float);\n    \n    TORCH_CHECK(shared_mem_size <= 49152, \n                \"Shared memory requirement exceeds GPU limit for dimension size\");\n    \n    row_scan_kernel<float><<<outer_elements, threads, shared_mem_size>>>(\n        x_reshaped.data_ptr<float>(),\n        out.data_ptr<float>(),\n        outer_elements,\n        n\n    );\n    \n    cudaError_t err = cudaGetLastError();\n    TORCH_CHECK(err == cudaSuccess, \n                \"CUDA kernel launch failed: \", cudaGetErrorString(err));\n    \n    return out.reshape(sizes);\n}",
+  "test_construction_rule": null,
+  "cluster_label": "Out-of-Bounds Access Non-Observability"
+}

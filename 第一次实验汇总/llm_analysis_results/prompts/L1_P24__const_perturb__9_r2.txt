@@ -1,0 +1,129 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      99|     auto input_contiguous = input.contiguous();
+     100|     auto output = torch::empty_like(input_contiguous);
+     101|     
+     102|     // Only support 2D tensors with dim=1 for now
+     103|     TORCH_CHECK(input_contiguous.dim() == 2, "Input must be 2D tensor");
+     104|     TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+     105|     
+     106|     int batch_size = input_contiguous.size(0);
+     107|     int dim_size = input_contiguous.size(1);
+     108|     
+     109|     // Optimize block size
+     110|     int BLOCK_SIZE = 256;
+>>>  111|     if (dim_size <= 256) {
+     112|         BLOCK_SIZE = 128;
+     113|     } else if (dim_size <= 512) {
+     114|         BLOCK_SIZE = 256;
+     115|     } else {
+     116|         BLOCK_SIZE = 512;
+     117|     }
+     118|     
+     119|     // Ensure block size is power of 2 for reduction
+     120|     BLOCK_SIZE = min(BLOCK_SIZE, 1024);
+     121|     BLOCK_SIZE = 1 << (int)log2f(BLOCK_SIZE);
+     122|     
+     123|     dim3 grid(batch_size);
+```
+
+## Mutated Code (around mutation site)
+```
+      99|     auto input_contiguous = input.contiguous();
+     100|     auto output = torch::empty_like(input_contiguous);
+     101|     
+     102|     // Only support 2D tensors with dim=1 for now
+     103|     TORCH_CHECK(input_contiguous.dim() == 2, "Input must be 2D tensor");
+     104|     TORCH_CHECK(dim == 1, "Only dim=1 is supported");
+     105|     
+     106|     int batch_size = input_contiguous.size(0);
+     107|     int dim_size = input_contiguous.size(1);
+     108|     
+     109|     // Optimize block size
+     110|     int BLOCK_SIZE = 256;
+>>>  111|     if (dim_size <= 255) {
+     112|         BLOCK_SIZE = 128;
+     113|     } else if (dim_size <= 512) {
+     114|         BLOCK_SIZE = 256;
+     115|     } else {
+     116|         BLOCK_SIZE = 512;
+     117|     }
+     118|     
+     119|     // Ensure block size is power of 2 for reduction
+     120|     BLOCK_SIZE = min(BLOCK_SIZE, 1024);
+     121|     BLOCK_SIZE = 1 << (int)log2f(BLOCK_SIZE);
+     122|     
+     123|     dim3 grid(batch_size);
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 111
+- Original fragment: `256`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutation only affects the BLOCK_SIZE selection when dim_size is exactly 256. To kill it, we need an input tensor where dim_size=256. This will cause the original to select BLOCK_SIZE=128 (since 256 ≤ 256) and the mutant to select BLOCK_SIZE=256 (since 256 > 255). The different block sizes could cause observable differences if the kernel's computation is block-size dependent (e.g., due to reduction patterns, shared memory usage, or thread synchronization). We can exploit floating-point non-associativity in reductions (e.g., sum, softmax, variance) where different parallel decomposition leads to different rounding errors.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    batch_size = 4
+    dim_size = 256  # Critical dimension to trigger different block sizes
+    
+    # Create values that cause large rounding differences in reduction
+    # Use a mix of very large and very small numbers
+    x = torch.zeros(batch_size, dim_size, device=device)
+    for i in range(dim_size):
+        # Large positive numbers in first half
+        if i < dim_size // 2:
+            x[:, i] = 1.0e12
+        # Alternating signs for cancellation
+        elif i < 3 * dim_size // 4:
+            x[:, i] = -1.0e12 * ((-1) ** i)
+        # Very small numbers in remaining
+        else:
+            x[:, i] = 1.0e-6 * ((-1) ** i)
+    
+    # Add some random noise to break symmetry
+    x += torch.randn_like(x) * 1.0e3
+    return [x]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=5.075174e+00, mean_diff=3.171984e+00, ref_range=[-2.0000e+12,-5.0752e+00], mut_range=[-2.0000e+12,0.0000e+00]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

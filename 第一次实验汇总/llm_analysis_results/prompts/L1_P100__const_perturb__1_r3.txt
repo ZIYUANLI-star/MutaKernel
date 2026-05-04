@@ -1,0 +1,154 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+       1| import torch
+       2| import torch.nn as nn
+       3| from torch.utils.cpp_extension import load_inline
+       4| 
+       5| # Define the custom CUDA kernel for fused hinge loss computation
+       6| hinge_loss_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| 
+      10| __global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {
+>>>   11|     __shared__ float shared_mem[256];
+      12|     
+      13|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      14|     int tid = threadIdx.x;
+      15|     
+      16|     float thread_loss = 0.0f;
+      17|     
+      18|     if (idx < size) {
+      19|         float margin = 1.0f - predictions[idx] * targets[idx];
+      20|         thread_loss = margin > 0.0f ? margin : 0.0f;
+      21|     }
+      22|     
+      23|     shared_mem[tid] = thread_loss;
+```
+
+## Mutated Code (around mutation site)
+```
+       1| import torch
+       2| import torch.nn as nn
+       3| from torch.utils.cpp_extension import load_inline
+       4| 
+       5| # Define the custom CUDA kernel for fused hinge loss computation
+       6| hinge_loss_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| 
+      10| __global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {
+>>>   11|     __shared__ float shared_mem[255];
+      12|     
+      13|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      14|     int tid = threadIdx.x;
+      15|     
+      16|     float thread_loss = 0.0f;
+      17|     
+      18|     if (idx < size) {
+      19|         float margin = 1.0f - predictions[idx] * targets[idx];
+      20|         thread_loss = margin > 0.0f ? margin : 0.0f;
+      21|     }
+      22|     
+      23|     shared_mem[tid] = thread_loss;
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 11
+- Original fragment: `256`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 1], dtype=torch.float32
+  arg[1]: shape=[128, 1], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To kill this mutant, we need to trigger an out-of-bounds shared memory access by using a tensor size that forces the kernel to use a block size of 256 threads or more, where threadIdx.x = 255 would write beyond shared_mem[255]. This requires: (1) Input size > 128 to require more threads, (2) Ensure the kernel launch configuration uses blockDim.x = 256 (common for such kernels), (3) Have thread 255 compute a non-zero loss to write something detectable.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Create 512 elements to ensure block size of 256 is used (2 full blocks)
+    size = 512
+    predictions = torch.zeros(size, 1, device=device, dtype=torch.float32)
+    targets = torch.zeros(size, 1, device=device, dtype=torch.float32)
+    
+    # Set element at index 255 (thread 255 in first block) to have margin > 0
+    # Use a unique value (2.0) so any corruption affects final loss distinctively
+    predictions[255, 0] = -1.0  # margin = 1 - (-1)*0 = 1 > 0
+    targets[255, 0] = 0.0
+    
+    # Set all other elements to give zero loss to isolate the effect
+    # predictions*targets > 1 => margin < 0
+    for i in range(size):
+        if i != 255:
+            predictions[i, 0] = 10.0
+            targets[i, 0] = 10.0  # product = 100, margin = -99 -> loss = 0
+    
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Instead of assuming block size, we need to exhaustively test different block sizes that the test harness might use. We'll create inputs that trigger the issue regardless of block size by ensuring thread 255 is active AND its value affects final output. We'll use three different strategies in one test: (1) force thread 255 to be active in first block by setting size to exactly 256, (2) ensure all threads contribute to final loss so any corruption is detectable, (3) use unique, non-zero values for each thread to detect corruption in final reduction.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use exactly 256 elements to guarantee thread 255 is active if block size is 256
+    # This also ensures the kernel must launch at least one full block
+    size = 256
+    predictions = torch.empty(size, 1, device=device, dtype=torch.float32)
+    targets = torch.empty(size, 1, device=device, dtype=torch.float32)
+    
+    # Assign unique, carefully crafted values so each thread computes a distinct loss
+    # Ensure margin > 0 for all threads so every thread contributes to loss
+    # Use formula: predictions[i] = i/256, targets[i] = 1.0
+    # Then margin = 1 - (i/256)*1 = (256-i)/256 > 0 for all i < 256
+    for i in range(size):
+        predictions[i, 0] = i / 256.0  # Range [0, 0.996...]
+        targets[i, 0] = 1.0            # Positive so product is positive
+    
+    # Thread 255: predictions[255]=0.996, targets[255]=1.0
+    # margin = 1 - 0.996 = 0.004 > 0
+    # This ensures thread 255 writes a non-zero value
+    
+    return [predictions, targets]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

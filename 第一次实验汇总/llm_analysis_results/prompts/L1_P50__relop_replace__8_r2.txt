@@ -1,0 +1,115 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      57|     
+      58|     // Warp-level reduction
+      59|     scalar_t warp_product = warp_reduce_product(thread_product);
+      60|     
+      61|     // Write warp result to shared memory
+      62|     if (threadIdx.x % 32 == 0) {
+      63|         shared[threadIdx.x / 32] = warp_product;
+      64|     }
+      65|     __syncthreads();
+      66|     
+      67|     // Final reduction across warps
+      68|     if (threadIdx.x < 32) {
+>>>   69|         scalar_t val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[threadIdx.x] : scalar_t(1.0);
+      70|         scalar_t block_product = warp_reduce_product(val);
+      71|         
+      72|         if (threadIdx.x == 0) {
+      73|             output[output_offset] = block_product;
+      74|         }
+      75|     }
+      76| }
+      77| 
+      78| template<typename scalar_t>
+      79| __global__ void prod_reduction_kernel_small(
+      80|     const scalar_t* __restrict__ input,
+      81|     scalar_t* __restrict__ output,
+```
+
+## Mutated Code (around mutation site)
+```
+      57|     
+      58|     // Warp-level reduction
+      59|     scalar_t warp_product = warp_reduce_product(thread_product);
+      60|     
+      61|     // Write warp result to shared memory
+      62|     if (threadIdx.x % 32 == 0) {
+      63|         shared[threadIdx.x / 32] = warp_product;
+      64|     }
+      65|     __syncthreads();
+      66|     
+      67|     // Final reduction across warps
+      68|     if (threadIdx.x < 32) {
+>>>   69|         scalar_t val = (threadIdx.x <= (blockDim.x + 31) / 32) ? shared[threadIdx.x] : scalar_t(1.0);
+      70|         scalar_t block_product = warp_reduce_product(val);
+      71|         
+      72|         if (threadIdx.x == 0) {
+      73|             output[output_offset] = block_product;
+      74|         }
+      75|     }
+      76| }
+      77| 
+      78| template<typename scalar_t>
+      79| __global__ void prod_reduction_kernel_small(
+      80|     const scalar_t* __restrict__ input,
+      81|     scalar_t* __restrict__ output,
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 69
+- Original fragment: `<`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use a block size that is NOT a multiple of 32, making num_warps = ceil(blockDim.x/32) not equal to blockDim.x/32. Then threadIdx.x = num_warps will be valid and read uninitialized shared memory. Set all input values to a small positive non-zero number (e.g., 1.000001) so the product is finite and sensitive to the extra factor. Ensure no zeros or extreme values that could dominate or cause NaN/overflow.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    # Use a shape that forces blockDim.x = 33 (or any non-multiple of 32).
+    # We need to adjust the kernel launch, but for the test we just provide input.
+    # Since the kernel likely uses blockDim.x = last dimension (256 originally),
+    # we change last dimension to 33.
+    shape = [16, 256, 33]  # Changed last dim from 256 to 33
+    # Fill with values slightly above 1.0, so product is sensitive to extra factor
+    val = 1.000001
+    x = torch.full(shape, val, dtype=torch.float32, device=device)
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=1.000244e+00, mean_diff=3.031043e-02, ref_range=[1.0002e+00,1.0002e+00], mut_range=[0.0000e+00,1.0002e+00]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

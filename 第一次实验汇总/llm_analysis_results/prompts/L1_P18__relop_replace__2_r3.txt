@@ -1,0 +1,143 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      14|     int idy = blockIdx.y * blockDim.y + threadIdx.y;
+      15|     
+      16|     if (idx < M && idy < K) {
+      17|         A_T[idx * K + idy] = A[idy * M + idx];
+      18|     }
+      19| }
+      20| 
+      21| // Kernel for transposing matrix B (N, K) -> (K, N)
+      22| __global__ void transpose_B_kernel(const float* B, float* B_T, int N, int K) {
+      23|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      24|     int idy = blockIdx.y * blockDim.y + threadIdx.y;
+      25|     
+>>>   26|     if (idx < K && idy < N) {
+      27|         B_T[idx * N + idy] = B[idy * K + idx];
+      28|     }
+      29| }
+      30| 
+      31| torch::Tensor matmul_optimized_cuda(torch::Tensor A, torch::Tensor B) {
+      32|     // Get dimensions
+      33|     int K = A.size(0);
+      34|     int M = A.size(1);
+      35|     int N = B.size(0);
+      36|     
+      37|     // Create output tensor
+      38|     auto C = torch::zeros({M, N}, A.options());
+```
+
+## Mutated Code (around mutation site)
+```
+      14|     int idy = blockIdx.y * blockDim.y + threadIdx.y;
+      15|     
+      16|     if (idx < M && idy < K) {
+      17|         A_T[idx * K + idy] = A[idy * M + idx];
+      18|     }
+      19| }
+      20| 
+      21| // Kernel for transposing matrix B (N, K) -> (K, N)
+      22| __global__ void transpose_B_kernel(const float* B, float* B_T, int N, int K) {
+      23|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      24|     int idy = blockIdx.y * blockDim.y + threadIdx.y;
+      25|     
+>>>   26|     if (idx <= K && idy < N) {
+      27|         B_T[idx * N + idy] = B[idy * K + idx];
+      28|     }
+      29| }
+      30| 
+      31| torch::Tensor matmul_optimized_cuda(torch::Tensor A, torch::Tensor B) {
+      32|     // Get dimensions
+      33|     int K = A.size(0);
+      34|     int M = A.size(1);
+      35|     int N = B.size(0);
+      36|     
+      37|     // Create output tensor
+      38|     auto C = torch::zeros({M, N}, A.options());
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 26
+- Original fragment: `<`
+
+## Input Specification
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[4096, 1024], dtype=torch.float32
+  arg[1]: shape=[2048, 4096], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input shape so that K is not a multiple of the block size, causing the grid to launch extra threads with idx=K. The mutant will then perform an out-of-bounds write at B_T[idx * N + idy] where idx=K, potentially causing a crash or memory corruption. The original kernel correctly rejects this thread with the `<` condition.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Choose K=63 (64-1) to be non-multiple of typical block sizes (16,32,64).
+    # This ensures grid.x = ceil(63/blockDim.x) launches extra threads.
+    K = 63
+    M = 10
+    N = 20
+    A = torch.randn(K, M, device=device, dtype=torch.float32)
+    B = torch.randn(N, K, device=device, dtype=torch.float32)
+    return [A, B]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Force the kernel to write beyond B_T's allocation into memory that will definitely be accessed later. Since B_T is used in subsequent matrix multiplication, we should make the out-of-bounds write corrupt adjacent memory that's part of the computation. We'll create inputs where: (1) K is carefully chosen so grid dimension ensures idx=K threads exist, and (2) The corrupted memory corresponds to either the output tensor C or the transposed A matrix in shared memory layout.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    # Choose dimensions that expose the idx=K boundary
+    K = 255  # One less than power of 2 to ensure extra threads
+    M = 256
+    N = 256
+    
+    # Create patterns that make corruption detectable
+    # A: shape [K, M] = [255, 256]
+    A = torch.arange(K * M, dtype=torch.float32, device=device).view(K, M) * 0.001
+    # B: shape [N, K] = [256, 255]
+    B = torch.arange(N * K, dtype=torch.float32, device=device).view(N, K) * 0.001 + 100.0
+    
+    # Add small noise to avoid pure linear patterns
+    A = A + torch.randn_like(A) * 0.001
+    B = B + torch.randn_like(B) * 0.001
+    
+    return [A, B]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

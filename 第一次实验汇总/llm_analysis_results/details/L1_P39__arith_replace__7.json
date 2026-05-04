@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P39__arith_replace__7",
+  "kernel_name": "L1_P39",
+  "operator_name": "arith_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The previous attempts failed because they targeted extremely small sum-of-squares values (≤1e-8), which caused numerical instability in both the original and mutant kernels, leading to both producing NaN/Inf outputs (original_ok=False, mutant_ok=False). The original kernel's +1e-8 epsilon should guarantee positive sqrt arguments, but small norms cause large scale factors (up to 1e4), which—when multiplied by non-zero inputs—can overflow to Inf if intermediate calculations exceed float32 range. The mutant's -1e-8 epsilon introduces NaN for sdata[0] < 1e-8, but the original also fails due to overflow, making differentiation impossible. The key is to avoid overflow in the original while exploiting the mutant's negative sqrt argument.",
+  "killable": true,
+  "kill_strategy": "Use a moderately small sum-of-squares value (e.g., 2e-8) where sdata[0] > 1e-8, ensuring the mutant's sqrt argument remains positive but smaller than the original's. This produces different finite scale factors, leading to diverging normalized outputs. Choose an input distribution that avoids overflow in the original (scale ~1/sqrt(2e-8) ≈ 7071) and uses multiple non-zero elements to keep individual values small, preventing overflow when scaled.",
+  "recommendations": "If this test still fails (e.g., both kernels produce similar outputs due to rounding or shared overflow), consider using a sum-of-squares slightly above 1e-8 (e.g., 1.0001e-8) to minimize scale magnitude. Also verify the reduction correctly aggregates across all threads; if the kernel uses multiple blocks, the per-block sum may differ from the global sum, requiring adjustment. Finally, check if the mutant's scale computation could be masked by subsequent operations (e.g., type casting).",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because all stress tests that could potentially expose the difference (e.g., near-zero inputs where sum of squares < 1e-8) caused the original kernel to fail (REF_FAIL) with NaN/crashes, preventing comparison. The mutation changes sqrtf(sdata[0] + 1e-8f) to sqrtf(sdata[0] - 1e-8f), which only produces divergent behavior when sdata[0] < 1e-8. However, the original kernel itself appears numerically unstable for extreme inputs—likely due to underflow in the tree reduction or overflow during normalization—making it impossible to distinguish from the mutant in those regimes. For normal inputs where sdata[0] >> 1e-8, the epsilon perturbation is negligible, so both kernels produce identical outputs within floating-point tolerance.",
+      "kill_strategy": "Design an input where the sum of squares per batch is strictly between 0 and 1e-8 (e.g., ~5e-9), ensuring the original kernel computes a finite positive norm (since it adds epsilon) while the mutant attempts sqrt(negative) → NaN. This requires carefully controlling the magnitude so that sdata[0] is small but non-zero, avoiding underflow in the reduction and preventing the original kernel from failing.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    val = math.sqrt(5e-9)  # ~7.071067811865475e-05\n    x = torch.zeros(batch_size, dim, device=device, dtype=torch.float32)\n    x[:, 0] = val  # First element of each batch set to val\n    return [x]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,1.0000e+00], mut_range=[nan,nan]",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The previous analysis correctly identified that the mutation can cause sqrtf(negative) → NaN when sdata[0] < 1e-8f. However, the implementation appears to have numerical issues when sdata[0] is very small but non-zero. The failed test shows both original and mutant kernels failing (original_ok=False, mutant_ok=False), suggesting there's additional validation or numerical instability in the kernel when handling extremely small norms. The mutant survives because the problematic regime (tiny norms) causes both implementations to fail, making them indistinguishable to the test harness. The mutation only changes behavior when sdata[0] is between 0 and 1e-8f, but if both implementations crash in that regime, the mutant remains undetected.",
+      "kill_strategy": "Instead of focusing on extremely small norms where both may fail, target the boundary where sdata[0] is exactly 1e-8f. The original computes sqrtf(2e-8f) ≈ 1.414e-4, while the mutant computes sqrtf(0) = 0, leading to division by zero (1/0 → inf). This should cause the mutant to produce inf values while the original produces finite values around 7071.07. Use exact 1e-8f sum by setting appropriate input values.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    target_sum = 1e-8  # Exact boundary value\n    val = math.sqrt(target_sum)  # sqrt(1e-8) ≈ 0.0001\n    x = torch.zeros(batch_size, dim, device=device, dtype=torch.float32)\n    # Set first element of each batch to achieve exact sum of squares = 1e-8\n    x[:, 0] = val\n    return [x]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,1.0000e+00], mut_range=[nan,nan]",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The previous attempts failed because they targeted extremely small sum-of-squares values (≤1e-8), which caused numerical instability in both the original and mutant kernels, leading to both producing NaN/Inf outputs (original_ok=False, mutant_ok=False). The original kernel's +1e-8 epsilon should guarantee positive sqrt arguments, but small norms cause large scale factors (up to 1e4), which—when multiplied by non-zero inputs—can overflow to Inf if intermediate calculations exceed float32 range. The mutant's -1e-8 epsilon introduces NaN for sdata[0] < 1e-8, but the original also fails due to overflow, making differentiation impossible. The key is to avoid overflow in the original while exploiting the mutant's negative sqrt argument.",
+      "kill_strategy": "Use a moderately small sum-of-squares value (e.g., 2e-8) where sdata[0] > 1e-8, ensuring the mutant's sqrt argument remains positive but smaller than the original's. This produces different finite scale factors, leading to diverging normalized outputs. Choose an input distribution that avoids overflow in the original (scale ~1/sqrt(2e-8) ≈ 7071) and uses multiple non-zero elements to keep individual values small, preventing overflow when scaled.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    target_sum = 2e-8  # Exact value > 1e-8\n    num_nonzero = 1024  # Spread across batch to keep each value small\n    val_per_element = math.sqrt(target_sum / num_nonzero)  # ~1.41421356e-06\n    x = torch.zeros(batch_size, dim, device=device, dtype=torch.float32)\n    # Set first 1024 elements of each batch to the computed value\n    x[:, :num_nonzero] = val_per_element\n    return [x]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.294417e-02, mean_diff=8.090108e-04, ref_range=[0.0000e+00,3.1250e-02], mut_range=[0.0000e+00,4.4194e-02]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 3,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "epsilon_sign_flip_norm_boundary",
+    "rule_description": "This rule generates inputs where the sum of squares per batch is exactly 2*epsilon, where epsilon is the small constant added/subtracted in normalization kernels. This creates a boundary condition where the original kernel's sqrt(3*epsilon) and mutant's sqrt(epsilon) produce distinct, finite scale factors without overflow/underflow. Input values are small but non-zero to avoid numerical instability.",
+    "applicable_operators": [
+      "arith_replace",
+      "const_replace",
+      "expr_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # Configuration for epsilon boundary test\n    EPS = 1e-8  # Common epsilon value in normalization kernels\n    TARGET_SUM = 2 * EPS  # 2*epsilon boundary\n    \n    # Ensure we have at least batch dimension\n    if len(shape) == 1:\n        batch_size = 1\n        feature_dim = shape[0]\n    else:\n        batch_size = shape[0]\n        feature_dim = shape[1]\n    \n    # Use ~10% non-zero elements to keep values small but spread out\n    num_nonzero = max(1, int(feature_dim * 0.1))\n    \n    # Compute value per element to achieve exact target sum\n    val_per_element = math.sqrt(TARGET_SUM / num_nonzero)\n    \n    # Create tensor with controlled sum of squares\n    x = torch.zeros(shape, device=device, dtype=dtype)\n    for b in range(batch_size):\n        # Place non-zero elements at deterministic positions\n        indices = torch.arange(num_nonzero, device=device)\n        if len(shape) == 1:\n            x[indices] = val_per_element\n        else:\n            x[b, indices] = val_per_element\n    \n    # Verify the construction (optional, for debugging)\n    if len(shape) == 1:\n        actual_sum = (x ** 2).sum().item()\n    else:\n        actual_sum = (x[0] ** 2).sum().item()  # Check first batch\n    \n    return x"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    target_sum = 2e-8  # Exact value > 1e-8\n    num_nonzero = 1024  # Spread across batch to keep each value small\n    val_per_element = math.sqrt(target_sum / num_nonzero)  # ~1.41421356e-06\n    x = torch.zeros(batch_size, dim, device=device, dtype=torch.float32)\n    # Set first 1024 elements of each batch to the computed value\n    x[:, :num_nonzero] = val_per_element\n    return [x]"
+}

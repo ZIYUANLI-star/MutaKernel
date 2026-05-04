@@ -1,0 +1,57 @@
+{
+  "mutant_id": "L1_P100__const_perturb__1",
+  "kernel_name": "L1_P100",
+  "operator_name": "const_perturb",
+  "status": "survived",
+  "survival_reason": "The input specification fixes tensors to shape [128,1], so the kernel only processes 128 elements. The test harness likely uses a block size of 128 or less (common for power-of-two sizes). With blockDim.x ≤ 128, threadIdx.x never reaches 255, so the mutated shared_mem[255] is large enough to avoid out-of-bounds writes. Both original (size 256) and mutant (size 255) have sufficient capacity, making the mutant behavior identical for all valid inputs.",
+  "killable": false,
+  "kill_strategy": "No input can kill this mutant under the given constraints. The fixed input size of 128 prevents triggering an out-of-bounds access because the maximum thread index (127) is within the mutated shared memory bounds.",
+  "recommendations": "To make this mutant killable, the input specification must allow larger sizes (≥256) to force block sizes of 256, where thread 255 would write out-of-bounds. Alternatively, the test harness could be modified to use a fixed block size of 256 regardless of input size, but that's not controllable via inputs.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survives because the original kernel's block size is likely less than or equal to 256 threads, and the mutated shared memory size of 255 is still sufficient for all active threads. The stress tests only varied input values while keeping the tensor shape fixed at [128, 1] = 128 elements. With 128 elements, a common block size would be 128 threads, which fits within both shared memory allocations (256 and 255). No out-of-bounds access occurs because threadIdx.x never reaches 255. The mutation only affects potential future usage with larger block sizes, not the current execution pattern.",
+      "kill_strategy": "To kill this mutant, we need to trigger an out-of-bounds shared memory access by using a tensor size that forces the kernel to use a block size of 256 threads or more, where threadIdx.x = 255 would write beyond shared_mem[255]. This requires: (1) Input size > 128 to require more threads, (2) Ensure the kernel launch configuration uses blockDim.x = 256 (common for such kernels), (3) Have thread 255 compute a non-zero loss to write something detectable.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Create 512 elements to ensure block size of 256 is used (2 full blocks)\n    size = 512\n    predictions = torch.zeros(size, 1, device=device, dtype=torch.float32)\n    targets = torch.zeros(size, 1, device=device, dtype=torch.float32)\n    \n    # Set element at index 255 (thread 255 in first block) to have margin > 0\n    # Use a unique value (2.0) so any corruption affects final loss distinctively\n    predictions[255, 0] = -1.0  # margin = 1 - (-1)*0 = 1 > 0\n    targets[255, 0] = 0.0\n    \n    # Set all other elements to give zero loss to isolate the effect\n    # predictions*targets > 1 => margin < 0\n    for i in range(size):\n        if i != 255:\n            predictions[i, 0] = 10.0\n            targets[i, 0] = 10.0  # product = 100, margin = -99 -> loss = 0\n    \n    return [predictions, targets]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant changes shared memory size from 256 to 255, which should cause out-of-bounds writes when blockDim.x = 256. However, the mutant survived all tests, suggesting the kernel launch configuration may use a different block size than 256. The previous attempt assumed the kernel uses 256 threads per block, but the test harness may use a different configuration (possibly 128, which matches the input size). Additionally, even with 256 threads, thread 255's out-of-bounds write might not corrupt observable output if: (1) the reduction step ignores out-of-bounds values, (2) the kernel uses atomic operations that bypass shared memory for thread 255, or (3) the kernel has bounds checking elsewhere that prevents the write.",
+      "kill_strategy": "Instead of assuming block size, we need to exhaustively test different block sizes that the test harness might use. We'll create inputs that trigger the issue regardless of block size by ensuring thread 255 is active AND its value affects final output. We'll use three different strategies in one test: (1) force thread 255 to be active in first block by setting size to exactly 256, (2) ensure all threads contribute to final loss so any corruption is detectable, (3) use unique, non-zero values for each thread to detect corruption in final reduction.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Use exactly 256 elements to guarantee thread 255 is active if block size is 256\n    # This also ensures the kernel must launch at least one full block\n    size = 256\n    predictions = torch.empty(size, 1, device=device, dtype=torch.float32)\n    targets = torch.empty(size, 1, device=device, dtype=torch.float32)\n    \n    # Assign unique, carefully crafted values so each thread computes a distinct loss\n    # Ensure margin > 0 for all threads so every thread contributes to loss\n    # Use formula: predictions[i] = i/256, targets[i] = 1.0\n    # Then margin = 1 - (i/256)*1 = (256-i)/256 > 0 for all i < 256\n    for i in range(size):\n        predictions[i, 0] = i / 256.0  # Range [0, 0.996...]\n        targets[i, 0] = 1.0            # Positive so product is positive\n    \n    # Thread 255: predictions[255]=0.996, targets[255]=1.0\n    # margin = 1 - 0.996 = 0.004 > 0\n    # This ensures thread 255 writes a non-zero value\n    \n    return [predictions, targets]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The input specification fixes tensors to shape [128,1], so the kernel only processes 128 elements. The test harness likely uses a block size of 128 or less (common for power-of-two sizes). With blockDim.x ≤ 128, threadIdx.x never reaches 255, so the mutated shared_mem[255] is large enough to avoid out-of-bounds writes. Both original (size 256) and mutant (size 255) have sufficient capacity, making the mutant behavior identical for all valid inputs.",
+      "kill_strategy": "No input can kill this mutant under the given constraints. The fixed input size of 128 prevents triggering an out-of-bounds access because the maximum thread index (127) is within the mutated shared memory bounds.",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel contains a hard-coded shared memory size (256) that assumes a specific thread block configuration. This creates two robustness issues: 1) The shared array size isn't validated against the actual block dimension, leading to potential out-of-bounds access if blockDim.x > 256. 2) The reduction loop assumes blockDim.x is a power of two, which may fail for other block sizes. To make the kernel robust, always declare shared memory with a size that matches the actual launch configuration, either through dynamic allocation or compile-time validation. This ensures memory safety regardless of block size changes.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cassert>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    extern __shared__ float shared_mem[];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Validate block size is power of two for reduction\n    assert((block_size & (block_size - 1)) == 0 && \"Block size must be power of two\");\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel with dynamic shared memory\n    size_t shared_mem_size = block_size * sizeof(float);\n    hinge_loss_kernel<<<num_blocks, block_size, shared_mem_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Out-of-Bounds Access Non-Observability"
+}

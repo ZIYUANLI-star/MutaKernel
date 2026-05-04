@@ -1,0 +1,58 @@
+{
+  "mutant_id": "L1_P47__index_replace__3",
+  "kernel_name": "L1_P47",
+  "operator_name": "index_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant likely survived because the previous test's inner_size (257) was still too small relative to the actual blockDim.x used by the test framework, causing grid.y to remain 1 (e.g., if blockDim.x=1024). With grid.y=1, both the original and mutant kernels use only blockIdx.y=0 (or blockIdx.z=0), making them equivalent. Additionally, even if grid.y>1, the mutant's use of blockIdx.z (always 0) leads to repeated writes to the same inner indices from multiple blocks, but the original kernel writes to distinct indices. However, if the output tensor is not zero-initialized, the missing writes in the mutant might be filled with uninitialized memory that coincidentally matches the expected values, though this is unlikely. The key issue is ensuring grid.y>1 regardless of blockDim.x.",
+  "killable": true,
+  "kill_strategy": "Use a very large inner_size (2000) to guarantee grid.y>1 even if blockDim.x is at its maximum (1024). This forces the mutant to compute only the first blockDim.x inner indices and leave the rest uninitialized, while the original kernel computes all inner indices. Random input values ensure each inner index has a unique sum, making missing writes detectable. Also, small outer_size and reduce_size keep the test fast.",
+  "recommendations": "For mutation testing, ensure test inputs are robust to varying launch configurations by exceeding hardware limits (e.g., blockDim.x max). Use random, non-uniform data to avoid accidental equivalence. Consider zero-initializing output tensors in the test harness to make missing writes obvious.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutation changed `blockIdx.y` to `blockIdx.z` for computing the inner index. Since the kernel launch configuration uses a 2D grid (x and y dimensions only), `blockIdx.z` is always 0. The original kernel's grid is configured such that `blockIdx.y` spans the inner dimension. With the fixed test input shape [16, 256, 256] and typical block size of 256, the grid's y-dimension size is ⌈256/256⌉ = 1. Thus, both `blockIdx.y` and `blockIdx.z` evaluate to 0, making the mutant equivalent to the original. The stress tests only varied values within the same shape, so this equivalence persisted.",
+      "kill_strategy": "Change the input shape to require multiple blocks in the y-dimension by increasing `inner_size` beyond the block's x-dimension (typically 256). The original kernel will use `blockIdx.y` to cover the full inner range, while the mutant's `blockIdx.z` remains 0, causing it to compute only the first block's worth of inner indices and leave the rest uninitialized (or zero if output is zero-initialized). Using an `inner_size` not divisible by the block size ensures the last block is partially filled, making the missing computations detectable.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    outer_size = 16\n    reduce_size = 256\n    inner_size = 257  # > typical blockDim.x (256)\n    input_tensor = torch.ones(outer_size, reduce_size, inner_size, device=device, dtype=torch.float32)\n    return [input_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant likely survived because the previous test's inner_size (257) was still too small relative to the actual blockDim.x used by the test framework, causing grid.y to remain 1 (e.g., if blockDim.x=1024). With grid.y=1, both the original and mutant kernels use only blockIdx.y=0 (or blockIdx.z=0), making them equivalent. Additionally, even if grid.y>1, the mutant's use of blockIdx.z (always 0) leads to repeated writes to the same inner indices from multiple blocks, but the original kernel writes to distinct indices. However, if the output tensor is not zero-initialized, the missing writes in the mutant might be filled with uninitialized memory that coincidentally matches the expected values, though this is unlikely. The key issue is ensuring grid.y>1 regardless of blockDim.x.",
+      "kill_strategy": "Use a very large inner_size (2000) to guarantee grid.y>1 even if blockDim.x is at its maximum (1024). This forces the mutant to compute only the first blockDim.x inner indices and leave the rest uninitialized, while the original kernel computes all inner indices. Random input values ensure each inner index has a unique sum, making missing writes detectable. Also, small outer_size and reduce_size keep the test fast.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    outer_size = 2\n    reduce_size = 3\n    inner_size = 2000  # Ensures grid.y > 1 even if blockDim.x = 1024\n    input_tensor = torch.randn(outer_size, reduce_size, inner_size, device=device, dtype=torch.float32)\n    return [input_tensor]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.195624e+01, mean_diff=1.205811e+00, ref_range=[-5.9781e+00,6.0174e+00], mut_range=[-5.3571e+00,6.0174e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 2,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "force_multiple_grid_dimensions",
+    "rule_description": "Generates inputs where at least one dimension significantly exceeds typical block sizes (e.g., >1024) to ensure multiple blocks are launched in multiple grid dimensions. This reveals index-swapping mutants that incorrectly map threads to data elements when grid dimensions differ.",
+    "applicable_operators": [
+      "index_replace",
+      "dimension_swap",
+      "thread_id_mutation"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Determine the largest dimension in the original shape\n    max_dim_idx = max(range(len(shape)), key=lambda i: shape[i])\n    # Create a modified shape where the largest dimension is increased to 2000\n    # (or at least >1024) to guarantee multiple blocks even with max blockDim.x\n    modified_shape = list(shape)\n    modified_shape[max_dim_idx] = max(2000, shape[max_dim_idx] + 1024)\n    \n    # Generate random non-zero data to ensure distinct outputs\n    if dtype.is_floating_point:\n        tensor = torch.rand(*modified_shape, device=device, dtype=dtype, generator=rng) * 2 - 1  # uniform [-1, 1]\n        # Avoid exact zeros to prevent masking errors\n        tensor[tensor == 0] = 0.001\n    else:\n        # For integer types, generate values in a non-zero range\n        tensor = torch.randint(1, 100, modified_shape, device=device, dtype=dtype, generator=rng)\n    return tensor"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\ndef generate_inputs(device):\n    outer_size = 2\n    reduce_size = 3\n    inner_size = 2000  # Ensures grid.y > 1 even if blockDim.x = 1024\n    input_tensor = torch.randn(outer_size, reduce_size, inner_size, device=device, dtype=torch.float32)\n    return [input_tensor]"
+}

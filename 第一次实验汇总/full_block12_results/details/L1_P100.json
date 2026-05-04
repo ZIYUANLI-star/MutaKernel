@@ -1,0 +1,296 @@
+{
+  "kernel": {
+    "problem_id": 100,
+    "level": 1,
+    "problem_name": "L1_P100",
+    "language": "cuda"
+  },
+  "summary": {
+    "total": 16,
+    "killed": 5,
+    "survived": 9,
+    "stillborn": 2,
+    "equivalent": 0,
+    "mutation_score": 0.3571,
+    "score_by_category": {
+      "A": 0.3333,
+      "B": 0.375,
+      "C": 0.0,
+      "D": 0.0
+    }
+  },
+  "mutants": [
+    {
+      "id": "L1_P100__arith_replace__9",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L58",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 43034.59453582764,
+      "site": {
+        "line_start": 58,
+        "line_end": 58,
+        "original_code": "/",
+        "node_type": "cuda_Div"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() * size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__arith_replace__7",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L44",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 43900.22134780884,
+      "site": {
+        "line_start": 44,
+        "line_end": 44,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size + 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__arith_replace__2",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L19",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 40764.06264305115,
+      "site": {
+        "line_start": 19,
+        "line_end": 19,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f + predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__relop_replace__3",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L27",
+      "status": "stillborn",
+      "error_message": "Subprocess timeout/crash (180s)",
+      "kill_input_seed": null,
+      "execution_time_ms": 180000,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": ">=",
+        "node_type": "cuda_GtE"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >> 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__relop_replace__2",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L27",
+      "status": "stillborn",
+      "error_message": "Subprocess timeout/crash (180s)",
+      "kill_input_seed": null,
+      "execution_time_ms": 180000,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride >= 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__relop_replace__4",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L28",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 33545.09115219116,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "<",
+        "node_type": "cuda_Lt"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid <= stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__const_perturb__1",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L11",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 33445.5509185791,
+      "site": {
+        "line_start": 11,
+        "line_end": 11,
+        "original_code": "256",
+        "node_type": "const:int-1"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[255];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__const_perturb__0",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L11",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 31574.150562286377,
+      "site": {
+        "line_start": 11,
+        "line_end": 11,
+        "original_code": "256",
+        "node_type": "const:int+1"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[257];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__index_replace__0",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L13",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 33876.94025039673,
+      "site": {
+        "line_start": 13,
+        "line_end": 13,
+        "original_code": "blockIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.y * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__index_replace__1",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L13",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 33779.61564064026,
+      "site": {
+        "line_start": 13,
+        "line_end": 13,
+        "original_code": "blockIdx.x",
+        "node_type": "cuda_dim|z"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.z * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__index_replace__4",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L13",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 33961.83085441589,
+      "site": {
+        "line_start": 13,
+        "line_end": 13,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.y;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__sync_remove__0",
+      "operator_name": "sync_remove",
+      "operator_category": "B",
+      "description": "Remove GPU synchronization barriers (tl.debug_barrier, __syncthreads) @ L24",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 31651.358604431152,
+      "site": {
+        "line_start": 24,
+        "line_end": 24,
+        "original_code": "__syncthreads();",
+        "node_type": "cuda_syncthreads"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__sync_remove__1",
+      "operator_name": "sync_remove",
+      "operator_category": "B",
+      "description": "Remove GPU synchronization barriers (tl.debug_barrier, __syncthreads) @ L31",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 34015.605449676514,
+      "site": {
+        "line_start": 31,
+        "line_end": 31,
+        "original_code": "__syncthreads();",
+        "node_type": "cuda_syncthreads"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__mask_boundary__0",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L18",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 31668.262481689453,
+      "site": {
+        "line_start": 18,
+        "line_end": 18,
+        "original_code": "idx < size",
+        "node_type": "rhs-1"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size - 1) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__mask_boundary__1",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L28",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 33479.580879211426,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "tid < stride",
+        "node_type": "rhs-1"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride - 1) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    },
+    {
+      "id": "L1_P100__launch_config_mutate__0",
+      "operator_name": "launch_config_mutate",
+      "operator_category": "B",
+      "description": "Perturb grid/block sizing expressions (// BLOCK, triton.cdiv) by ±1 @ L44",
+      "status": "killed",
+      "error_message": "Runtime trial 0: CUDA error: invalid configuration argument\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_L",
+      "kill_input_seed": 42,
+      "execution_time_ms": 31673.505544662476,
+      "site": {
+        "line_start": 44,
+        "line_end": 44,
+        "original_code": "(size + block_size - 1) / block_size",
+        "node_type": "-1"
+      },
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size - 1;\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)"
+    }
+  ]
+}

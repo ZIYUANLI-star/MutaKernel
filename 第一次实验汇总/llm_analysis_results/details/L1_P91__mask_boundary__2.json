@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P91__mask_boundary__2",
+  "kernel_name": "L1_P91",
+  "operator_name": "mask_boundary",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant changes the boundary condition from `inner_idx >= inner_size` to `inner_idx > inner_size`. In the original test suite, the kernel is always called with `inner_size = 1` (since the input is 2D shape [128, 4000], interpreted as [outer_size=128, dim_size=4000, inner_size=1]). The launch configuration is set to exactly `inner_size` threads, so `inner_idx` only takes values 0..0, never reaching the boundary. Thus, the mutated condition behaves identically because no thread ever satisfies `inner_idx == inner_size` (which would be 1) to expose the difference. The stress tests only varied input values, not shapes, so the mutant survived.",
+  "killable": true,
+  "kill_strategy": "To kill the mutant, we must use a 3D tensor where `inner_size > 1` and a launch configuration that creates extra threads (i.e., total threads > inner_size). This allows a thread with `inner_idx == inner_size` to execute. Such a thread will compute out-of-bounds memory accesses, potentially corrupting adjacent data in the tensor. By carefully choosing values, we can make the out-of-bounds writes affect visible outputs, causing a divergence from the original kernel.",
+  "recommendations": "1. Kernel robustness: Consider using a stricter launch configuration that exactly matches the number of needed threads (i.e., total threads = outer_size * inner_size). Alternatively, adjust the boundary condition to be more explicit: `if (inner_idx >= inner_size) return;` is correct, but ensure the launch grid is derived as `ceil(inner_size / blockDim.x)` to avoid extra threads. 2. Test suite improvement: Include varying tensor ranks (2D and 3D) and shapes where inner_size is not a power of two or not a multiple of the block size. This would expose boundary-condition mutants that survive due to insufficient thread coverage.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant changes the boundary condition from `inner_idx >= inner_size` to `inner_idx > inner_size`. In the original test suite, the kernel is always called with `inner_size = 1` (since the input is 2D shape [128, 4000], interpreted as [outer_size=128, dim_size=4000, inner_size=1]). The launch configuration is set to exactly `inner_size` threads, so `inner_idx` only takes values 0..0, never reaching the boundary. Thus, the mutated condition behaves identically because no thread ever satisfies `inner_idx == inner_size` (which would be 1) to expose the difference. The stress tests only varied input values, not shapes, so the mutant survived.",
+      "kill_strategy": "To kill the mutant, we must use a 3D tensor where `inner_size > 1` and a launch configuration that creates extra threads (i.e., total threads > inner_size). This allows a thread with `inner_idx == inner_size` to execute. Such a thread will compute out-of-bounds memory accesses, potentially corrupting adjacent data in the tensor. By carefully choosing values, we can make the out-of-bounds writes affect visible outputs, causing a divergence from the original kernel.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Shape: [outer_size, dim_size, inner_size] = [2, 2, 2]\n    # Values chosen so that the extra thread (inner_idx=2) reads 5 and 3,\n    # writes 5 to index 4 (which the valid thread would overwrite with 12).\n    # The original kernel never runs the extra thread, so index 4 becomes 12.\n    # The mutant may write 5 or 12 depending on race, exposing a difference.\n    data = [\n        [[1.0, 2.0], [3.0, 4.0]],  # outer_idx = 0\n        [[5.0, 6.0], [7.0, 8.0]]   # outer_idx = 1\n    ]\n    input_tensor = torch.tensor(data, dtype=torch.float32, device=device)\n    return [input_tensor]\n",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=5.000000e+00, mean_diff=6.250000e-01, ref_range=[3.0000e+00,1.4000e+01], mut_range=[4.0000e+00,1.4000e+01]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "boundary_expansion_3d_input",
+    "rule_description": "Generates 3D tensors where the innermost dimension is >1 and launch configuration may create extra threads. This exposes boundary condition mutations by ensuring threads with indices at or beyond the original boundary execute, revealing differences in masking logic. Values are set to be distinct to detect out-of-bounds writes or race conditions.",
+    "applicable_operators": [
+      "mask_boundary",
+      "mask_expansion",
+      "guard_removal"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Ensure we have at least 3 dimensions for this rule\n    if len(shape) < 3:\n        # If original shape has fewer dims, expand to 3D with inner_size=2\n        # Outer size = max(2, shape[0] if exists else 2)\n        # Dim size = shape[1] if exists else 2\n        # Inner size = 2 (critical for boundary exposure)\n        outer = shape[0] if len(shape) > 0 else 2\n        dim = shape[1] if len(shape) > 1 else 2\n        inner = 2  # Force inner dimension >1\n        shape = (max(2, outer), max(2, dim), inner)\n    else:\n        # Keep outer and middle dimensions but ensure inner dimension >= 2\n        shape = (max(2, shape[0]), max(2, shape[1]), max(2, shape[2]))\n    \n    # Generate distinct values to detect incorrect writes\n    total_elements = shape[0] * shape[1] * shape[2]\n    # Create a sequence of distinct values\n    if dtype.is_floating_point:\n        # For floating point, use incrementing sequence\n        data = torch.arange(total_elements, dtype=dtype, device=device).view(shape)\n    else:\n        # For integer types, use modulo to stay in type range\n        max_val = min(torch.iinfo(dtype).max, 1000) if hasattr(torch, 'iinfo') else 100\n        data = torch.randint(0, max_val, (total_elements,), dtype=dtype, device=device, generator=rng)\n        data = data.view(shape)\n    \n    return data"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    # Shape: [outer_size, dim_size, inner_size] = [2, 2, 2]\n    # Values chosen so that the extra thread (inner_idx=2) reads 5 and 3,\n    # writes 5 to index 4 (which the valid thread would overwrite with 12).\n    # The original kernel never runs the extra thread, so index 4 becomes 12.\n    # The mutant may write 5 or 12 depending on race, exposing a difference.\n    data = [\n        [[1.0, 2.0], [3.0, 4.0]],  # outer_idx = 0\n        [[5.0, 6.0], [7.0, 8.0]]   # outer_idx = 1\n    ]\n    input_tensor = torch.tensor(data, dtype=torch.float32, device=device)\n    return [input_tensor]\n"
+}

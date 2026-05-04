@@ -1,0 +1,137 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      31|     
+      32|     if (idx < size) {
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      36|         T tanh_val = fast_tanh<T>(inner);
+      37|         output[idx] = T(0.5f) * x * (T(1.0f) + tanh_val);
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+>>>   43|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      44|     
+      45|     if (idx < size) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+      50|         output[idx] = __float2half(0.5f * x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+```
+
+## Mutated Code (around mutation site)
+```
+      31|     
+      32|     if (idx < size) {
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      36|         T tanh_val = fast_tanh<T>(inner);
+      37|         output[idx] = T(0.5f) * x * (T(1.0f) + tanh_val);
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+>>>   43|     int idx = blockIdx.x * blockDim.x - threadIdx.x;
+      44|     
+      45|     if (idx < size) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+      50|         output[idx] = __float2half(0.5f * x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 43
+- Original fragment: `+`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[2000, 2000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Switch the input dtype from float32 to float16 (torch.float16). This will cause the mutated half-precision kernel to execute, where the index calculation `blockIdx.x * blockDim.x - threadIdx.x` produces negative indices for many threads (especially in early blocks). These negative indices pass the `idx < size` check (since size > 0), leading to out-of-bounds memory accesses on both read (`input[idx]`) and write (`output[idx]`). This will either cause a CUDA memory error (crash) or produce garbage outputs different from the original kernel's correct computation.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Same shape [2000, 2000] but with dtype torch.float16
+    shape = (2000, 2000)
+    # Use random values in a reasonable range for float16 to avoid overflow
+    # The exact range is not critical; any values will expose the index bug.
+    input_tensor = torch.randn(shape, device=device, dtype=torch.float16) * 2.0
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=nan, mean_diff=nan, ref_range=[-1.7017e-01,1.0555e+01], mut_range=[nan,nan]
+
+### Round 2
+- Strategy: Switch back to float32 (which uses the non-mutated template kernel) but craft a specific input size that reveals the mutation's effect when the launch configuration causes wrap-around indexing. The mutated half kernel won't execute with float32 input, but we can still test if the mutation affects float32 execution through some mechanism. Actually, wait - the mutation is only in the half specialization. So we need to trigger the half kernel but with a launch configuration where negative indices don't cause immediate errors but produce wrong results that differ from correct execution.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Use half precision to trigger mutated kernel
+    # Choose size 1024 - common block size, ensures all threads active
+    # Use sequential values to make output scrambling obvious
+    size = 1024
+    input_tensor = torch.arange(0, size, dtype=torch.float16, device=device).view(32, 32) * 0.1
+    # Make it exactly [2000, 2000] shape by padding
+    full_tensor = torch.zeros(2000, 2000, dtype=torch.float16, device=device)
+    full_tensor[:32, :32] = input_tensor
+    return [full_tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,1.0231e+02], mut_range=[nan,nan]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

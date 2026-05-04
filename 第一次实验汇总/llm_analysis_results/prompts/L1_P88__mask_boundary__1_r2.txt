@@ -1,0 +1,117 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      36|         T tanh_val = fast_tanh<T>(inner);
+      37|         output[idx] = T(0.5f) * x * (T(1.0f) + tanh_val);
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+      43|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      44|     
+>>>   45|     if (idx < size) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+      50|         output[idx] = __float2half(0.5f * x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+      56|     auto size = input.numel();
+      57|     auto output = torch::empty_like(input);
+```
+
+## Mutated Code (around mutation site)
+```
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      36|         T tanh_val = fast_tanh<T>(inner);
+      37|         output[idx] = T(0.5f) * x * (T(1.0f) + tanh_val);
+      38|     }
+      39| }
+      40| 
+      41| template<>
+      42| __global__ void gelu_kernel<half>(const half* __restrict__ input, half* __restrict__ output, int size) {
+      43|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      44|     
+>>>   45|     if (idx < size - 1) {
+      46|         float x = __half2float(input[idx]);
+      47|         float x_cubed = x * x * x;
+      48|         float inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+      49|         float tanh_val = fast_tanh<float>(inner);
+      50|         output[idx] = __float2half(0.5f * x * (1.0f + tanh_val));
+      51|     }
+      52| }
+      53| 
+      54| torch::Tensor gelu_cuda(torch::Tensor input) {
+      55|     at::cuda::CUDAGuard guard(input.device());
+      56|     auto size = input.numel();
+      57|     auto output = torch::empty_like(input);
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 45
+- Original fragment: `idx < size`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[2000, 2000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To kill the mutant, we must test the half-precision (float16) path where the mutated boundary guard is actually executed. Specifically, we need a tensor with dtype=torch.float16 (or torch.half) and a size where the last element's skipping becomes observable. The last element (index size-1) will be uninitialized in the mutant's output, potentially containing arbitrary values from memory allocation, while the original computes GELU normally for that element.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Create a half-precision tensor with non-trivial values
+    # Using shape [1, 1] to minimize size while ensuring mutation affects the only element
+    # Actually, with size=1, idx < size-1 becomes idx < 0, so NO threads execute!
+    # Better: size=2, where idx=1 (last element) is skipped by mutant
+    size = 2  # Smallest size where mutation has effect
+    tensor = torch.full((size,), 2.0, dtype=torch.float16, device=device)  # Distinctive value
+    # Ensure last element is different from potential zero-initialized memory
+    return [tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=nan, mean_diff=nan, ref_range=[1.9551e+00,1.9551e+00], mut_range=[nan,nan]
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

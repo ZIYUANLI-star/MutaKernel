@@ -1,0 +1,493 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 45 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for fused KL divergence
+kl_div_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+template<typename scalar_t>
+__global__ void fused_kl_div_kernel(
+    const scalar_t* __restrict__ predictions,
+    const scalar_t* __restrict__ targets,
+    scalar_t* __restrict__ output,
+    int batch_size,
+    int seq_len
+) {
+    // Each block processes one batch element
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+    
+    const scalar_t* pred_batch = predictions + batch_idx * seq_len;
+    const scalar_t* target_batch = targets + batch_idx * seq_len;
+    
+    // Thread block and warp setup
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads in block
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    for (int idx = tid; idx < seq_len; idx += total_threads) {
+        float p = static_cast<float>(pred_batch[idx]);
+        float t = static_cast<float>(target_batch[idx]);
+        
+        // KL divergence: t * log(t / p) = t * (log(t) - log(p))
+        // But we compute directly to match PyTorch's kl_div
+        if (t > 0.0f && p > 0.0f) {
+            thread_sum += t * (__logf(t) - __logf(p));
+        }
+        // Note: PyTorch's kl_div expects log(predictions) as input,
+        // but we're computing the full KL divergence here
+    }
+    
+    // Warp reduction
+    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>());
+    
+    // First thread in warp writes to shared memory
+    __shared__ float block_sums[32];
+    if (warp.thread_rank() == 0) {
+        block_sums[warp.meta_group_rank()] = warp_sum;
+    }
+    block.sync();
+    
+    // First warp reduces all warp sums
+    if (warp.meta_group_rank() == 0) {
+        float block_sum = 0.0f;
+        int num_warps = (total_threads + 31) / 32;
+        if (warp.thread_rank() < num_warps) {
+            block_sum = block_sums[warp.thread_rank()];
+        }
+        
+        float final_sum = cg::reduce(warp, block_sum, cg::plus<float>());
+        
+        if (warp.thread_rank() == 0) {
+            // Store per-batch result
+            output[batch_idx] = static_cast<scalar_t>(final_sum);
+        }
+    }
+}
+
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    // Ensure inputs are on GPU and contiguous
+    predictions = predictions.contiguous();
+    targets = targets.contiguous();
+    
+    auto batch_size = predictions.size(0);
+    auto seq_len = predictions.size(1);
+    
+    // Create output tensor for per-batch results
+    auto output = torch::zeros({batch_size}, predictions.options());
+    
+    // Optimized kernel launch configuration
+    int threads = 256;
+    int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(predictions.scalar_type(), "fused_kl_div_kernel", ([&] {
+        fused_kl_div_kernel<scalar_t><<<blocks, threads>>>(
+            predictions.data_ptr<scalar_t>(),
+            targets.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            seq_len
+        );
+    }));
+    
+    // Return batchmean reduction
+    return output.mean();
+}
+"""
+
+kl_div_cpp_source = """
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+# Compile the inline CUDA code
+fused_kl_div = load_inline(
+    name="fused_kl_div",
+    cpp_sources=kl_div_cpp_source,
+    cuda_sources=kl_div_source,
+    functions=["fused_kl_div_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fused_kl_div = fused_kl_div
+        
+    def forward(self, predictions, targets):
+        # Input validation and preprocessing
+        predictions = predictions.contiguous()
+        targets = targets.contiguous()
+        
+        # Ensure numerical stability (matching PyTorch's behavior)
+        predictions = torch.clamp(predictions, min=1e-12)
+        targets = torch.clamp(targets, min=1e-12)
+        
+        # Normalize to probability distributions
+        predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+        targets = targets / targets.sum(dim=-1, keepdim=True)
+        
+        # Use fused CUDA kernel
+        return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for fused KL divergence
+kl_div_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+template<typename scalar_t>
+__global__ void fused_kl_div_kernel(
+    const scalar_t* __restrict__ predictions,
+    const scalar_t* __restrict__ targets,
+    scalar_t* __restrict__ output,
+    int batch_size,
+    int seq_len
+) {
+    // Each block processes one batch element
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+    
+    const scalar_t* pred_batch = predictions + batch_idx * seq_len;
+    const scalar_t* target_batch = targets + batch_idx * seq_len;
+    
+    // Thread block and warp setup
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads in block
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    for (int idx = tid; idx < seq_len; idx += total_threads) {
+        float p = static_cast<float>(pred_batch[idx]);
+        float t = static_cast<float>(target_batch[idx]);
+        
+        // KL divergence: t * log(t / p) = t * (log(t) - log(p))
+        // But we compute directly to match PyTorch's kl_div
+        if (t > 0.0f && p > 0.0f) {
+            thread_sum += t * (__logf(t) - __logf(p));
+        }
+        // Note: PyTorch's kl_div expects log(predictions) as input,
+        // but we're computing the full KL divergence here
+    }
+    
+    // Warp reduction
+    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>());
+    
+    // First thread in warp writes to shared memory
+    __shared__ float block_sums[32];
+    if (warp.thread_rank() != 0) {
+        block_sums[warp.meta_group_rank()] = warp_sum;
+    }
+    block.sync();
+    
+    // First warp reduces all warp sums
+    if (warp.meta_group_rank() == 0) {
+        float block_sum = 0.0f;
+        int num_warps = (total_threads + 31) / 32;
+        if (warp.thread_rank() < num_warps) {
+            block_sum = block_sums[warp.thread_rank()];
+        }
+        
+        float final_sum = cg::reduce(warp, block_sum, cg::plus<float>());
+        
+        if (warp.thread_rank() == 0) {
+            // Store per-batch result
+            output[batch_idx] = static_cast<scalar_t>(final_sum);
+        }
+    }
+}
+
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    // Ensure inputs are on GPU and contiguous
+    predictions = predictions.contiguous();
+    targets = targets.contiguous();
+    
+    auto batch_size = predictions.size(0);
+    auto seq_len = predictions.size(1);
+    
+    // Create output tensor for per-batch results
+    auto output = torch::zeros({batch_size}, predictions.options());
+    
+    // Optimized kernel launch configuration
+    int threads = 256;
+    int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(predictions.scalar_type(), "fused_kl_div_kernel", ([&] {
+        fused_kl_div_kernel<scalar_t><<<blocks, threads>>>(
+            predictions.data_ptr<scalar_t>(),
+            targets.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            seq_len
+        );
+    }));
+    
+    // Return batchmean reduction
+    return output.mean();
+}
+"""
+
+kl_div_cpp_source = """
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+# Compile the inline CUDA code
+fused_kl_div = load_inline(
+    name="fused_kl_div",
+    cpp_sources=kl_div_cpp_source,
+    cuda_sources=kl_div_source,
+    functions=["fused_kl_div_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fused_kl_div = fused_kl_div
+        
+    def forward(self, predictions, targets):
+        # Input validation and preprocessing
+        predictions = predictions.contiguous()
+        targets = targets.contiguous()
+        
+        # Ensure numerical stability (matching PyTorch's behavior)
+        predictions = torch.clamp(predictions, min=1e-12)
+        targets = torch.clamp(targets, min=1e-12)
+        
+        # Normalize to probability distributions
+        predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+        targets = targets / targets.sum(dim=-1, keepdim=True)
+        
+        # Use fused CUDA kernel
+        return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 57
+- Original fragment: `==`
+- node_type: cuda_Eq
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[128, 4096], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 4096], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 57
+- Original fragment: `==`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - relop_boundary_hit: passed
+  - relop_boundary_hit: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - near_zero: passed
+  - near_zero: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [128, 4096], 'dtype': 'torch.float32', 'min': 1.5551440810668282e-06, 'max': 0.014670520089566708, 'mean': 0.000244140625, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': 1.69823204032582e-06, 'max': 0.018165625631809235, 'mean': 0.00024414065410383046, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_large_magnitude_1', 'seed': 10101, 'tensors': [{'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4169.43603515625, 'max': 5140.97314453125, 'mean': -1.6916475296020508, 'has_nan': False, 'has_inf': False}, {'shape': [128, 4096], 'dtype': 'torch.float32', 'min': -4866.79345703125, 'max': 5496.4072265625, 'mean': -1.6630561351776123, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: possibly_killable
+- Confidence: 0.95
+- Reasoning: The mutation changes which threads write warp sums to shared memory: from 'warp.thread_rank() == 0' to 'warp.thread_rank() != 0'. This means thread 0 of each warp no longer writes, while all other threads (1-31) do write. The subsequent reduction in the first warp reads from block_sums[warp.thread_rank()] where warp.thread_rank() ranges 0-31. For threads with rank 0 in the first warp, block_sums[0] will be uninitialized (or contain garbage from previous execution) instead of the correct warp sum
+- Kill strategy: Create inputs where the first warp's thread 0 has a non-zero contribution to the KL divergence. Since thread 0's warp sum will be lost (not written to block_sums[0]), and the reduction will use garbage instead, any case where thread 0's warp sum ≠ garbage value will produce different outputs. We need to ensure thread 0 in the first warp processes at least one element with t>0 and p>0.
+- Suggested test: Create inputs where thread 0 in the first warp (global thread index 0) processes at least one element with positive target and prediction values, ensuring its warp sum is non-zero. The garbage value i
+- Had executable code: True
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 45 / 45 rounds. Result: ALL SURVIVED (bitwise identical)
+  - sparse_extreme seed=42: survived
+  - sparse_extreme seed=43: survived
+  - sparse_extreme seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - near_overflow seed=47: survived
+  - denormals seed=48: survived
+  - denormals seed=49: survived
+  - denormals seed=50: survived
+  - all_negative seed=51: survived
+  - all_negative seed=52: survived
+  - all_negative seed=53: survived
+  - all_positive seed=54: survived
+  - all_positive seed=55: survived
+  - all_positive seed=56: survived
+  - mixed_extremes seed=57: survived
+  - mixed_extremes seed=58: survived
+  - mixed_extremes seed=59: survived
+  - alternating_sign seed=60: survived
+  - alternating_sign seed=61: survived
+  - alternating_sign seed=62: survived
+  - uniform_constant seed=63: survived
+  - uniform_constant seed=64: survived
+  - uniform_constant seed=65: survived
+  - head_heavy seed=66: survived
+  - head_heavy seed=67: survived
+  - head_heavy seed=68: survived
+  - tail_heavy seed=69: survived
+  - tail_heavy seed=70: survived
+  - tail_heavy seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- reduction_adversarial: reduction_adversarial
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

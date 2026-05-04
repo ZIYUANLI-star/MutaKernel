@@ -1,0 +1,763 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 112 rounds of bitwise comparison)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for MaxPool1d with shared memory and warp-level reduction
+maxpool1d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+template<typename scalar_t>
+__global__ void maxpool1d_forward_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t* __restrict__ indices,
+    const int batch_size,
+    const int channels,
+    const int input_length,
+    const int output_length,
+    const int kernel_size,
+    const int stride,
+    const int padding,
+    const int dilation,
+    const bool return_indices
+) {
+    const int batch = blockIdx.z;
+    const int channel = blockIdx.y;
+    const int output_pos = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (output_pos >= output_length) return;
+    
+    const int input_start = output_pos * stride - padding;
+    scalar_t max_val = -INFINITY;
+    int max_idx = -1;
+    
+    // Process kernel window with loop unrolling
+    #pragma unroll(4)
+    for (int k = 0; k < kernel_size; k++) {
+        const int input_pos = input_start + k * dilation;
+        
+        if (input_pos >= 0 && input_pos < input_length) {
+            const int input_idx = ((batch * channels + channel) * input_length + input_pos);
+            const scalar_t val = input[input_idx];
+            
+            if (val > max_val) {
+                max_val = val;
+                max_idx = input_pos;
+            }
+        }
+    }
+    
+    const int output_idx = ((batch * channels + channel) * output_length + output_pos);
+    output[output_idx] = max_val;
+    
+    if (return_indices && indices != nullptr) {
+        indices[output_idx] = max_idx;
+    }
+}
+
+template<typename scalar_t>
+__global__ void maxpool1d_forward_kernel_batch_channel_parallel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t* __restrict__ indices,
+    const int batch_size,
+    const int channels,
+    const int input_length,
+    const int output_length,
+    const int kernel_size,
+    const int stride,
+    const int padding,
+    const int dilation,
+    const bool return_indices
+) {
+    // Process multiple output positions per thread
+    const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const int threads_per_channel = blockDim.x * gridDim.x / (batch_size * channels);
+    
+    if (threads_per_channel == 0) return;
+    
+    const int batch_channel = tid / threads_per_channel;
+    const int local_tid = tid % threads_per_channel;
+    
+    if (batch_channel >= batch_size * channels) return;
+    
+    const int batch = batch_channel / channels;
+    const int channel = batch_channel % channels;
+    
+    // Process multiple output positions per thread
+    for (int output_pos = local_tid; output_pos < output_length; output_pos += threads_per_channel) {
+        const int input_start = output_pos * stride - padding;
+        scalar_t max_val = -INFINITY;
+        int max_idx = -1;
+        
+        // Optimized loop with boundary check hoisting
+        const int first_valid_k = max(0, (-input_start + dilation - 1) / dilation);
+        const int last_valid_k = min(kernel_size, (input_length - input_start + dilation - 1) / dilation);
+        
+        for (int k = first_valid_k; k < last_valid_k; k++) {
+            const int input_pos = input_start + k * dilation;
+            const int input_idx = ((batch * channels + channel) * input_length + input_pos);
+            const scalar_t val = input[input_idx];
+            
+            if (val > max_val) {
+                max_val = val;
+                max_idx = input_pos;
+            }
+        }
+        
+        const int output_idx = ((batch * channels + channel) * output_length + output_pos);
+        output[output_idx] = max_val;
+        
+        if (return_indices && indices != nullptr) {
+            indices[output_idx] = max_idx;
+        }
+    }
+}
+
+torch::Tensor maxpool1d_forward_cuda(
+    torch::Tensor input,
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t padding,
+    int64_t dilation,
+    bool return_indices
+) {
+    // Input dimensions
+    const int batch_size = input.size(0);
+    const int channels = input.size(1);
+    const int input_length = input.size(2);
+    
+    // Calculate output length
+    const int output_length = (input_length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    
+    // Create output tensor
+    auto output = torch::empty({batch_size, channels, output_length}, 
+                              input.options().device(torch::kCUDA));
+    
+    // Create indices tensor if needed
+    torch::Tensor indices;
+    if (return_indices) {
+        indices = torch::empty({batch_size, channels, output_length}, 
+                              torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
+    }
+    
+    // Choose optimal kernel configuration based on problem size
+    const int total_elements = batch_size * channels * output_length;
+    
+    if (total_elements < 65536) {
+        // Small problem size: use thread-per-output strategy
+        const int block_size = 256;
+        const int grid_size = (output_length + block_size - 1) / block_size;
+        
+        dim3 grid(grid_size, channels, batch_size);
+        
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "maxpool1d_forward_cuda", ([&] {
+            maxpool1d_forward_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                return_indices ? indices.data_ptr<int64_t>() : nullptr,
+                batch_size,
+                channels,
+                input_length,
+                output_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                return_indices
+            );
+        }));
+    } else {
+        // Large problem size: use batch-channel parallel strategy
+        const int block_size = 256;
+        const int grid_size = min(65535, (batch_size * channels * 32 + block_size - 1) / block_size);
+        
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "maxpool1d_forward_cuda", ([&] {
+            maxpool1d_forward_kernel_batch_channel_parallel<scalar_t><<<grid_size, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                return_indices ? indices.data_ptr<int64_t>() : nullptr,
+                batch_size,
+                channels,
+                input_length,
+                output_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                return_indices
+            );
+        }));
+    }
+    
+    if (return_indices) {
+        return torch::cat({output.unsqueeze(-1), indices.unsqueeze(-1)}, -1);
+    }
+    
+    return output;
+}
+"""
+
+maxpool1d_cpp_source = """
+torch::Tensor maxpool1d_forward_cuda(
+    torch::Tensor input,
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t padding,
+    int64_t dilation,
+    bool return_indices
+);
+"""
+
+# Compile the inline CUDA code with optimization flags
+maxpool1d_cuda = load_inline(
+    name="maxpool1d_cuda",
+    cpp_sources=maxpool1d_cpp_source,
+    cuda_sources=maxpool1d_source,
+    functions=["maxpool1d_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-DNDEBUG"],
+    extra_ldflags=[""],
+    with_cuda=True,
+    extra_include_paths=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Highly optimized model that performs Max Pooling 1D with custom CUDA kernels.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, 
+                 dilation: int = 1, return_indices: bool = False):
+        """
+        Initializes the optimized Max Pooling 1D layer.
+
+        Args:
+            kernel_size (int): Size of the window to take a max over.
+            stride (int, optional): Stride of the window. Defaults to None (same as kernel_size).
+            padding (int, optional): Implicit zero padding to be added on both sides. Defaults to 0.
+            dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+            return_indices (bool, optional): Whether to return the indices of the maximum values. Defaults to False.
+        """
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+        
+        # Store the custom CUDA operator
+        self.maxpool1d_cuda = maxpool1d_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Max Pooling 1D to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, sequence_length).
+
+        Returns:
+            torch.Tensor: Output tensor with Max Pooling 1D applied, shape (batch_size, num_features, output_sequence_length).
+        """
+        # Ensure tensor is on CUDA and contiguous
+        if not x.is_cuda:
+            x = x.cuda()
+        if not x.is_contiguous():
+            x = x.contiguous()
+            
+        # Apply custom CUDA kernel
+        result = self.maxpool1d_cuda.maxpool1d_forward_cuda(
+            x,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.return_indices
+        )
+        
+        return result
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for MaxPool1d with shared memory and warp-level reduction
+maxpool1d_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+template<typename scalar_t>
+__global__ void maxpool1d_forward_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t* __restrict__ indices,
+    const int batch_size,
+    const int channels,
+    const int input_length,
+    const int output_length,
+    const int kernel_size,
+    const int stride,
+    const int padding,
+    const int dilation,
+    const bool return_indices
+) {
+    const int batch = blockIdx.z;
+    const int channel = blockIdx.y;
+    const int output_pos = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (output_pos >= output_length) return;
+    
+    const int input_start = output_pos * stride - padding;
+    scalar_t max_val = -INFINITY;
+    int max_idx = -1;
+    
+    // Process kernel window with loop unrolling
+    #pragma unroll(4)
+    for (int k = 0; k < kernel_size; k++) {
+        const int input_pos = input_start + k * dilation;
+        
+        if (input_pos >= 0 && input_pos < input_length) {
+            const int input_idx = ((batch * channels + channel) * input_length + input_pos);
+            const scalar_t val = input[input_idx];
+            
+            if (val > max_val) {
+                max_val = val;
+                max_idx = input_pos;
+            }
+        }
+    }
+    
+    const int output_idx = ((batch * channels + channel) * output_length + output_pos);
+    output[output_idx] = max_val;
+    
+    if (return_indices && indices != nullptr) {
+        indices[output_idx] = max_idx;
+    }
+}
+
+template<typename scalar_t>
+__global__ void maxpool1d_forward_kernel_batch_channel_parallel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t* __restrict__ indices,
+    const int batch_size,
+    const int channels,
+    const int input_length,
+    const int output_length,
+    const int kernel_size,
+    const int stride,
+    const int padding,
+    const int dilation,
+    const bool return_indices
+) {
+    // Process multiple output positions per thread
+    const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    const int threads_per_channel = blockDim.x * gridDim.x / (batch_size * channels);
+    
+    if (threads_per_channel == 0) return;
+    
+    const int batch_channel = tid / threads_per_channel;
+    const int local_tid = tid % threads_per_channel;
+    
+    if (batch_channel >= batch_size * channels) return;
+    
+    const int batch = batch_channel / channels;
+    const int channel = batch_channel % channels;
+    
+    // Process multiple output positions per thread
+    for (int output_pos = local_tid; output_pos < output_length; output_pos += threads_per_channel) {
+        const int input_start = output_pos * stride - padding;
+        scalar_t max_val = -INFINITY;
+        int max_idx = -1;
+        
+        // Optimized loop with boundary check hoisting
+        const int first_valid_k = max(0, (-input_start + dilation - 1) / dilation);
+        const int last_valid_k = min(kernel_size, (input_length - input_start + dilation - 1) / dilation);
+        
+        for (int k = first_valid_k; k < last_valid_k; k++) {
+            const int input_pos = input_start + k * dilation;
+            const int input_idx = ((batch * channels + channel) * input_length + input_pos);
+            const scalar_t val = input[input_idx];
+            
+            if (val > max_val) {
+                max_val = val;
+                max_idx = input_pos;
+            }
+        }
+        
+        const int output_idx = ((batch * channels + channel) * output_length + output_pos);
+        output[output_idx] = max_val;
+        
+        if (return_indices && indices != nullptr) {
+            indices[output_idx] = max_idx;
+        }
+    }
+}
+
+torch::Tensor maxpool1d_forward_cuda(
+    torch::Tensor input,
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t padding,
+    int64_t dilation,
+    bool return_indices
+) {
+    // Input dimensions
+    const int batch_size = input.size(0);
+    const int channels = input.size(1);
+    const int input_length = input.size(2);
+    
+    // Calculate output length
+    const int output_length = (input_length + 2 * padding - dilation * (kernel_size - 1) - 1) / stride + 1;
+    
+    // Create output tensor
+    auto output = torch::empty({batch_size, channels, output_length}, 
+                              input.options().device(torch::kCUDA));
+    
+    // Create indices tensor if needed
+    torch::Tensor indices;
+    if (return_indices) {
+        indices = torch::empty({batch_size, channels, output_length}, 
+                              torch::TensorOptions().dtype(torch::kLong).device(torch::kCUDA));
+    }
+    
+    // Choose optimal kernel configuration based on problem size
+    const int total_elements = batch_size * channels * output_length;
+    
+    if (total_elements < 65536) {
+        // Small problem size: use thread-per-output strategy
+        const int block_size = 256;
+        const int grid_size = (output_length + block_size - 1) / block_size;
+        
+        dim3 grid(grid_size, channels, batch_size);
+        
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "maxpool1d_forward_cuda", ([&] {
+            maxpool1d_forward_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                return_indices ? indices.data_ptr<int64_t>() : nullptr,
+                batch_size,
+                channels,
+                input_length,
+                output_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                return_indices
+            );
+        }));
+    } else {
+        // Large problem size: use batch-channel parallel strategy
+        const int block_size = 256;
+        const int grid_size = min(65535, (batch_size * channels * 32 + block_size - 1) / block_size);
+        
+        AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "maxpool1d_forward_cuda", ([&] {
+            maxpool1d_forward_kernel_batch_channel_parallel<scalar_t><<<grid_size, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                return_indices ? indices.data_ptr<int64_t>() : nullptr,
+                batch_size,
+                channels,
+                input_length,
+                output_length,
+                kernel_size,
+                stride,
+                padding,
+                dilation,
+                return_indices
+            );
+        }));
+    }
+    
+    if (return_indices) {
+        return torch::cat({output, indices.unsqueeze(-1)}, -1);
+    }
+    
+    return output;
+}
+"""
+
+maxpool1d_cpp_source = """
+torch::Tensor maxpool1d_forward_cuda(
+    torch::Tensor input,
+    int64_t kernel_size,
+    int64_t stride,
+    int64_t padding,
+    int64_t dilation,
+    bool return_indices
+);
+"""
+
+# Compile the inline CUDA code with optimization flags
+maxpool1d_cuda = load_inline(
+    name="maxpool1d_cuda",
+    cpp_sources=maxpool1d_cpp_source,
+    cuda_sources=maxpool1d_source,
+    functions=["maxpool1d_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-DNDEBUG"],
+    extra_ldflags=[""],
+    with_cuda=True,
+    extra_include_paths=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Highly optimized model that performs Max Pooling 1D with custom CUDA kernels.
+    """
+    def __init__(self, kernel_size: int, stride: int = None, padding: int = 0, 
+                 dilation: int = 1, return_indices: bool = False):
+        """
+        Initializes the optimized Max Pooling 1D layer.
+
+        Args:
+            kernel_size (int): Size of the window to take a max over.
+            stride (int, optional): Stride of the window. Defaults to None (same as kernel_size).
+            padding (int, optional): Implicit zero padding to be added on both sides. Defaults to 0.
+            dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+            return_indices (bool, optional): Whether to return the indices of the maximum values. Defaults to False.
+        """
+        super(ModelNew, self).__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride if stride is not None else kernel_size
+        self.padding = padding
+        self.dilation = dilation
+        self.return_indices = return_indices
+        
+        # Store the custom CUDA operator
+        self.maxpool1d_cuda = maxpool1d_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Max Pooling 1D to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, sequence_length).
+
+        Returns:
+            torch.Tensor: Output tensor with Max Pooling 1D applied, shape (batch_size, num_features, output_sequence_length).
+        """
+        # Ensure tensor is on CUDA and contiguous
+        if not x.is_cuda:
+            x = x.cuda()
+        if not x.is_contiguous():
+            x = x.contiguous()
+            
+        # Apply custom CUDA kernel
+        result = self.maxpool1d_cuda.maxpool1d_forward_cuda(
+            x,
+            self.kernel_size,
+            self.stride,
+            self.padding,
+            self.dilation,
+            self.return_indices
+        )
+        
+        return result
+```
+
+## Mutation Details
+- Operator: broadcast_unsafe — Remove explicit broadcast before element-wise ops
+- Location: line 200
+- Original fragment: `.unsqueeze(-1)`
+- node_type: d1:unsqueeze
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 64, 128], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 200
+- Original fragment: `.unsqueeze(-1)`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - near_zero: passed
+  - near_zero: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - all_negative: passed
+  - all_negative: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 64, 128], 'dtype': 'torch.float32', 'min': -4.288045883178711, 'max': 4.515127182006836, 'mean': -0.0010600131936371326, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [16, 64, 128], 'dtype': 'torch.float32', 'min': -4.131533622741699, 'max': 10000.0, 'mean': 0.0752045065164566, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 0.95
+- Reasoning: The mutation removes `.unsqueeze(-1)` from the `output` tensor in the `torch::cat` operation when `return_indices` is true. However, `output` already has shape `[batch_size, channels, output_length]` (3D), while `indices.unsqueeze(-1)` has shape `[batch_size, channels, output_length, 1]` (4D). In PyTorch, concatenating a 3D tensor with a 4D tensor along dimension -1 implicitly unsqueezes the 3D tensor to 4D before concatenation. The explicit `.unsqueeze(-1)` is redundant because broadcasting rul
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - near_overflow seed=42: survived
+  - near_overflow seed=43: survived
+  - near_overflow seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - denormals seed=47: survived
+  - denormals seed=48: survived
+  - denormals seed=49: survived
+  - denormals seed=50: survived
+  - denormals seed=51: survived
+  - all_positive seed=52: survived
+  - all_positive seed=53: survived
+  - all_positive seed=54: survived
+  - all_positive seed=55: survived
+  - all_positive seed=56: survived
+  - mixed_extremes seed=57: survived
+  - mixed_extremes seed=58: survived
+  - mixed_extremes seed=59: survived
+  - mixed_extremes seed=60: survived
+  - mixed_extremes seed=61: survived
+  - alternating_sign seed=62: survived
+  - alternating_sign seed=63: survived
+  - alternating_sign seed=64: survived
+  - alternating_sign seed=65: survived
+  - alternating_sign seed=66: survived
+  - uniform_constant seed=67: survived
+  - uniform_constant seed=68: survived
+  - uniform_constant seed=69: survived
+  - uniform_constant seed=70: survived
+  - uniform_constant seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+SKIPPED: operator_not_applicable
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

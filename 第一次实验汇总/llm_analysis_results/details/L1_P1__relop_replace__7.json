@@ -1,0 +1,58 @@
+{
+  "mutant_id": "L1_P1__relop_replace__7",
+  "kernel_name": "L1_P1",
+  "operator_name": "relop_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survives because even when N is not a multiple of TILE_SIZE, the out-of-bounds write at index `row * N + N` (when col=N) falls within the same memory page as the valid allocation due to PyTorch's memory alignment and CUDA's memory protection granularity. This doesn't cause a crash or detectable corruption because: (1) The GPU memory allocator may pad allocations beyond requested size, (2) The single extra write may not cross page boundaries, and (3) The stress tests may not verify exact output values beyond checking for crashes. The previous attempt with N=33 failed because the write at index 33 was still within padded memory bounds.",
+  "killable": true,
+  "kill_strategy": "Force a larger out-of-bounds write that clearly crosses page boundaries by using an input size where the extra thread writes far beyond the allocated memory region. Use N = 2047 (not multiple of 32) so that thread with col=2047 writes at index `row*2047 + 2047`. For row=2046, this writes to index ~4.19M, but the allocation is only 2047² ≈ 4.19M elements. However, due to padding, this may still be safe. Instead, we need to cause a write so far out of bounds that it clearly accesses unallocated memory. We'll achieve this by exploiting that the kernel uses 32-bit indexing, and we can cause an index overflow/wrap-around by making N large enough that `row * N + col` exceeds 32-bit range when col=N.",
+  "recommendations": "Instead of relying on crashes, implement value checking: 1) Compute reference output on CPU, 2) Run original and mutant kernels, 3) Compare results exactly (not just checking for crashes). Also consider using cuda-memcheck with --tool initcheck to detect uninitialized memory reads/writes, or --tool racecheck for race conditions. The mutant may cause writes to memory that other threads then overwrite, so checking final values is crucial. If the out-of-bounds writes don't cause crashes, they may still corrupt adjacent memory that belongs to other variables - try placing a guard page or special pattern after the output tensor.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because all stress tests used input dimensions N=2048, which is a multiple of the TILE_SIZE (32). When N is a multiple of TILE_SIZE, the grid launching mechanism ensures that the maximum column index computed by any thread is N-1. Thus, the condition `col <= N` is always true (since col ≤ N-1 < N) for all launched threads, making the mutant behavior identical to the original (`col < N`). No value-distribution changes could expose the mutation because the condition's branch is never taken differently when N is a multiple of TILE_SIZE.",
+      "kill_strategy": "Use an input dimension N that is NOT a multiple of TILE_SIZE (32). When N is not a multiple of 32, the grid launches extra threads with column indices up to ceil(N/32)*32 - 1, which includes indices equal to N. For these threads, the mutant's condition `col <= N` will be true (allowing out-of-bounds writes at linear index `row * N + N`), while the original's `col < N` correctly filters them out. This will cause either a CUDA memory error (crash) or silent corruption of adjacent memory, distinguishing the mutant.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    N = 33  # Not a multiple of TILE_SIZE (32)\n    torch.manual_seed(123)  # For reproducibility\n    A = torch.randn(N, N, device=device, dtype=torch.float32)\n    B = torch.randn(N, N, device=device, dtype=torch.float32)\n    return [A, B]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survives because even when N is not a multiple of TILE_SIZE, the out-of-bounds write at index `row * N + N` (when col=N) falls within the same memory page as the valid allocation due to PyTorch's memory alignment and CUDA's memory protection granularity. This doesn't cause a crash or detectable corruption because: (1) The GPU memory allocator may pad allocations beyond requested size, (2) The single extra write may not cross page boundaries, and (3) The stress tests may not verify exact output values beyond checking for crashes. The previous attempt with N=33 failed because the write at index 33 was still within padded memory bounds.",
+      "kill_strategy": "Force a larger out-of-bounds write that clearly crosses page boundaries by using an input size where the extra thread writes far beyond the allocated memory region. Use N = 2047 (not multiple of 32) so that thread with col=2047 writes at index `row*2047 + 2047`. For row=2046, this writes to index ~4.19M, but the allocation is only 2047² ≈ 4.19M elements. However, due to padding, this may still be safe. Instead, we need to cause a write so far out of bounds that it clearly accesses unallocated memory. We'll achieve this by exploiting that the kernel uses 32-bit indexing, and we can cause an index overflow/wrap-around by making N large enough that `row * N + col` exceeds 32-bit range when col=N.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # N chosen to cause integer overflow in index calculation when col=N\n    # N = 46341 -> N*N = 2,147,488,281 > 2^31-1\n    N = 46341\n    torch.manual_seed(123)\n    # Use smaller matrices to fit memory, but the kernel will still compute with N\n    # Actually, we need to allocate NxN matrices which is ~8.6GB for float32\n    # This is too large for most GPUs. Let's instead use a smaller N that still causes\n    # significant out-of-bounds writes beyond the allocation.\n    # Alternative: Use N = 8193 (not multiple of 32) which creates many out-of-bounds writes\n    # The allocation is 8193*8193 = 67.1M elements = 268MB\n    # Threads with col=8193 write to indices row*8193 + 8193 = (row+1)*8193\n    # For row=8192 (last row), index = 8193*8193 = 67,117,649 which is one beyond allocation\n    # This single out-of-bounds write might still be within padding.\n    # Let's cause MANY out-of-bounds writes by making N just above a multiple of 32\n    # so that many threads have col=N.\n    N = 33  # Actually go back to small N but verify exact output values\n    # We'll compute reference CPU result and compare bit-exact\n    A = torch.ones(N, N, device=device, dtype=torch.float32)\n    B = torch.eye(N, device=device, dtype=torch.float32) * 2.0\n    # With these inputs, C should be exactly 2*A (since B is 2*identity)\n    # The mutant may write incorrect values at (row, N) positions\n    # We'll run both original and mutant and compare full output\n    return [A, B]\n",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.000000e+00, mean_diff=7.346189e-03, ref_range=[2.0000e+00,2.0000e+00], mut_range=[0.0000e+00,2.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 2,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "index_overflow_due_to_extended_bound",
+    "rule_description": "Targets kernels where relational operator mutations extend loop bounds beyond intended limits. Creates inputs where the index calculation for the extended bound causes integer overflow in 32-bit arithmetic, or produces values far beyond allocated memory bounds, making out-of-bounds writes detectable.",
+    "applicable_operators": [
+      "relop_replace",
+      "loop_boundary",
+      "arithmetic_replace"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    import torch\n    import math\n    \n    # For 2D matrix kernels, target square dimensions near sqrt(2^31) to cause overflow\n    # when index = row*N + N with row near N-1\n    if len(shape) == 2 and shape[0] == shape[1]:\n        N = shape[0]\n        # Choose dimension that ensures index overflow when computing (N-1)*N + N = N*N\n        # Smallest N where N*N > 2^31-1 is 46341\n        overflow_N = 46341\n        \n        # If requested N is smaller, still use a non-multiple of tile size (32)\n        # to ensure extended bounds produce out-of-bounds writes\n        if N < overflow_N:\n            # Adjust to be non-multiple of 32 to get extra threads\n            adjusted_N = N\n            if adjusted_N % 32 == 0:\n                adjusted_N += 1\n            \n            # Create matrices with predictable pattern for value comparison\n            A = torch.ones((adjusted_N, adjusted_N), device=device, dtype=dtype)\n            B = torch.eye(adjusted_N, device=device, dtype=dtype) * 2.0\n            return [A, B]\n        else:\n            # For large N near overflow boundary, use identity-like pattern\n            # but be mindful of memory constraints\n            A = torch.ones((N, N), device=device, dtype=dtype)\n            B = torch.eye(N, device=device, dtype=dtype)\n            return [A, B]\n    \n    # For 1D kernels, target size near 2^31 for overflow in index + 1 calculations\n    elif len(shape) == 1:\n        N = shape[0]\n        # Create input with pattern for easy validation\n        data = torch.arange(N, device=device, dtype=dtype) / N\n        return [data]\n    \n    # Default: return random data with seed for reproducibility\n    torch.manual_seed(123)\n    return [torch.randn(shape, device=device, dtype=dtype)]"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\ndef generate_inputs(device):\n    # N chosen to cause integer overflow in index calculation when col=N\n    # N = 46341 -> N*N = 2,147,488,281 > 2^31-1\n    N = 46341\n    torch.manual_seed(123)\n    # Use smaller matrices to fit memory, but the kernel will still compute with N\n    # Actually, we need to allocate NxN matrices which is ~8.6GB for float32\n    # This is too large for most GPUs. Let's instead use a smaller N that still causes\n    # significant out-of-bounds writes beyond the allocation.\n    # Alternative: Use N = 8193 (not multiple of 32) which creates many out-of-bounds writes\n    # The allocation is 8193*8193 = 67.1M elements = 268MB\n    # Threads with col=8193 write to indices row*8193 + 8193 = (row+1)*8193\n    # For row=8192 (last row), index = 8193*8193 = 67,117,649 which is one beyond allocation\n    # This single out-of-bounds write might still be within padding.\n    # Let's cause MANY out-of-bounds writes by making N just above a multiple of 32\n    # so that many threads have col=N.\n    N = 33  # Actually go back to small N but verify exact output values\n    # We'll compute reference CPU result and compare bit-exact\n    A = torch.ones(N, N, device=device, dtype=torch.float32)\n    B = torch.eye(N, device=device, dtype=torch.float32) * 2.0\n    # With these inputs, C should be exactly 2*A (since B is 2*identity)\n    # The mutant may write incorrect values at (row, N) positions\n    # We'll run both original and mutant and compare full output\n    return [A, B]\n"
+}

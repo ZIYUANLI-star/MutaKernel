@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P99__cast_remove__2",
+  "kernel_name": "L1_P99",
+  "operator_name": "cast_remove",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survives because the input tensors from get_inputs() are already torch.float32. The mutation removes the .float() cast on the negative tensor, but since it's already float32, the cast is a no-op. The stress tests only varied values within float32, not dtype. The CUDA kernel likely accepts float32 inputs, so both original and mutant pass identical float32 tensors to the kernel, producing identical outputs. The mutation is semantically equivalent for float32 inputs, making it unkillable by value variations alone.",
+  "killable": true,
+  "kill_strategy": "The mutant can be killed by providing a negative tensor with a non-float32 dtype (e.g., float64, float16, int32). The original code would cast it to float32, while the mutant would pass the original dtype to the kernel. The CUDA kernel may produce incorrect results, crash, or trigger dtype mismatches when receiving unexpected dtypes.",
+  "recommendations": "1. The test suite should include dtype variations, especially for operations with explicit casts. 2. The kernel's forward method should validate input dtypes or use dtype annotations to prevent silent dtype mismatches. 3. Consider making the kernel dtype-agnostic or explicitly handling dtype conversions in a way that's robust to mutations.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survives because the input tensors from get_inputs() are already torch.float32. The mutation removes the .float() cast on the negative tensor, but since it's already float32, the cast is a no-op. The stress tests only varied values within float32, not dtype. The CUDA kernel likely accepts float32 inputs, so both original and mutant pass identical float32 tensors to the kernel, producing identical outputs. The mutation is semantically equivalent for float32 inputs, making it unkillable by value variations alone.",
+      "kill_strategy": "The mutant can be killed by providing a negative tensor with a non-float32 dtype (e.g., float64, float16, int32). The original code would cast it to float32, while the mutant would pass the original dtype to the kernel. The CUDA kernel may produce incorrect results, crash, or trigger dtype mismatches when receiving unexpected dtypes.",
+      "killable": true,
+      "suggested_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Generate random values in a range where float32 vs float64 differences matter\n    # Using values that require more precision than float32 can provide\n    shape = [128, 4096]\n    \n    # Anchor and positive: float32 as usual\n    anchor = torch.randn(shape, dtype=torch.float32, device=device) * 1000.0\n    positive = anchor + torch.randn(shape, dtype=torch.float32, device=device) * 0.01\n    \n    # Negative: float64 (double) with values that have precision beyond float32\n    # Create values with subtle differences that float32 cannot represent accurately\n    negative = torch.randn(shape, dtype=torch.float64, device='cpu')\n    # Scale to large magnitude to amplify precision differences\n    negative = negative * 1000000.0\n    # Add tiny perturbations that get lost in float32 rounding\n    negative = negative + torch.randn(shape, dtype=torch.float64, device='cpu') * 1e-10\n    negative = negative.to(device)  # Move to device (still float64)\n    \n    return [anchor, positive, negative]\n",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "higher_precision_inputs",
+    "rule_description": "Generates tensors with dtypes of higher precision than typical (e.g., float64 for float32 contexts). This reveals mutations that remove explicit casts by exposing precision differences or kernel compatibility issues when higher-precision data flows through computations designed for lower precision.",
+    "applicable_operators": [
+      "cast_remove",
+      "cast_type_change",
+      "arithmetic_replacement"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Map common target dtypes to higher-precision alternatives\n    precision_map = {\n        torch.float16: torch.float32,\n        torch.float32: torch.float64,\n        torch.bfloat16: torch.float32,\n        torch.int32: torch.int64,\n        torch.int16: torch.int32,\n    }\n    \n    # Use higher precision if available, otherwise fall back to original\n    target_dtype = precision_map.get(dtype, dtype)\n    \n    # Generate base tensor with random values in a large range to amplify precision differences\n    base = torch.randn(shape, dtype=target_dtype, device='cpu', generator=rng) * 1000000.0\n    \n    # Add tiny perturbations that get lost when converting to lower precision\n    if target_dtype in [torch.float32, torch.float64]:\n        # For floating types: add noise below the precision threshold of original dtype\n        eps = torch.finfo(dtype).eps if hasattr(torch.finfo(dtype), 'eps') else 1e-7\n        perturbation = torch.randn(shape, dtype=target_dtype, device='cpu', generator=rng) * (eps / 1000.0)\n        base = base + perturbation\n    elif target_dtype in [torch.int32, torch.int64]:\n        # For integer types: ensure values exceed typical range of original dtype\n        max_val = torch.iinfo(dtype).max if hasattr(torch.iinfo(dtype), 'max') else 2**31-1\n        base = base % (max_val * 2)  # Values potentially beyond original dtype's range\n    \n    # Move to target device, preserving higher precision dtype\n    return base.to(device)"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\nimport math\n\ndef generate_inputs(device):\n    # Generate random values in a range where float32 vs float64 differences matter\n    # Using values that require more precision than float32 can provide\n    shape = [128, 4096]\n    \n    # Anchor and positive: float32 as usual\n    anchor = torch.randn(shape, dtype=torch.float32, device=device) * 1000.0\n    positive = anchor + torch.randn(shape, dtype=torch.float32, device=device) * 0.01\n    \n    # Negative: float64 (double) with values that have precision beyond float32\n    # Create values with subtle differences that float32 cannot represent accurately\n    negative = torch.randn(shape, dtype=torch.float64, device='cpu')\n    # Scale to large magnitude to amplify precision differences\n    negative = negative * 1000000.0\n    # Add tiny perturbations that get lost in float32 rounding\n    negative = negative + torch.randn(shape, dtype=torch.float64, device='cpu') * 1e-10\n    negative = negative.to(device)  # Move to device (still float64)\n    \n    return [anchor, positive, negative]\n"
+}

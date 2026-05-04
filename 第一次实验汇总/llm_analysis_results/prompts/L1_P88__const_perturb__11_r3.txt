@@ -1,0 +1,173 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      11| 
+      12| namespace {
+      13| constexpr float GELU_COEF = 0.044715f;
+      14| constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;  // sqrt(2/π)
+      15| }
+      16| 
+      17| template<typename T>
+      18| __device__ T fast_tanh(T x) {
+      19|     // More accurate tanh approximation for GELU
+      20|     if (x < -4.97f) return T(-1.0f);
+      21|     if (x > 4.97f) return T(1.0f);
+      22|     T x2 = x * x;
+>>>   23|     T a = x * (T(135135.0f) + x2 * (T(17325.0f) + x2 * (T(378.0f) + x2)));
+      24|     T b = T(135135.0f) + x2 * (T(62370.0f) + x2 * (T(3150.0f) + x2 * T(28.0f)));
+      25|     return a / b;
+      26| }
+      27| 
+      28| template<typename T>
+      29| __global__ void gelu_kernel(const T* __restrict__ input, T* __restrict__ output, int size) {
+      30|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      31|     
+      32|     if (idx < size) {
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+```
+
+## Mutated Code (around mutation site)
+```
+      11| 
+      12| namespace {
+      13| constexpr float GELU_COEF = 0.044715f;
+      14| constexpr float SQRT_2_OVER_PI = 0.7978845608028654f;  // sqrt(2/π)
+      15| }
+      16| 
+      17| template<typename T>
+      18| __device__ T fast_tanh(T x) {
+      19|     // More accurate tanh approximation for GELU
+      20|     if (x < -4.97f) return T(-1.0f);
+      21|     if (x > 4.97f) return T(1.0f);
+      22|     T x2 = x * x;
+>>>   23|     T a = x * (T(136486.35f) + x2 * (T(17325.0f) + x2 * (T(378.0f) + x2)));
+      24|     T b = T(135135.0f) + x2 * (T(62370.0f) + x2 * (T(3150.0f) + x2 * T(28.0f)));
+      25|     return a / b;
+      26| }
+      27| 
+      28| template<typename T>
+      29| __global__ void gelu_kernel(const T* __restrict__ input, T* __restrict__ output, int size) {
+      30|     int idx = blockIdx.x * blockDim.x + threadIdx.x;
+      31|     
+      32|     if (idx < size) {
+      33|         T x = input[idx];
+      34|         T x_cubed = x * x * x;
+      35|         T inner = SQRT_2_OVER_PI * (x + GELU_COEF * x_cubed);
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 23
+- Original fragment: `135135.0f`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[2000, 2000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Target the specific input value that maximizes the error: choose x such that the inner argument to tanh (SQRT_2_OVER_PI*(x + GELU_COEF*x³)) equals 4.97, the boundary of the approximation's active region. At this point, the relative error in the tanh approximation is locally maximized, producing a measurable difference in the GELU output (~0.003 absolute error per element).
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    SQRT_2_OVER_PI = 0.7978845608028654
+    GELU_COEF = 0.044715
+    target = 4.97 / SQRT_2_OVER_PI  # want inner = 4.97
+    # Solve x + GELU_COEF*x³ = target via Newton's method
+    x = torch.tensor(3.79, device=device, dtype=torch.float32)  # initial guess
+    for _ in range(10):
+        f = x + GELU_COEF * x**3 - target
+        f_prime = 1.0 + 3.0 * GELU_COEF * x**2
+        x = x - f / f_prime
+    # Create tensor with all elements set to this critical x
+    input_tensor = torch.full((2000, 2000), x.item(), device=device, dtype=torch.float32)
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Target extreme values where the tanh approximation's error is amplified through GELU's non-linear region, specifically inputs that produce large positive/negative inner arguments while avoiding saturation. Use a tensor with strategically chosen values spanning the sensitive transition region where GELU's curvature is highest (approximately |x| ∈ [1.5, 3.0]), combined with values near zero to check for error accumulation.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Constants from the kernel
+    SQRT_2_OVER_PI = 0.7978845608028654
+    GELU_COEF = 0.044715
+    
+    # Choose values that probe different parts of the approximation
+    # 1. Values where inner = SQRT_2_OVER_PI*(x + GELU_COEF*x^3) is in sensitive region
+    # Solve for x where inner = 2.0 (approximately where tanh derivative is high)
+    target = 2.0 / SQRT_2_OVER_PI
+    # Solve x + GELU_COEF*x^3 = target via Newton
+    x1 = torch.tensor(1.5, device=device, dtype=torch.float32)
+    for _ in range(10):
+        f = x1 + GELU_COEF * x1**3 - target
+        f_prime = 1.0 + 3.0 * GELU_COEF * x1**2
+        x1 = x1 - f / f_prime
+    
+    # 2. Negative counterpart
+    x2 = -x1
+    
+    # 3. Value where inner = 4.0 (near saturation boundary but not exactly 4.97)
+    target2 = 4.0 / SQRT_2_OVER_PI
+    x3 = torch.tensor(3.0, device=device, dtype=torch.float32)
+    for _ in range(10):
+        f = x3 + GELU_COEF * x3**3 - target2
+        f_prime = 1.0 + 3.0 * GELU_COEF * x3**2
+        x3 = x3 - f / f_prime
+    
+    # 4. Very small values and zeros to check error accumulation
+    x4 = torch.tensor(0.0, device=device, dtype=torch.float32)
+    x5 = torch.tensor(0.01, device=device, dtype=torch.float32)
+    x6 = torch.tensor(-0.01, device=device, dtype=torch.float32)
+    
+    # Combine into a 2000x2000 tensor with repeating pattern
+    values = torch.stack([x1, x2, x3, x4, x5, x6])
+    # Repeat pattern to fill 2000x2000 (2000*2000/6 ≈ 666666 repetitions)
+    pattern = values.repeat(333333, 1)  # 1999998 elements
+    remainder = 2000*2000 - pattern.numel()
+    if remainder > 0:
+        extra = values[:remainder]
+        pattern = torch.cat([pattern.flatten(), extra])
+    
+    input_tensor = pattern.reshape(2000, 2000)
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

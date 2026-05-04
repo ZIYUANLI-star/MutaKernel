@@ -1,0 +1,131 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant survived all 4 layers of stress testing (value-distribution, dtype-switch,
+repeated-execution, training-mode). Your task is to analyze WHY it survived and
+whether it CAN be killed with a specifically designed input.
+
+## Original Code (around mutation site)
+```
+      59|     int batch_size
+      60| ) {
+      61|     // Single block reduction for final mean
+      62|     __shared__ float shared_sum[256];
+      63|     
+      64|     int tid = threadIdx.x;
+      65|     shared_sum[tid] = 0.0f;
+      66|     
+      67|     // Accumulate batch means
+      68|     for (int i = tid; i < batch_size; i += 256) {
+      69|         shared_sum[tid] += batch_means[i];
+      70|     }
+>>>   71|     __syncthreads();
+      72|     
+      73|     // Parallel reduction
+      74|     for (int stride = 128; stride > 0; stride >>= 1) {
+      75|         if (tid < stride) {
+      76|             shared_sum[tid] += shared_sum[tid + stride];
+      77|         }
+      78|         __syncthreads();
+      79|     }
+      80|     
+      81|     // Write scalar output
+      82|     if (tid == 0) {
+      83|         *final_output = shared_sum[0] / batch_size;
+```
+
+## Mutated Code (around mutation site)
+```
+      59|     int batch_size
+      60| ) {
+      61|     // Single block reduction for final mean
+      62|     __shared__ float shared_sum[256];
+      63|     
+      64|     int tid = threadIdx.x;
+      65|     shared_sum[tid] = 0.0f;
+      66|     
+      67|     // Accumulate batch means
+      68|     for (int i = tid; i < batch_size; i += 256) {
+      69|         shared_sum[tid] += batch_means[i];
+      70|     }
+>>>   71|     
+      72|     // Parallel reduction
+      73|     for (int stride = 128; stride > 0; stride >>= 1) {
+      74|         if (tid < stride) {
+      75|             shared_sum[tid] += shared_sum[tid + stride];
+      76|         }
+      77|         __syncthreads();
+      78|     }
+      79|     
+      80|     // Write scalar output
+      81|     if (tid == 0) {
+      82|         *final_output = shared_sum[0] / batch_size;
+      83|     }
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 71
+- Original fragment: `__syncthreads();`
+- node_type: cuda_syncthreads
+
+## Stress Test Results (already tried — mutant survived ALL of these)
+**IMPORTANT**: All stress tests below used the SAME input shape as get_inputs().
+Only the input VALUES were changed — input shape/dimensions were NEVER varied.
+
+### Layer 1: Value-Distribution Stress (14 policies × 3 seeds = 42 tests)
+| Policy | Seeds | Result | Description |
+|--------|-------|--------|-------------|
+| large_magnitude | ×3 | both_ok (no difference found) | values ~1e6 |
+| mixed_extremes | ×3 | both_ok (no difference found) | mix of 1e6 and 1e-6 |
+| near_overflow | ×3 | REF_FAIL (ref itself crashes/NaN) | values ~1e38 |
+| near_zero | ×3 | both_ok (no difference found) | values ~1e-7 |
+| denormals | ×3 | both_ok (no difference found) | values ~1e-40 (subnormal) |
+| all_negative | ×3 | both_ok (no difference found) | all values < 0 |
+| all_positive | ×3 | both_ok (no difference found) | all values > 0 |
+| alternating_sign | ×3 | both_ok (no difference found) | [+big, -big, +big, ...] |
+| sparse | ×3 | both_ok (no difference found) | 90% zeros, 10% random |
+| uniform_constant | ×3 | both_ok (no difference found) | all elements = same constant |
+| structured_ramp | ×3 | both_ok (no difference found) | linearly increasing 0→N |
+| boundary_last_element | ×3 | both_ok (no difference found) | last element set to extreme |
+| head_heavy | ×3 | both_ok (no difference found) | first 10% large, rest small |
+| tail_heavy | ×3 | both_ok (no difference found) | last 10% large, rest small |
+
+### Layer 2 (dtype switch): not killed
+### Layer 3 (repeated execution, 10 trials × 3 seeds): ALL CONSISTENT
+### Layer 4 (training mode): not killed
+
+**Conclusion from stress testing**: No value-distribution change could distinguish
+original from mutant. If you believe the mutant is killable, you MUST try a
+fundamentally different approach (e.g., different input shapes/dimensions, not
+just different values).
+
+## Input Specification
+The kernel's `get_inputs()` returns tensors with these shapes/dtypes:
+forward() takes 2 tensor argument(s):
+  arg[0]: shape=[128, 4096], dtype=torch.float32
+  arg[1]: shape=[128, 4096], dtype=torch.float32
+
+## Instructions
+Analyze deeply and respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<detailed technical explanation of WHY this mutant survives — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<if killable: describe the specific numerical regime or input pattern that could distinguish original from mutant; if not killable: explain why no input can expose a difference>",
+  "suggested_test": {
+    "description": "<what this input specifically tests>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` returning a list of tensors>"
+  },
+  "recommendations": "<what should be improved — either in the kernel code for robustness, or in the test suite for better coverage>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+  (see Input Specification above for the exact count, shapes, and dtypes)
+- For example, if forward(self, predictions, targets) takes 2 args and
+  get_inputs() returns [tensor_shape_A, tensor_shape_B], then generate_inputs
+  must return [tensor_shape_A, tensor_shape_B] — exactly 2 tensors
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- Focus on the MOST promising extreme-value or edge-case regime to kill this mutant
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

@@ -1,0 +1,130 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant survived all 4 layers of stress testing (value-distribution, dtype-switch,
+repeated-execution, training-mode). Your task is to analyze WHY it survived and
+whether it CAN be killed with a specifically designed input.
+
+## Original Code (around mutation site)
+```
+      52|             if (elem_idx < size) {
+      53|                 output[elem_idx] = fast_tanh(input[elem_idx]);
+      54|             }
+      55|         }
+      56|     }
+      57| }
+      58| 
+      59| // Specialized kernel for half precision (fp16)
+      60| __global__ void tanh_activation_kernel_half(const __half* __restrict__ input,
+      61|                                             __half* __restrict__ output,
+      62|                                             int64_t size) {
+      63|     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+>>>   64|     if (idx < size) {
+      65|         float val = __half2float(input[idx]);
+      66|         float result = fast_tanh(val);
+      67|         output[idx] = __float2half(result);
+      68|     }
+      69| }
+      70| 
+      71| torch::Tensor tanh_activation_cuda(torch::Tensor input) {
+      72|     auto size = input.numel();
+      73|     auto output = torch::empty_like(input);
+      74|     
+      75|     const int block_size = 512;  // Increased block size for better occupancy
+      76|     const int vec_size = 4;
+```
+
+## Mutated Code (around mutation site)
+```
+      52|             if (elem_idx < size) {
+      53|                 output[elem_idx] = fast_tanh(input[elem_idx]);
+      54|             }
+      55|         }
+      56|     }
+      57| }
+      58| 
+      59| // Specialized kernel for half precision (fp16)
+      60| __global__ void tanh_activation_kernel_half(const __half* __restrict__ input,
+      61|                                             __half* __restrict__ output,
+      62|                                             int64_t size) {
+      63|     int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+>>>   64|     if (idx <= size) {
+      65|         float val = __half2float(input[idx]);
+      66|         float result = fast_tanh(val);
+      67|         output[idx] = __float2half(result);
+      68|     }
+      69| }
+      70| 
+      71| torch::Tensor tanh_activation_cuda(torch::Tensor input) {
+      72|     auto size = input.numel();
+      73|     auto output = torch::empty_like(input);
+      74|     
+      75|     const int block_size = 512;  // Increased block size for better occupancy
+      76|     const int vec_size = 4;
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 64
+- Original fragment: `<`
+- node_type: cuda_Lt
+
+## Stress Test Results (already tried — mutant survived ALL of these)
+**IMPORTANT**: All stress tests below used the SAME input shape as get_inputs().
+Only the input VALUES were changed — input shape/dimensions were NEVER varied.
+
+### Layer 1: Value-Distribution Stress (14 policies × 3 seeds = 42 tests)
+| Policy | Seeds | Result | Description |
+|--------|-------|--------|-------------|
+| boundary_last_element | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | last element set to extreme |
+| structured_ramp | ×3 | both_ok (no difference found) | linearly increasing 0→N |
+| large_magnitude | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | values ~1e6 |
+| near_overflow | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | values ~1e38 |
+| near_zero | ×3 | both_ok (no difference found) | values ~1e-7 |
+| denormals | ×3 | both_ok (no difference found) | values ~1e-40 (subnormal) |
+| all_negative | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | all values < 0 |
+| all_positive | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | all values > 0 |
+| mixed_extremes | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | mix of 1e6 and 1e-6 |
+| alternating_sign | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | [+big, -big, +big, ...] |
+| sparse | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | 90% zeros, 10% random |
+| uniform_constant | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | all elements = same constant |
+| head_heavy | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | first 10% large, rest small |
+| tail_heavy | ×3 | ORIG_ALSO_FAILS (original ≠ ref) | last 10% large, rest small |
+
+### Layer 2 (dtype switch): not killed
+### Layer 3 (repeated execution, 10 trials × 3 seeds): ALL CONSISTENT
+### Layer 4 (training mode): not killed
+
+**Conclusion from stress testing**: No value-distribution change could distinguish
+original from mutant. If you believe the mutant is killable, you MUST try a
+fundamentally different approach (e.g., different input shapes/dimensions, not
+just different values).
+
+## Input Specification
+The kernel's `get_inputs()` returns tensors with these shapes/dtypes:
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Instructions
+Analyze deeply and respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<detailed technical explanation of WHY this mutant survives — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<if killable: describe the specific numerical regime or input pattern that could distinguish original from mutant; if not killable: explain why no input can expose a difference>",
+  "suggested_test": {
+    "description": "<what this input specifically tests>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` returning a list of tensors>"
+  },
+  "recommendations": "<what should be improved — either in the kernel code for robustness, or in the test suite for better coverage>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+  (see Input Specification above for the exact count, shapes, and dtypes)
+- For example, if forward(self, predictions, targets) takes 2 args and
+  get_inputs() returns [tensor_shape_A, tensor_shape_B], then generate_inputs
+  must return [tensor_shape_A, tensor_shape_B] — exactly 2 tensors
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- Focus on the MOST promising extreme-value or edge-case regime to kill this mutant
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

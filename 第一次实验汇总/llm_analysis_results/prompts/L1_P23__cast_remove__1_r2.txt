@@ -1,0 +1,130 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      44|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      45|         if (tid < s) {
+      46|             shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+      47|         }
+      48|         __syncthreads();
+      49|     }
+      50|     
+      51|     float row_max = shared_max[0];
+      52|     
+      53|     // Second pass: compute exponentials and sum
+      54|     float thread_sum = 0.0f;
+      55|     for (int i = tid; i < num_features; i += stride) {
+>>>   56|         float val = static_cast<float>(batch_input[i]);
+      57|         float exp_val = expf(val - row_max);
+      58|         batch_output[i] = static_cast<T>(exp_val);
+      59|         thread_sum += exp_val;
+      60|     }
+      61|     
+      62|     // Parallel reduction for sum
+      63|     shared_sum[tid] = thread_sum;
+      64|     __syncthreads();
+      65|     
+      66|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      67|         if (tid < s) {
+      68|             shared_sum[tid] += shared_sum[tid + s];
+```
+
+## Mutated Code (around mutation site)
+```
+      44|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      45|         if (tid < s) {
+      46|             shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+      47|         }
+      48|         __syncthreads();
+      49|     }
+      50|     
+      51|     float row_max = shared_max[0];
+      52|     
+      53|     // Second pass: compute exponentials and sum
+      54|     float thread_sum = 0.0f;
+      55|     for (int i = tid; i < num_features; i += stride) {
+>>>   56|         float val = batch_input[i];
+      57|         float exp_val = expf(val - row_max);
+      58|         batch_output[i] = static_cast<T>(exp_val);
+      59|         thread_sum += exp_val;
+      60|     }
+      61|     
+      62|     // Parallel reduction for sum
+      63|     shared_sum[tid] = thread_sum;
+      64|     __syncthreads();
+      65|     
+      66|     for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      67|         if (tid < s) {
+      68|             shared_sum[tid] += shared_sum[tid + s];
+```
+
+## Mutation Details
+- Operator: cast_remove — Remove an explicit type cast (static_cast, .float(), etc.)
+- Location: line 56
+- Original fragment: `static_cast<float>(batch_input[i])`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 16384], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: The mutant can be killed by changing the input dtype to something other than float32 that requires explicit conversion. For example, using int16_t, bfloat16, or double inputs would cause different behavior: the explicit static_cast<float> in original ensures conversion to float32, while the mutant would do implicit conversion (potentially different). With double inputs, the original truncates to float32 before subtraction, while the mutant would keep double precision until assignment to float val (still truncates), but intermediate computations might differ. The most promising is using integer dtypes where the cast affects numerical values.
+- Suggested code:
+```python
+import torch
+import math
+def generate_inputs(device):
+    # Create int16 tensor with extreme values
+    shape = [16, 16384]
+    # Fill with alternating large positive/negative int16 extremes
+    # Use values that are exactly representable in int16 but may lose precision when converted to float
+    max_int16 = 32767
+    min_int16 = -32768
+    # Pattern: mix extremes and zeros to test conversion
+    tensor = torch.zeros(shape, dtype=torch.int16, device=device)
+    for i in range(shape[0]):
+        for j in range(shape[1]):
+            if j % 4 == 0:
+                tensor[i, j] = max_int16
+            elif j % 4 == 1:
+                tensor[i, j] = min_int16
+            elif j % 4 == 2:
+                tensor[i, j] = 0
+            else:
+                tensor[i, j] = max_int16 // 2  # mid-range
+    # Convert to float32 for kernel input (kernel expects float32, but we can reinterpret)
+    # Actually, the kernel template expects same dtype as output? Let's use float32 but with int16 bit pattern.
+    # Better: use torch.float32 but with values that are exact ints
+    tensor_float = tensor.to(torch.float32)
+    return [tensor_float]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

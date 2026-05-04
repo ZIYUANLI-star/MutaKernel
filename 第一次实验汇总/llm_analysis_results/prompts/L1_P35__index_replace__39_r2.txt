@@ -1,0 +1,116 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+     107|     
+     108|     float inv_std = 0.0f;
+     109|     if (threadIdx.x == 0) {
+     110|         float var = shared_data[0] / group_elements;
+     111|         inv_std = rsqrtf(var + eps);
+     112|         shared_data[0] = inv_std;
+     113|     }
+     114|     __syncthreads();
+     115|     
+     116|     inv_std = shared_data[0];
+     117|     
+     118|     // Apply normalization with affine transformation
+>>>  119|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+     120|         int c = group_start + (idx / spatial_size);
+     121|         int s = idx % spatial_size;
+     122|         int output_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+     123|         
+     124|         float val = to_float(input[output_idx]);
+     125|         float normalized = (val - mean) * inv_std;
+     126|         
+     127|         if (weight && bias) {
+     128|             normalized = normalized * weight[c] + bias[c];
+     129|         }
+     130|         
+     131|         output[output_idx] = from_float<T>(normalized);
+```
+
+## Mutated Code (around mutation site)
+```
+     107|     
+     108|     float inv_std = 0.0f;
+     109|     if (threadIdx.x == 0) {
+     110|         float var = shared_data[0] / group_elements;
+     111|         inv_std = rsqrtf(var + eps);
+     112|         shared_data[0] = inv_std;
+     113|     }
+     114|     __syncthreads();
+     115|     
+     116|     inv_std = shared_data[0];
+     117|     
+     118|     // Apply normalization with affine transformation
+>>>  119|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.z) {
+     120|         int c = group_start + (idx / spatial_size);
+     121|         int s = idx % spatial_size;
+     122|         int output_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+     123|         
+     124|         float val = to_float(input[output_idx]);
+     125|         float normalized = (val - mean) * inv_std;
+     126|         
+     127|         if (weight && bias) {
+     128|             normalized = normalized * weight[c] + bias[c];
+     129|         }
+     130|         
+     131|         output[output_idx] = from_float<T>(normalized);
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 119
+- Original fragment: `blockDim.x`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Change the input shape to force a different launch configuration where blockDim.z is not equal to blockDim.x, or to make group_elements small enough that the difference in stride causes a clear divergence in which threads process which elements. Specifically, reducing the spatial dimensions to 1x1 will make group_elements equal to the number of channels per group. With a typical 1D block of size 256, the original stride (blockDim.x = 256) will cause only the first few threads to process elements (or each thread to process at most one element), while the mutant stride (blockDim.z = 1) will cause every thread to iterate over many elements, leading to overlapping writes and incorrect outputs.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Shape: [batch, channels, height, width]
+    # Use 16 batches, 64 channels, spatial size 1x1 to make group_elements = channels_per_group
+    # Assuming the group normalization uses a group size of 32 (common), each group has 32 elements.
+    # The kernel likely launches with a 1D block of 256 threads.
+    # Original stride = 256 → only thread 0 processes the first element, others skip.
+    # Mutant stride = 1 → all threads process all elements, causing race conditions.
+    input_tensor = torch.randn(16, 64, 1, 1, device=device, dtype=torch.float32)
+    return [input_tensor]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

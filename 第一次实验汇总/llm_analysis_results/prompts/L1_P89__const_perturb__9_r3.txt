@@ -1,0 +1,131 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      18|     int ai = tid * 2;
+      19|     int bi = tid * 2 + 1;
+      20|     
+      21|     if (ai < n) temp[ai] = data[ai];
+      22|     if (bi < n) temp[bi] = data[bi];
+      23|     
+      24|     __syncthreads();
+      25|     
+      26|     // Up-sweep phase
+      27|     for (int d = n >> 1; d > 0; d >>= 1) {
+      28|         if (tid < d) {
+      29|             int ai = offset * (2 * tid + 1) - 1;
+>>>   30|             int bi = offset * (2 * tid + 2) - 1;
+      31|             temp[bi] += temp[ai];
+      32|         }
+      33|         offset <<= 1;
+      34|         __syncthreads();
+      35|     }
+      36|     
+      37|     // Down-sweep phase
+      38|     if (tid == 0) {
+      39|         temp[n - 1] = 0;
+      40|     }
+      41|     
+      42|     for (int d = 1; d < n; d <<= 1) {
+```
+
+## Mutated Code (around mutation site)
+```
+      18|     int ai = tid * 2;
+      19|     int bi = tid * 2 + 1;
+      20|     
+      21|     if (ai < n) temp[ai] = data[ai];
+      22|     if (bi < n) temp[bi] = data[bi];
+      23|     
+      24|     __syncthreads();
+      25|     
+      26|     // Up-sweep phase
+      27|     for (int d = n >> 1; d > 0; d >>= 1) {
+      28|         if (tid < d) {
+      29|             int ai = offset * (2 * tid + 1) - 1;
+>>>   30|             int bi = offset * (1 * tid + 2) - 1;
+      31|             temp[bi] += temp[ai];
+      32|         }
+      33|         offset <<= 1;
+      34|         __syncthreads();
+      35|     }
+      36|     
+      37|     // Down-sweep phase
+      38|     if (tid == 0) {
+      39|         temp[n - 1] = 0;
+      40|     }
+      41|     
+      42|     for (int d = 1; d < n; d <<= 1) {
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 30
+- Original fragment: `2`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[128, 4000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use a non-power-of-2 input size to break the degeneracy. The mutation's effect becomes visible when the binary tree structure is incomplete. Specifically, when `n` is not a power of 2, the `d` values in the loop `for (int d = n >> 1; d > 0; d >>= 1)` produce different iteration counts, and the index calculation divergence accumulates. A size like 3000 (non-power-of-2) with carefully structured values will cause incorrect partial sums during the up-sweep phase, propagating to wrong final scan results. Use a simple ascending sequence to make verification easy.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Change shape from [128, 4000] to [128, 3000] to test non-power-of-2
+    n = 3000
+    batch = 128
+    # Create ascending values per row for easy verification
+    data = torch.arange(n, dtype=torch.float32, device=device).unsqueeze(0).expand(batch, n).clone()
+    return [data]
+
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Use a sparse input pattern with non-zero values only at indices that cause self-addition or misalignment in the mutant's up-sweep. Specifically, target indices where the mutant's `bi = offset * (1 * tid + 2) - 1` equals `ai` (self-addition) or deviates significantly from the original stride. This creates double-counting or missed accumulations that propagate through both phases, producing incorrect final prefix sums. A pattern with 1s at selected even indices (e.g., 2 and 4) and zeros elsewhere will stress these specific miscalculations.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    batch = 128
+    n = 4000
+    data = torch.zeros(batch, n, dtype=torch.float32, device=device)
+    data[:, 2] = 1.0  # Index 2 (affected by self-addition in mutant)
+    data[:, 4] = 1.0  # Index 4 (misaligned accumulation in mutant)
+    return [data]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

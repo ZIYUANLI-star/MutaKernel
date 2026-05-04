@@ -1,0 +1,42 @@
+{
+  "mutant_id": "L1_P100__sync_remove__1",
+  "kernel_name": "L1_P100",
+  "operator_name": "sync_remove",
+  "status": "survived",
+  "survival_reason": "The mutant removes a __syncthreads() in a parallel reduction. This can cause race conditions because threads may read stale values from shared memory. However, for the given input shape [128,1], only 128 threads are active in a block of 256. The inactive threads are set to 0 and never written. The reduction without barriers becomes deterministic because the active threads only read from inactive threads (which are constant 0) and from active threads that are not modified in the reduction (because the first iteration adds 0). Therefore, the race condition does not occur for this input shape. For other shapes (e.g., 256 elements) the race condition is non-deterministic and may not manifest in a single run, explaining why previous attempts failed.",
+  "killable": false,
+  "kill_strategy": "N/A",
+  "recommendations": "To kill this mutant, stress tests must use input shapes that fully utilize the block (e.g., multiples of 256) and run the kernel multiple times to catch non-deterministic race conditions. However, for a single run, the mutant may survive. For the given input specification, the mutant is unkillable.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the input shape [128,1] leads to a single thread block with 256 threads, but only the first 128 threads have valid data. The reduction loop reads from shared memory locations beyond the initialized portion (indices 128-255), which are uninitialized (potentially zero). Since __syncthreads() only coordinates within a block and all active threads are within the same warp(s) due to the small size, the removal of synchronization does not cause observable differences in this specific configuration. Both original and mutant read the same uninitialized values, leading to identical outputs under all tested value distributions.",
+      "kill_strategy": "The mutant can be killed by using an input shape where the number of elements equals or exceeds the block size (256). This forces the reduction to use all threads with initialized data, making the race condition from missing __syncthreads() observable. Specifically, with a fully utilized block, threads in later warps may read partially updated values from earlier warps in the same reduction step, causing incorrect sums. Using uniform non-zero values (e.g., all 1.0) will produce a predictable expected sum (256.0), while the mutant may produce a different value due to race conditions.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # Shape [256,1] to match block size 256, ensuring all threads are active\n    predictions = torch.ones((256, 1), dtype=torch.float32, device=device)\n    targets = torch.zeros((256, 1), dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant removes a __syncthreads() in a parallel reduction. This can cause race conditions because threads may read stale values from shared memory. However, for the given input shape [128,1], only 128 threads are active in a block of 256. The inactive threads are set to 0 and never written. The reduction without barriers becomes deterministic because the active threads only read from inactive threads (which are constant 0) and from active threads that are not modified in the reduction (because the first iteration adds 0). Therefore, the race condition does not occur for this input shape. For other shapes (e.g., 256 elements) the race condition is non-deterministic and may not manifest in a single run, explaining why previous attempts failed.",
+      "kill_strategy": "N/A",
+      "killable": false,
+      "suggested_code": null,
+      "killed": false,
+      "detail": {}
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel lacks validation of the parallel reduction pattern's correctness. The reduction algorithm assumes proper synchronization for correct shared memory access, but this dependency is implicit. A robust design should either: 1) Use atomic operations for the final reduction to avoid synchronization dependencies, or 2) Explicitly validate that the reduction size is compatible with the algorithm's assumptions. The current implementation hides the synchronization requirement, making it vulnerable to race conditions when inputs don't align perfectly with the block size or when synchronization is removed. Adding explicit checks or using more robust reduction patterns would prevent silent errors.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for fused hinge loss computation\nhinge_loss_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\n__global__ void hinge_loss_kernel(const float* predictions, const float* targets, float* loss, int size) {\n    __shared__ float shared_mem[256];\n    \n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int tid = threadIdx.x;\n    \n    float thread_loss = 0.0f;\n    \n    if (idx < size) {\n        float margin = 1.0f - predictions[idx] * targets[idx];\n        thread_loss = margin > 0.0f ? margin : 0.0f;\n    }\n    \n    shared_mem[tid] = thread_loss;\n    __syncthreads();\n    \n    // Parallel reduction for sum within block\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_mem[tid] += shared_mem[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // First thread writes block sum to global memory\n    if (tid == 0) {\n        loss[blockIdx.x] = shared_mem[0];\n    }\n}\n\ntorch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {\n    auto size = predictions.numel();\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    // Validation: Ensure kernel assumptions hold\n    if (block_size & (block_size - 1)) {\n        AT_ERROR(\"Block size must be power of two for reduction\");\n    }\n    \n    // Allocate device memory for block sums\n    auto block_sums = torch::zeros({num_blocks}, torch::TensorOptions().dtype(torch::kFloat32).device(predictions.device()));\n    \n    // Launch kernel\n    hinge_loss_kernel<<<num_blocks, block_size>>>(\n        predictions.data_ptr<float>(),\n        targets.data_ptr<float>(),\n        block_sums.data_ptr<float>(),\n        size\n    );\n    \n    // Synchronize to catch any kernel errors\n    cudaDeviceSynchronize();\n    \n    // Final reduction on CPU (small number of elements)\n    auto final_loss = block_sums.sum() / size;\n    \n    return final_loss;\n}\n\"\"\"\n\nhinge_loss_cpp_source = \"torch::Tensor hinge_loss_cuda(torch::Tensor predictions, torch::Tensor targets);\"\n\n# Compile the inline CUDA code for hinge loss\nhinge_loss_module = load_inline(\n    name=\"hinge_loss\",\n    cpp_sources=hinge_loss_cpp_source,\n    cuda_sources=hinge_loss_source,\n    functions=[\"hinge_loss_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that computes Hinge Loss using custom CUDA kernel.\n    Fuses clamp, multiplication, subtraction, and mean operations.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.hinge_loss_kernel = hinge_loss_module\n\n    def forward(self, predictions, targets):\n        # Ensure tensors are contiguous and have same shape\n        predictions = predictions.contiguous().view(-1)\n        targets = targets.contiguous().view(-1)\n        \n        # Validate inputs\n        if predictions.numel() != targets.numel():\n            raise ValueError(\"Predictions and targets must have same number of elements\")\n        \n        if predictions.numel() == 0:\n            return torch.tensor(0.0, device=predictions.device)\n        \n        return self.hinge_loss_kernel.hinge_loss_cuda(predictions, targets)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Race Condition / Non-Determinism Not Triggered"
+}

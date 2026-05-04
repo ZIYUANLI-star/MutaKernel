@@ -1,0 +1,496 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+A mutation testing tool applied the following mutation to a GPU kernel. The
+mutant has survived ALL of the following testing:
+- EMD 4-layer equivalence detection (Layer 0-3, 0 rounds of bitwise comparison)
+- Enhanced deterministic testing (5 dimensions, 126 rounds)
+
+Your task: determine whether this mutant is truly unkillable under the
+fixed-shape contract, or whether a still-missed value-level test exists.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+
+### Auxiliary configuration-stress track
+We additionally tested alternative batch sizes as a **separate probe** (see
+config_stress results below). This does NOT redefine the main contract.
+**Do NOT suggest shape or batch size changes in your answer.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized Softplus with vectorized loads
+softplus_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename scalar_t, int VEC_SIZE>
+struct VectorType;
+
+template<>
+struct VectorType<float, 4> {
+    using type = float4;
+};
+
+template<>
+struct VectorType<half, 8> {
+    using type = uint4;  // For half, we use uint4 for 8 half values
+};
+
+template<typename scalar_t, int VEC_SIZE>
+__device__ __forceinline__ scalar_t softplus_activation(scalar_t x, float beta) {
+    float x_scaled = static_cast<float>(x) * beta;
+    if (x_scaled > 20.0f) return static_cast<scalar_t>(x);
+    if (x_scaled < -20.0f) return static_cast<scalar_t>(0.0f);
+    return static_cast<scalar_t>(log1pf(expf(x_scaled)) / beta);
+}
+
+template<>
+__device__ __forceinline__ half softplus_activation<half, 8>(half x, float beta) {
+    float x_f = __half2float(x);
+    float x_scaled = x_f * beta;
+    if (x_scaled > 20.0f) return x;
+    if (x_scaled < -20.0f) return __float2half(0.0f);
+    return __float2half(log1pf(expf(x_scaled)) / beta);
+}
+
+template<typename scalar_t, int VEC_SIZE>
+__global__ void softplus_vectorized_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t size,
+    float beta) {
+    
+    int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
+    
+    if (idx + VEC_SIZE <= size) {
+        using VecType = typename VectorType<scalar_t, VEC_SIZE>::type;
+        VecType vec_in = *reinterpret_cast<const VecType*>(&input[idx]);
+        VecType vec_out;
+        
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; i++) {
+            scalar_t val;
+            if constexpr (std::is_same<scalar_t, half>::value && VEC_SIZE == 8) {
+                half* half_ptr = reinterpret_cast<half*>(&vec_in);
+                val = half_ptr[i];
+            } else {
+                float* float_ptr = reinterpret_cast<float*>(&vec_in);
+                val = static_cast<scalar_t>(float_ptr[i]);
+            }
+            
+            scalar_t result = softplus_activation<scalar_t, VEC_SIZE>(val, beta);
+            
+            if constexpr (std::is_same<scalar_t, half>::value && VEC_SIZE == 8) {
+                half* half_out = reinterpret_cast<half*>(&vec_out);
+                half_out[i] = result;
+            } else {
+                float* float_out = reinterpret_cast<float*>(&vec_out);
+                float_out[i] = static_cast<float>(result);
+            }
+        }
+        
+        *reinterpret_cast<VecType*>(&output[idx]) = vec_out;
+    } else {
+        // Handle remaining elements
+        for (int i = 0; i < VEC_SIZE && idx + i < size; i++) {
+            output[idx + i] = softplus_activation<scalar_t, VEC_SIZE>(input[idx + i], beta);
+        }
+    }
+}
+
+torch::Tensor softplus_cuda(torch::Tensor input, float beta) {
+    TORCH_CHECK(input.is_cuda(), "Input tensor must be on CUDA device");
+    TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
+    
+    auto output = torch::empty_like(input);
+    int64_t size = input.numel();
+    
+    // Choose optimal vector size based on dtype
+    if (input.scalar_type() == torch::kFloat32) {
+        const int VEC_SIZE = 4;
+        const int block_size = 256;
+        int grid_size = (size + block_size * VEC_SIZE - 1) / (block_size * VEC_SIZE);
+        
+        softplus_vectorized_kernel<float, VEC_SIZE><<<grid_size, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            size,
+            beta
+        );
+    } else if (input.scalar_type() == torch::kFloat16) {
+        const int VEC_SIZE = 8;
+        const int block_size = 256;
+        int grid_size = (size + block_size * VEC_SIZE - 1) / (block_size * VEC_SIZE);
+        
+        softplus_vectorized_kernel<half, VEC_SIZE><<<grid_size, block_size>>>(
+            reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+            size,
+            beta
+        );
+    } else {
+        AT_ERROR("Unsupported data type for softplus_cuda");
+    }
+    
+    return output;
+}
+"""
+
+softplus_cpp_source = """
+torch::Tensor softplus_cuda(torch::Tensor input, float beta=1.0);
+"""
+
+# Compile the inline CUDA code
+softplus_module = load_inline(
+    name="softplus_module",
+    cpp_sources=softplus_cpp_source,
+    cuda_sources=softplus_source,
+    functions=["softplus_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas=-v"],
+    extra_cflags=["-O3"],
+    extra_ldflags=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softplus activation using custom CUDA kernel.
+    """
+    def __init__(self, beta=1.0):
+        super(ModelNew, self).__init__()
+        self.beta = beta
+        self.softplus_cuda = softplus_module.softplus_cuda
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            x = x.cuda()
+        if not x.is_contiguous():
+            x = x.contiguous()
+            
+        return self.softplus_cuda(x, self.beta)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized Softplus with vectorized loads
+softplus_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename scalar_t, int VEC_SIZE>
+struct VectorType;
+
+template<>
+struct VectorType<float, 4> {
+    using type = float4;
+};
+
+template<>
+struct VectorType<half, 8> {
+    using type = uint4;  // For half, we use uint4 for 8 half values
+};
+
+template<typename scalar_t, int VEC_SIZE>
+__device__ __forceinline__ scalar_t softplus_activation(scalar_t x, float beta) {
+    float x_scaled = static_cast<float>(x) * beta;
+    if (x_scaled > 20.0f) return static_cast<scalar_t>(x);
+    if (x_scaled < -20.0f) return static_cast<scalar_t>(0.0f);
+    return static_cast<scalar_t>(log1pf(expf(x_scaled)) / beta);
+}
+
+template<>
+__device__ __forceinline__ half softplus_activation<half, 8>(half x, float beta) {
+    float x_f = __half2float(x);
+    float x_scaled = x_f * beta;
+    if (x_scaled > 20.0f) return x;
+    if (x_scaled < -20.0f) return __float2half(0.0f);
+    return __float2half(log1pf(expf(x_scaled)) / beta);
+}
+
+template<typename scalar_t, int VEC_SIZE>
+__global__ void softplus_vectorized_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    int64_t size,
+    float beta) {
+    
+    int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
+    
+    if (idx + VEC_SIZE <= size) {
+        using VecType = typename VectorType<scalar_t, VEC_SIZE>::type;
+        VecType vec_in = *reinterpret_cast<const VecType*>(&input[idx]);
+        VecType vec_out;
+        
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; i++) {
+            scalar_t val;
+            if constexpr (std::is_same<scalar_t, half>::value && VEC_SIZE == 8) {
+                half* half_ptr = reinterpret_cast<half*>(&vec_in);
+                val = half_ptr[i];
+            } else {
+                float* float_ptr = reinterpret_cast<float*>(&vec_in);
+                val = static_cast<scalar_t>(float_ptr[i]);
+            }
+            
+            scalar_t result = softplus_activation<scalar_t, VEC_SIZE>(val, beta);
+            
+            if constexpr (std::is_same<scalar_t, half>::value && VEC_SIZE == 8) {
+                half* half_out = reinterpret_cast<half*>(&vec_out);
+                half_out[i] = result;
+            } else {
+                float* float_out = reinterpret_cast<float*>(&vec_out);
+                float_out[i] = static_cast<float>(result);
+            }
+        }
+        
+        *reinterpret_cast<VecType*>(&output[idx]) = vec_out;
+    } else {
+        // Handle remaining elements
+        for (int i = 0; i < VEC_SIZE && idx - i < size; i++) {
+            output[idx + i] = softplus_activation<scalar_t, VEC_SIZE>(input[idx + i], beta);
+        }
+    }
+}
+
+torch::Tensor softplus_cuda(torch::Tensor input, float beta) {
+    TORCH_CHECK(input.is_cuda(), "Input tensor must be on CUDA device");
+    TORCH_CHECK(input.is_contiguous(), "Input tensor must be contiguous");
+    
+    auto output = torch::empty_like(input);
+    int64_t size = input.numel();
+    
+    // Choose optimal vector size based on dtype
+    if (input.scalar_type() == torch::kFloat32) {
+        const int VEC_SIZE = 4;
+        const int block_size = 256;
+        int grid_size = (size + block_size * VEC_SIZE - 1) / (block_size * VEC_SIZE);
+        
+        softplus_vectorized_kernel<float, VEC_SIZE><<<grid_size, block_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            size,
+            beta
+        );
+    } else if (input.scalar_type() == torch::kFloat16) {
+        const int VEC_SIZE = 8;
+        const int block_size = 256;
+        int grid_size = (size + block_size * VEC_SIZE - 1) / (block_size * VEC_SIZE);
+        
+        softplus_vectorized_kernel<half, VEC_SIZE><<<grid_size, block_size>>>(
+            reinterpret_cast<half*>(input.data_ptr<at::Half>()),
+            reinterpret_cast<half*>(output.data_ptr<at::Half>()),
+            size,
+            beta
+        );
+    } else {
+        AT_ERROR("Unsupported data type for softplus_cuda");
+    }
+    
+    return output;
+}
+"""
+
+softplus_cpp_source = """
+torch::Tensor softplus_cuda(torch::Tensor input, float beta=1.0);
+"""
+
+# Compile the inline CUDA code
+softplus_module = load_inline(
+    name="softplus_module",
+    cpp_sources=softplus_cpp_source,
+    cuda_sources=softplus_source,
+    functions=["softplus_cuda"],
+    verbose=False,
+    extra_cuda_cflags=["-O3", "--use_fast_math", "-Xptxas=-v"],
+    extra_cflags=["-O3"],
+    extra_ldflags=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softplus activation using custom CUDA kernel.
+    """
+    def __init__(self, beta=1.0):
+        super(ModelNew, self).__init__()
+        self.beta = beta
+        self.softplus_cuda = softplus_module.softplus_cuda
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not x.is_cuda:
+            x = x.cuda()
+        if not x.is_contiguous():
+            x = x.contiguous()
+            
+        return self.softplus_cuda(x, self.beta)
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 81
+- Original fragment: `+`
+- node_type: cuda_Add
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis (Layer 3) may contain mathematical errors.
+Reason independently from the source code — do not blindly trust prior
+reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 81
+- Original fragment: `+`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Error: worker_timeout_or_crash
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+
+### Main Track (fixed-shape, variable-value)
+
+#### 1. Value-Distribution Stress
+Tested 63 / 63 rounds. Result: ALL SURVIVED (bitwise identical)
+  - large_magnitude seed=42: survived
+  - large_magnitude seed=43: survived
+  - large_magnitude seed=44: survived
+  - mixed_extremes seed=45: survived
+  - mixed_extremes seed=46: survived
+  - mixed_extremes seed=47: survived
+  - dense_nonzero seed=48: survived
+  - dense_nonzero seed=49: survived
+  - dense_nonzero seed=50: survived
+  - near_overflow seed=51: survived
+  - near_overflow seed=52: survived
+  - near_overflow seed=53: survived
+  - near_zero seed=54: survived
+  - near_zero seed=55: survived
+  - near_zero seed=56: survived
+  - denormals seed=57: survived
+  - denormals seed=58: survived
+  - denormals seed=59: survived
+  - all_negative seed=60: survived
+  - all_negative seed=61: survived
+  - all_negative seed=62: survived
+  - all_positive seed=63: survived
+  - all_positive seed=64: survived
+  - all_positive seed=65: survived
+  - alternating_sign seed=66: survived
+  - alternating_sign seed=67: survived
+  - alternating_sign seed=68: survived
+  - sparse seed=69: survived
+  - sparse seed=70: survived
+  - sparse seed=71: survived
+
+#### 2. Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+
+#### 3. Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+
+#### 4. Training Mode (.train())
+Result: ALL SURVIVED
+
+### Auxiliary Configuration-Stress Track (separate from main contract)
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+### Policy Semantics Reference
+- all_negative: all values < 0
+- all_positive: all values > 0
+- alternating_sign: [+big, -big, +big, ...] pattern
+- boundary_last_element: all-zero baseline with last valid element amplified
+- denormals: values ~1e-40 (subnormal floats)
+- dense_nonzero: all non-zero (|randn|+1.0), eliminates zero-masking equivalence
+- extreme_magnitude: extreme_magnitude
+- head_heavy: first 10% large, rest small
+- init_sensitive: init_sensitive
+- large_magnitude: values ~1e6, tests large-number accumulation
+- mixed_extremes: mix of 1e6 and 1e-6 values
+- near_epsilon: near_epsilon
+- near_overflow: values ~1e38, tests near-overflow behavior
+- near_zero: values ~1e-7, tests near-zero sensitivity
+- reduction_adversarial: reduction_adversarial
+- relop_boundary_hit: integer-valued tensors emphasizing equality/boundary comparisons
+- sparse: 90% zeros, 10% random non-zero
+- sparse_extreme: 99% zeros + 1% extreme (randn*1e4), boundary/propagation test
+- structured_ramp: linearly increasing 0→N, index-visible pattern
+- tail_heavy: last 10% large, rest small
+- uniform_constant: all elements = same constant value
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Coverage gap identification**: If a difference IS reachable, review
+the tested policies (see Policy Semantics Reference) and explain precisely
+which value pattern was missed and WHY it would trigger the difference.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario that no previous test covered.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

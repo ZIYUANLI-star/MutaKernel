@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P50__relop_replace__8",
+  "kernel_name": "L1_P50",
+  "operator_name": "relop_replace",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant survives because previous attempts changed the block size (via input shape), causing the original kernel to also fail (original_ok=False). The mutation only affects behavior when threadIdx.x equals num_warps (the number of warps), triggering an out-of-bounds read of shared memory. This out-of-bounds read is uncontrolled and may coincidentally read 1.0, making the mutant behave identically to the original. The original kernel is designed for blockDim.x=256 (last dimension 256), so altering the shape invalidates the kernel's assumptions, leading to incorrect outputs for both original and mutant.",
+  "killable": true,
+  "kill_strategy": "Use the intended input shape [16, 256, 256] and fill all values with 1.0. This ensures the correct product is 1.0 and the original kernel should compute 1.0. The mutant will read an out-of-bounds shared memory location (index 8) due to the changed condition. If this location contains any value other than 1.0 (e.g., 0.0 from uninitialized memory), the mutant's product will differ, killing the mutant.",
+  "recommendations": "If this test fails to kill the mutant, consider running multiple independent tests with different random seeds to increase the chance of observing a non-1.0 out-of-bounds read, or analyze the kernel's shared memory allocation pattern to predict the out-of-bounds value. However, the mutant may be unkillable if the out-of-bounds read consistently returns 1.0.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutation changes the condition from `threadIdx.x < (blockDim.x + 31) / 32` to `threadIdx.x <= (blockDim.x + 31) / 32` for reading from shared memory. This only matters when threadIdx.x equals the number of warps (num_warps = ceil(blockDim.x/32)). For blockDim.x=256 (as implied by input shape), num_warps=8. The original uses scalar_t(1.0) for thread 8, while the mutant reads shared[8] (uninitialized). However, if the uninitialized value happens to be 1.0 (common in GPU memory), the product reduction remains unchanged. Additionally, even if it's not 1.0, the final product might be dominated by zeros or NaNs from other threads, masking the difference.",
+      "kill_strategy": "Use a block size that is NOT a multiple of 32, making num_warps = ceil(blockDim.x/32) not equal to blockDim.x/32. Then threadIdx.x = num_warps will be valid and read uninitialized shared memory. Set all input values to a small positive non-zero number (e.g., 1.000001) so the product is finite and sensitive to the extra factor. Ensure no zeros or extreme values that could dominate or cause NaN/overflow.",
+      "killable": true,
+      "suggested_code": "import torch\ndef generate_inputs(device):\n    # Use a shape that forces blockDim.x = 33 (or any non-multiple of 32).\n    # We need to adjust the kernel launch, but for the test we just provide input.\n    # Since the kernel likely uses blockDim.x = last dimension (256 originally),\n    # we change last dimension to 33.\n    shape = [16, 256, 33]  # Changed last dim from 256 to 33\n    # Fill with values slightly above 1.0, so product is sensitive to extra factor\n    val = 1.000001\n    x = torch.full(shape, val, dtype=torch.float32, device=device)\n    return [x]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.000244e+00, mean_diff=3.031043e-02, ref_range=[1.0002e+00,1.0002e+00], mut_range=[0.0000e+00,1.0002e+00]",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survives because the out-of-bounds access at shared[num_warps] (when threadIdx.x = num_warps) reads uninitialized memory, which can be any value. Previous attempts with small positive values (1.000001) caused the original kernel to compute approximately 1.000033^33 while the mutant multiplied by uninitialized memory (potentially 0.0, giving 0.0). However, the comparison between original and mutant outputs showed differences but the mutant wasn't 'killed' - likely because the testing framework only kills mutants when they produce DIFFERENT but VALID outputs (not NaN/inf). When uninitialized memory contains 0.0, the mutant produces 0.0, which differs from the original's ~1.000033, but 0.0 might be considered a 'valid' output (finite). The key is that the out-of-bounds read's value is non-deterministic across runs, making consistent detection tricky.",
+      "kill_strategy": "Force the out-of-bounds read to be a predictable, non-1.0 value by poisoning shared memory with sentinel values. Use a block size that's NOT a multiple of 32 (e.g., 33) so num_warps=2 and threadIdx.x=2 reads shared[2] (out-of-bounds). Before the kernel launch, we can't directly initialize shared memory, but we can influence what resides in that memory location by using input values that cause specific warp products to be written to adjacent shared memory slots. By making all valid warp products = 1.0 and ensuring the out-of-bounds location (which is actually the next slot in shared memory) contains a known non-1.0 value from a previous kernel launch or careful indexing.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    shape = [16, 256, 33]  # last dim 33 forces blockDim.x=33\n    # Fill with -1.0, so each warp product depends on number of elements\n    # Warp0: 32 elements → (-1)^32 = 1.0\n    # Warp1: 1 element  → (-1)^1 = -1.0\n    x = torch.full(shape, -1.0, dtype=torch.float32, device=device)\n    # Modify one element in warp1 to be 2.0, making shared[1] = -2.0\n    # This ensures the final product is not ±1.0 and more sensitive\n    x[:, :, 32] = 2.0  # last element (index 32) is in warp1\n    return [x]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref output NaN/Inf on LLM input"
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutant survives because previous attempts changed the block size (via input shape), causing the original kernel to also fail (original_ok=False). The mutation only affects behavior when threadIdx.x equals num_warps (the number of warps), triggering an out-of-bounds read of shared memory. This out-of-bounds read is uncontrolled and may coincidentally read 1.0, making the mutant behave identically to the original. The original kernel is designed for blockDim.x=256 (last dimension 256), so altering the shape invalidates the kernel's assumptions, leading to incorrect outputs for both original and mutant.",
+      "kill_strategy": "Use the intended input shape [16, 256, 256] and fill all values with 1.0. This ensures the correct product is 1.0 and the original kernel should compute 1.0. The mutant will read an out-of-bounds shared memory location (index 8) due to the changed condition. If this location contains any value other than 1.0 (e.g., 0.0 from uninitialized memory), the mutant's product will differ, killing the mutant.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    shape = [16, 256, 256]\n    x = torch.ones(shape, dtype=torch.float32, device=device)\n    return [x]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.000000e+00, mean_diff=3.906250e-03, ref_range=[1.0000e+00,1.0000e+00], mut_range=[0.0000e+00,1.0000e+00]",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 3,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "design_shape_constant_one",
+    "rule_description": "Generates inputs with the kernel's designed shape (typically the last dimension matching thread block size) and all values set to 1.0. This tests boundary condition mutations by ensuring out-of-bounds memory accesses (caused by operator changes) read uncontrolled values that differ from the constant, while the original kernel behaves correctly with valid indices.",
+    "applicable_operators": [
+      "relop_replace",
+      "array_index_replace",
+      "boundary_change"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Preserve the original shape (assumed to be the kernel's designed shape)\n    # Fill entire tensor with 1.0 to detect out-of-bounds reads from mutations\n    return torch.ones(shape, dtype=dtype, device=device)"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    shape = [16, 256, 256]\n    x = torch.ones(shape, dtype=torch.float32, device=device)\n    return [x]"
+}

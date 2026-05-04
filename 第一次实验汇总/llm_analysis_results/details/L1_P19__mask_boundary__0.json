@@ -1,0 +1,63 @@
+{
+  "mutant_id": "L1_P19__mask_boundary__0",
+  "kernel_name": "L1_P19",
+  "operator_name": "mask_boundary",
+  "status": "survived",
+  "survival_reason": "The mutant changes the boundary condition from 'idx < size' to 'idx < size - 1', causing the last element (index size-1) to be skipped and remain uninitialized. The previous attempts assumed that uninitialized GPU memory would contain arbitrary values, but the mutant survived, suggesting that in the test environment, the memory allocated by torch.empty_like() may be zero-initialized or pre-initialized to values matching the expected output. Specifically, when the last element was set to a positive value, the mutant's uninitialized memory coincidentally matched that value; when set to negative, it matched zero (the correct ReLU output). This indicates the test environment might have deterministic memory initialization, masking the mutation's effect.",
+  "killable": true,
+  "kill_strategy": "Use a tensor where the last element is positive and all other elements are negative, so the reference output has a distinct positive value only at the last index. The mutant will skip initializing this last index, leaving it as uninitialized memory. By using a large, random negative pattern for the rest, the probability of the uninitialized value matching the expected positive value is extremely low. Additionally, we will explicitly verify the last element's value and ensure the rest are zero (ReLU of negative).",
+  "recommendations": "If this test still fails to kill the mutant, consider that the test environment may be zero-initializing GPU memory and the comparison tolerance may be too loose. In that case, manually check the last element's value with exact equality (using torch.equal) rather than approximate comparison. Additionally, try to 'dirty' the GPU memory by allocating and freeing other tensors before the test to increase the chance of non-zero uninitialized values.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant survived because the stress tests likely did not verify the entire output tensor. The mutation only affects the last element (index size-1) of the output, leaving it uninitialized. The stress tests, despite varying values, may have only compared the first (size-1) elements, or the last element was consistently non-positive (e.g., negative or zero) in all tests. Since `torch::empty_like` often returns zero-initialized memory (especially for GPU tensors in test environments), the mutant's output for a non-positive last element would match the original's ReLU(≤0)=0, hiding the difference. The 'boundary_last_element' and 'tail_heavy' tests may have used negative extremes or not checked the last index explicitly.",
+      "kill_strategy": "Set the last element of the input tensor to a distinctive positive value (e.g., 123456.789) and verify the entire output tensor. The original kernel will compute ReLU(positive)=positive at the last index, while the mutant will leave that index uninitialized (likely zero or arbitrary). This will cause a detectable difference when comparing outputs element-wise.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Create a tensor of zeros with the exact required shape and dtype\n    input_tensor = torch.zeros((16, 16384), dtype=torch.float32, device=device)\n    # Set the last element (index [15, 16383]) to a distinctive positive value\n    input_tensor[-1, -1] = 123456.789\n    return [input_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 2,
+      "survival_reason": "The mutant survived because the previous test's verification logic likely only checked for kernel execution success (ref_ok, original_ok, mutant_ok) rather than actual output correctness. Since both kernels execute without crashes and produce tensors of the correct shape, they passed. However, the mutant leaves the last element uninitialized, which could be any value (including zero by chance). The previous test set a distinctive positive value at the last position and expected different outputs, but if the verification didn't compare values precisely (e.g., only checked for NaNs/Infs), the mutant would survive. The memory from torch.empty_like() might be zero-initialized in some environments, causing the last element to appear as 0, matching the expected ReLU(positive) = positive behavior.",
+      "kill_strategy": "Create an input where the last element is NEGATIVE, making the original kernel produce 0 at that position, while the mutant leaves it uninitialized (likely non-zero). Then run a precise element-wise comparison of outputs. Since uninitialized memory is unlikely to be exactly 0, the mutant will produce a different value (non-zero) at that position.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Create a tensor filled with random positive values\n    input_tensor = torch.rand((16, 16384), dtype=torch.float32, device=device) * 0.5 + 0.1  # values in [0.1, 0.6]\n    # Set the very last element to a distinctive negative value\n    input_tensor[-1, -1] = -999.0\n    return [input_tensor]\n",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    },
+    {
+      "round": 3,
+      "survival_reason": "The mutant changes the boundary condition from 'idx < size' to 'idx < size - 1', causing the last element (index size-1) to be skipped and remain uninitialized. The previous attempts assumed that uninitialized GPU memory would contain arbitrary values, but the mutant survived, suggesting that in the test environment, the memory allocated by torch.empty_like() may be zero-initialized or pre-initialized to values matching the expected output. Specifically, when the last element was set to a positive value, the mutant's uninitialized memory coincidentally matched that value; when set to negative, it matched zero (the correct ReLU output). This indicates the test environment might have deterministic memory initialization, masking the mutation's effect.",
+      "kill_strategy": "Use a tensor where the last element is positive and all other elements are negative, so the reference output has a distinct positive value only at the last index. The mutant will skip initializing this last index, leaving it as uninitialized memory. By using a large, random negative pattern for the rest, the probability of the uninitialized value matching the expected positive value is extremely low. Additionally, we will explicitly verify the last element's value and ensure the rest are zero (ReLU of negative).",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    torch.manual_seed(42)  # For reproducibility\n    # Create tensor filled with random negative values in [-10, -0.1)\n    input_tensor = -torch.rand((16, 16384), dtype=torch.float32, device=device) * 9.9 - 0.1\n    # Set the last element to a distinctive positive value\n    input_tensor[-1, -1] = 123456.789\n    return [input_tensor]",
+      "killed": false,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": false,
+  "killing_round": 0,
+  "robustness_suggestion": "The kernel lacks proper defensive coding practices against uninitialized memory access and incomplete writes. When a kernel skips writing to elements in an output buffer, the memory remains in an undefined state that may coincidentally match expected values during testing. To make the kernel robust, we should: 1) Always ensure the kernel writes to every element in the output buffer, even if just to write a default value, 2) Initialize the output tensor to a known invalid sentinel value before kernel execution, 3) Add a proper fence or synchronization to ensure writes complete, and 4) Consider using atomics or thread-safe writes for edge cases when threads might overlap in boundary conditions.",
+  "robustness_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for ReLU\nrelu_source = \"\"\"\n#include <torch/extension.h>\n\ntemplate<typename scalar_t>\n__global__ void relu_kernel(const scalar_t* __restrict__ input, \n                           scalar_t* __restrict__ output, \n                           int64_t size) {\n    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;\n    \n    // Handle all elements, including boundary cases\n    if (idx < size) {\n        scalar_t val = input[idx];\n        output[idx] = val > static_cast<scalar_t>(0) ? val : static_cast<scalar_t>(0);\n    }\n    // Additional thread to handle the last element if grid doesn't cover it\n    // This ensures every element is written\n    int64_t idx2 = (blockIdx.x * blockDim.x + threadIdx.x) + gridDim.x * blockDim.x;\n    if (idx2 < size) {\n        scalar_t val = input[idx2];\n        output[idx2] = val > static_cast<scalar_t>(0) ? val : static_cast<scalar_t>(0);\n    }\n}\n\ntorch::Tensor relu_cuda(torch::Tensor input) {\n    // Initialize output to NaN (invalid sentinel) before kernel launch\n    auto output = torch::full_like(input, std::numeric_limits<float>::quiet_NaN());\n    \n    int64_t size = input.numel();\n    \n    const int block_size = 256;\n    // Calculate grid size to ensure coverage of all elements\n    int grid_size = (size + block_size - 1) / block_size;\n    // Ensure at least 1 grid\n    grid_size = grid_size > 0 ? grid_size : 1;\n    \n    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), \"relu_cuda\", ([&] {\n        relu_kernel<scalar_t><<<grid_size, block_size>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            size\n        );\n        // Synchronize to ensure kernel completes\n        cudaDeviceSynchronize();\n    }));\n    \n    // Verify no NaN values remain (all elements were written)\n    // This check is expensive but ensures robustness during testing\n    #ifdef DEBUG_KERNEL\n    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), \"relu_verify\", ([&] {\n        auto output_a = output.accessor<scalar_t, 1>();\n        for (int64_t i = 0; i < size; ++i) {\n            if (std::isnan(output_a[i])) {\n                AT_ERROR(\"Kernel failed to write element \", i, \"/\", size);\n            }\n        }\n    }));\n    #endif\n    \n    return output;\n}\n\"\"\"\n\nrelu_cpp_source = \"\"\"\n#include <torch/extension.h>\n#include <cmath>\n\ntorch::Tensor relu_cuda(torch::Tensor input);\n\"\"\"\n\n# Compile the inline CUDA code for ReLU\nrelu_extension = load_inline(\n    name=\"relu_extension\",\n    cpp_sources=relu_cpp_source,\n    cuda_sources=relu_source,\n    functions=[\"relu_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\", \"-DDEBUG_KERNEL\"],  # Enable debug checks for testing\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs ReLU activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies ReLU activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with ReLU applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return relu_extension.relu_cuda(x)\n        else:\n            # Fallback to PyTorch's implementation for CPU tensors\n            return torch.relu(x)\n",
+  "test_construction_rule": null,
+  "cluster_label": "Out-of-Bounds Access Non-Observability"
+}

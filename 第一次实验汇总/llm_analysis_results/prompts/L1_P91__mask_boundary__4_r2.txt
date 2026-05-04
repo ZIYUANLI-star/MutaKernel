@@ -1,0 +1,104 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      36| 
+      37| template<typename scalar_t>
+      38| __global__ void reverse_cumsum_kernel_unrolled(
+      39|     const scalar_t* __restrict__ input,
+      40|     scalar_t* __restrict__ output,
+      41|     const int64_t outer_size,
+      42|     const int64_t dim_size,
+      43|     const int64_t inner_size
+      44| ) {
+      45|     const int64_t outer_idx = blockIdx.y;
+      46|     const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+      47|     
+>>>   48|     if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+      49|     
+      50|     const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+      51|     
+      52|     scalar_t sum = 0;
+      53|     int64_t dim_idx = dim_size - 1;
+      54|     
+      55|     // Unroll by 4 for better instruction-level parallelism
+      56|     for (; dim_idx >= 3; dim_idx -= 4) {
+      57|         const int64_t offset0 = base_offset + dim_idx * inner_size;
+      58|         const int64_t offset1 = base_offset + (dim_idx - 1) * inner_size;
+      59|         const int64_t offset2 = base_offset + (dim_idx - 2) * inner_size;
+      60|         const int64_t offset3 = base_offset + (dim_idx - 3) * inner_size;
+```
+
+## Mutated Code (around mutation site)
+```
+      36| 
+      37| template<typename scalar_t>
+      38| __global__ void reverse_cumsum_kernel_unrolled(
+      39|     const scalar_t* __restrict__ input,
+      40|     scalar_t* __restrict__ output,
+      41|     const int64_t outer_size,
+      42|     const int64_t dim_size,
+      43|     const int64_t inner_size
+      44| ) {
+      45|     const int64_t outer_idx = blockIdx.y;
+      46|     const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+      47|     
+>>>   48|     if (outer_idx > outer_size || inner_idx >= inner_size) return;
+      49|     
+      50|     const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+      51|     
+      52|     scalar_t sum = 0;
+      53|     int64_t dim_idx = dim_size - 1;
+      54|     
+      55|     // Unroll by 4 for better instruction-level parallelism
+      56|     for (; dim_idx >= 3; dim_idx -= 4) {
+      57|         const int64_t offset0 = base_offset + dim_idx * inner_size;
+      58|         const int64_t offset1 = base_offset + (dim_idx - 1) * inner_size;
+      59|         const int64_t offset2 = base_offset + (dim_idx - 2) * inner_size;
+      60|         const int64_t offset3 = base_offset + (dim_idx - 3) * inner_size;
+```
+
+## Mutation Details
+- Operator: mask_boundary — Tighten a boundary guard (idx < N → idx < N-1)
+- Location: line 48
+- Original fragment: `outer_idx >= outer_size`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[128, 4000], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: To kill the mutant, we need to force a kernel launch where `outer_idx == outer_size`. This requires launching more blocks in the y-dimension than `outer_size`. Since `outer_idx = blockIdx.y`, we need `gridDim.y > outer_size`. This can be achieved by modifying the kernel launch parameters, not just the input values. However, given the constraints of testing only via input tensors, we can create an input shape that leads to an incorrect launch configuration calculation by the caller. Specifically, if the kernel's caller incorrectly calculates the grid size due to integer division rounding up or other bugs, it might launch extra blocks. We can design input with `inner_size` that's not a multiple of the thread block size, causing the caller to over-allocate blocks.
+- Suggested code:
+```python
+null
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

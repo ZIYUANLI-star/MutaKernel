@@ -1,0 +1,43 @@
+{
+  "mutant_id": "L1_P96__launch_config_mutate__1",
+  "kernel_name": "L1_P96",
+  "operator_name": "launch_config_mutate",
+  "status": "killed_by_llm",
+  "survival_reason": "The mutant reduces the number of reduction blocks by one (from ceil(N/256) to ceil(N/256)-1). With the original input shape (524288 elements), the reduction kernel likely uses a grid-stride loop to process elements. When one block is removed, the stride decreases from 524288 to 523264, causing the first 1024 threads to each process one extra element, thus still covering all elements. The partial sums are then aggregated differently but still sum to the same total loss, making the mutant numerically equivalent for large inputs that are multiples of the block size or have a large number of blocks.",
+  "killable": true,
+  "kill_strategy": "Use a small input where the original reduction_blocks = 1 (i.e., total_elements ≤ 256). The mutant will compute reduction_blocks = 0, leading to an empty grid launch and a zero sum of losses, while the original correctly computes the non-zero sum.",
+  "recommendations": "The test suite should vary input shapes, not just values, to cover launch-configuration edge cases (e.g., total_elements ≤ block_size, total_elements just above block size, and non-multiples of block size). The kernel code could also include an assertion that reduction_blocks > 0 to catch such errors, but the original formula is already robust.",
+  "rounds": [
+    {
+      "round": 1,
+      "survival_reason": "The mutant reduces the number of reduction blocks by one (from ceil(N/256) to ceil(N/256)-1). With the original input shape (524288 elements), the reduction kernel likely uses a grid-stride loop to process elements. When one block is removed, the stride decreases from 524288 to 523264, causing the first 1024 threads to each process one extra element, thus still covering all elements. The partial sums are then aggregated differently but still sum to the same total loss, making the mutant numerically equivalent for large inputs that are multiples of the block size or have a large number of blocks.",
+      "kill_strategy": "Use a small input where the original reduction_blocks = 1 (i.e., total_elements ≤ 256). The mutant will compute reduction_blocks = 0, leading to an empty grid launch and a zero sum of losses, while the original correctly computes the non-zero sum.",
+      "killable": true,
+      "suggested_code": "import torch\n\ndef generate_inputs(device):\n    # Choose a shape with total_elements = 100 (<=256) to force original reduction_blocks = 1, mutant = 0\n    shape = [1, 100]\n    predictions = torch.ones(shape, device=device, dtype=torch.float32) * 2.0  # Non-zero difference\n    targets = torch.zeros(shape, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "killed": true,
+      "detail": {
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": ""
+      }
+    }
+  ],
+  "killed_by_llm": true,
+  "killing_round": 1,
+  "robustness_suggestion": "",
+  "robustness_code": "",
+  "test_construction_rule": {
+    "rule_name": "minimal_reduction_workload",
+    "rule_description": "Targets kernels with grid-stride reduction patterns by creating inputs with total elements ≤ typical block size (e.g., 256). This forces the original kernel to launch exactly one block while mutants that reduce block count by one may launch zero blocks, causing silent computation failures.",
+    "applicable_operators": [
+      "launch_config_mutate",
+      "grid_mutate",
+      "block_mutate"
+    ],
+    "policy_code": "def policy(shape, dtype, device, rng):\n    # Force total elements to be ≤256 to target reduction kernels with block size 256\n    # Use small non-zero values to ensure detectable output differences\n    total_elements = rng.integers(1, 257)  # 1-256 elements\n    # Create shape that produces exactly total_elements\n    if len(shape) > 1:\n        # Keep first dimension as 1, adjust last dimension to reach target\n        new_shape = [1] * (len(shape)-1) + [total_elements]\n    else:\n        new_shape = [total_elements]\n    \n    # Generate non-zero values to ensure reduction produces detectable result\n    # Use simple pattern: constant value between 1.0 and 3.0\n    value = 1.0 + 2.0 * rng.random()\n    return torch.full(new_shape, value, dtype=dtype, device=device)"
+  },
+  "cluster_label": "",
+  "suggested_test_code": "import torch\n\ndef generate_inputs(device):\n    # Choose a shape with total_elements = 100 (<=256) to force original reduction_blocks = 1, mutant = 0\n    shape = [1, 100]\n    predictions = torch.ones(shape, device=device, dtype=torch.float32) * 2.0  # Non-zero difference\n    targets = torch.zeros(shape, device=device, dtype=torch.float32)\n    return [predictions, targets]"
+}

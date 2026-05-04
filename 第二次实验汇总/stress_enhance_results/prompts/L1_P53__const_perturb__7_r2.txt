@@ -1,0 +1,571 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived:
+- EMD 4-layer equivalence detection (112 rounds)
+- Enhanced deterministic testing (5 dimensions, 138 rounds)
+- AND your previous suggested inputs (see below)
+
+Re-analyze with the failure information and try a fundamentally different approach.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison is BITWISE (NaN-aware).
+- **Do NOT suggest shape or batch size changes.**
+
+### Auxiliary configuration-stress track
+- Alternative batch sizes were tested separately (see below).
+- This does NOT redefine the main contract.
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized min reduction
+min_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <limits>
+
+template<typename scalar_t>
+__global__ void min_reduction_dim1_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim1,
+    const int dim2
+) {
+    // Reduce over dim1 (dimension 1)
+    const int batch = blockIdx.x;
+    const int col = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (col >= dim2) return;
+    
+    scalar_t thread_min = std::numeric_limits<scalar_t>::max();
+    
+    // Each thread processes all rows for its column
+    for (int row = 0; row < dim1; row++) {
+        int idx = (batch * dim1 + row) * dim2 + col;
+        scalar_t val = input[idx];
+        if (val < thread_min) {
+            thread_min = val;
+        }
+    }
+    
+    // Write thread result directly to output
+    output[batch * dim2 + col] = thread_min;
+}
+
+template<typename scalar_t>
+__global__ void min_reduction_dim2_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim1,
+    const int dim2
+) {
+    // Reduce over dim2 (dimension 2)
+    const int batch = blockIdx.x;
+    const int row = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (row >= dim1) return;
+    
+    scalar_t thread_min = std::numeric_limits<scalar_t>::max();
+    
+    // Each thread processes all columns for its row
+    for (int col = 0; col < dim2; col++) {
+        int idx = (batch * dim1 + row) * dim2 + col;
+        scalar_t val = input[idx];
+        if (val < thread_min) {
+            thread_min = val;
+        }
+    }
+    
+    // Write thread result directly to output
+    output[batch * dim1 + row] = thread_min;
+}
+
+template<typename scalar_t>
+__global__ void min_reduction_dim0_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim1,
+    const int dim2
+) {
+    // Reduce over batch dimension (dimension 0)
+    const int row = blockIdx.x;
+    const int col = threadIdx.x;
+    
+    if (col >= dim2) return;
+    
+    scalar_t thread_min = std::numeric_limits<scalar_t>::max();
+    
+    // Each thread processes all batches for its (row, col) position
+    for (int batch = 0; batch < batch_size; batch++) {
+        int idx = (batch * dim1 + row) * dim2 + col;
+        scalar_t val = input[idx];
+        if (val < thread_min) {
+            thread_min = val;
+        }
+    }
+    
+    // Write thread result directly to output
+    output[row * dim2 + col] = thread_min;
+}
+
+torch::Tensor min_reduction_cuda(torch::Tensor input, int dim) {
+    auto sizes = input.sizes();
+    int batch_size = sizes[0];
+    int dim1 = sizes[1];
+    int dim2 = sizes[2];
+    
+    // Calculate output shape
+    torch::Tensor output;
+    if (dim == 0) {
+        output = torch::empty({dim1, dim2}, input.options());
+    } else if (dim == 1) {
+        output = torch::empty({batch_size, dim2}, input.options());
+    } else if (dim == 2) {
+        output = torch::empty({batch_size, dim1}, input.options());
+    } else {
+        throw std::runtime_error("Invalid reduction dimension");
+    }
+    
+    // Choose kernel based on reduction dimension
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "min_reduction", ([&] {
+        if (dim == 0) {
+            // Reduce over batch dimension
+            dim3 grid(dim1, 1, 1);
+            int block_size = min(dim2, 1024);
+            
+            min_reduction_dim0_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim1,
+                dim2
+            );
+        } else if (dim == 1) {
+            // Reduce over dim1
+            dim3 grid(batch_size, 1, 1);
+            int block_size = min(dim2, 1024);
+            
+            min_reduction_dim1_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim1,
+                dim2
+            );
+        } else if (dim == 2) {
+            // Reduce over dim2
+            dim3 grid(batch_size, 1, 1);
+            int block_size = min(dim1, 1024);
+            
+            min_reduction_dim2_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim1,
+                dim2
+            );
+        }
+    }));
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+min_reduction_cpp_source = "torch::Tensor min_reduction_cuda(torch::Tensor input, int dim);"
+
+# Compile the inline CUDA code
+min_reduction = load_inline(
+    name="min_reduction",
+    cpp_sources=min_reduction_cpp_source,
+    cuda_sources=min_reduction_source,
+    functions=["min_reduction_cuda"],
+    verbose=False,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs min reduction over a specific dimension using custom CUDA kernel.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.min_reduction = min_reduction
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies min reduction over the specified dimension to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after min reduction over the specified dimension.
+        """
+        return self.min_reduction.min_reduction_cuda(x, self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized min reduction
+min_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <limits>
+
+template<typename scalar_t>
+__global__ void min_reduction_dim1_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim1,
+    const int dim2
+) {
+    // Reduce over dim1 (dimension 1)
+    const int batch = blockIdx.x;
+    const int col = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (col >= dim2) return;
+    
+    scalar_t thread_min = std::numeric_limits<scalar_t>::max();
+    
+    // Each thread processes all rows for its column
+    for (int row = 0; row < dim1; row++) {
+        int idx = (batch * dim1 + row) * dim2 + col;
+        scalar_t val = input[idx];
+        if (val < thread_min) {
+            thread_min = val;
+        }
+    }
+    
+    // Write thread result directly to output
+    output[batch * dim2 + col] = thread_min;
+}
+
+template<typename scalar_t>
+__global__ void min_reduction_dim2_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim1,
+    const int dim2
+) {
+    // Reduce over dim2 (dimension 2)
+    const int batch = blockIdx.x;
+    const int row = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (row >= dim1) return;
+    
+    scalar_t thread_min = std::numeric_limits<scalar_t>::max();
+    
+    // Each thread processes all columns for its row
+    for (int col = 0; col < dim2; col++) {
+        int idx = (batch * dim1 + row) * dim2 + col;
+        scalar_t val = input[idx];
+        if (val < thread_min) {
+            thread_min = val;
+        }
+    }
+    
+    // Write thread result directly to output
+    output[batch * dim1 + row] = thread_min;
+}
+
+template<typename scalar_t>
+__global__ void min_reduction_dim0_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim1,
+    const int dim2
+) {
+    // Reduce over batch dimension (dimension 0)
+    const int row = blockIdx.x;
+    const int col = threadIdx.x;
+    
+    if (col >= dim2) return;
+    
+    scalar_t thread_min = std::numeric_limits<scalar_t>::max();
+    
+    // Each thread processes all batches for its (row, col) position
+    for (int batch = 0; batch < batch_size; batch++) {
+        int idx = (batch * dim1 + row) * dim2 + col;
+        scalar_t val = input[idx];
+        if (val < thread_min) {
+            thread_min = val;
+        }
+    }
+    
+    // Write thread result directly to output
+    output[row * dim2 + col] = thread_min;
+}
+
+torch::Tensor min_reduction_cuda(torch::Tensor input, int dim) {
+    auto sizes = input.sizes();
+    int batch_size = sizes[0];
+    int dim1 = sizes[1];
+    int dim2 = sizes[2];
+    
+    // Calculate output shape
+    torch::Tensor output;
+    if (dim == 0) {
+        output = torch::empty({dim1, dim2}, input.options());
+    } else if (dim == 1) {
+        output = torch::empty({batch_size, dim2}, input.options());
+    } else if (dim == 2) {
+        output = torch::empty({batch_size, dim1}, input.options());
+    } else {
+        throw std::runtime_error("Invalid reduction dimension");
+    }
+    
+    // Choose kernel based on reduction dimension
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "min_reduction", ([&] {
+        if (dim == 0) {
+            // Reduce over batch dimension
+            dim3 grid(dim1, 1, 1);
+            int block_size = min(dim2, 1024);
+            
+            min_reduction_dim0_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim1,
+                dim2
+            );
+        } else if (dim == 1) {
+            // Reduce over dim1
+            dim3 grid(batch_size, 1, 1);
+            int block_size = min(dim2, 1024);
+            
+            min_reduction_dim1_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim1,
+                dim2
+            );
+        } else if (dim == 1) {
+            // Reduce over dim2
+            dim3 grid(batch_size, 1, 1);
+            int block_size = min(dim1, 1024);
+            
+            min_reduction_dim2_kernel<scalar_t><<<grid, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim1,
+                dim2
+            );
+        }
+    }));
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+min_reduction_cpp_source = "torch::Tensor min_reduction_cuda(torch::Tensor input, int dim);"
+
+# Compile the inline CUDA code
+min_reduction = load_inline(
+    name="min_reduction",
+    cpp_sources=min_reduction_cpp_source,
+    cuda_sources=min_reduction_source,
+    functions=["min_reduction_cuda"],
+    verbose=False,
+    extra_cflags=[""],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs min reduction over a specific dimension using custom CUDA kernel.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.min_reduction = min_reduction
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies min reduction over the specified dimension to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after min reduction over the specified dimension.
+        """
+        return self.min_reduction.min_reduction_cuda(x, self.dim)
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 144
+- Original fragment: `2`
+- node_type: const:int-1
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis may contain errors. Reason independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 144
+- Original fragment: `2`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - near_zero: passed
+  - near_zero: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - sparse: passed
+  - sparse: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - all_negative: passed
+  - all_negative: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 256, 256], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.793313980102539, 'mean': -0.0003390001365914941, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_all_negative_1', 'seed': 10101, 'tensors': [{'shape': [16, 256, 256], 'dtype': 'torch.float32', 'min': -549.6406860351562, 'max': -0.0003282409452367574, 'mean': -79.86443328857422, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes the condition from `dim == 2` to `dim == 1` on line 144. However, this code path is unreachable for the fixed input shape [16, 256, 256] with `dim == 2`. The condition `dim == 1` is already handled earlier (lines 132-143), so when `dim == 2`, the original executes the correct kernel, but the mutant would skip this branch entirely (since `dim == 2` is not `dim == 1`). However, the output tensor shape is determined BEFORE the kernel launch: for `dim == 2`, the output shape is 
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+### Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - near_overflow seed=42: survived
+  - near_overflow seed=43: survived
+  - near_overflow seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - denormals seed=47: survived
+  - denormals seed=48: survived
+  - denormals seed=49: survived
+  - denormals seed=50: survived
+  - denormals seed=51: survived
+  - all_positive seed=52: survived
+  - all_positive seed=53: survived
+  - all_positive seed=54: survived
+  - all_positive seed=55: survived
+  - all_positive seed=56: survived
+  - mixed_extremes seed=57: survived
+  - mixed_extremes seed=58: survived
+  - mixed_extremes seed=59: survived
+  - mixed_extremes seed=60: survived
+  - mixed_extremes seed=61: survived
+  - alternating_sign seed=62: survived
+  - alternating_sign seed=63: survived
+  - alternating_sign seed=64: survived
+  - alternating_sign seed=65: survived
+  - alternating_sign seed=66: survived
+  - uniform_constant seed=67: survived
+  - uniform_constant seed=68: survived
+  - uniform_constant seed=69: survived
+  - uniform_constant seed=70: survived
+  - uniform_constant seed=71: survived
+### Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+### Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+### Training Mode
+Result: ALL SURVIVED
+### Configuration-Stress Track
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Instantiate ModelNew with dim=2 and run forward on a randomly-valued tensor of shape [16,256,256]. The original would produce correct min over dim2; the mutant outputs garbage, causing bitwise mismatch.
+- Suggested code:
+```python
+def generate_inputs(device):
+    import torch
+    x = torch.randn(16, 256, 256, dtype=torch.float32, device=device)
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Reachability**: Derive concrete variable ranges from code constants.
+Do NOT claim a boundary case is reachable without deriving it.
+
+**Step 2 — Why previous attempts failed**: For each failed round, explain
+the specific mathematical reason it could not expose a difference.
+
+**Step 3 — Novel strategy or conclusion**: Either identify a fundamentally
+different value-level approach, or conclude unkillable with proof.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation or path argument>",
+  "survival_reason": "<updated analysis — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new VALUE-LEVEL strategy different from ALL previous, or why unkillable>",
+  "suggested_test": {
+    "description": "<what this NEW input tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... DIFFERENT from all previous>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same tensor count/shapes.
+- Shapes MUST EXACTLY MATCH Input Specification.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

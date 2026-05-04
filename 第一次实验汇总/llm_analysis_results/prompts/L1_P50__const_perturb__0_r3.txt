@@ -1,0 +1,132 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+       1| import torch
+       2| import torch.nn as nn
+       3| from torch.utils.cpp_extension import load_inline
+       4| 
+       5| # Define the custom CUDA kernel for product reduction
+       6| prod_reduction_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| 
+      10| template<typename scalar_t>
+      11| __device__ __forceinline__ scalar_t warp_reduce_product(scalar_t val) {
+      12|     #pragma unroll
+>>>   13|     for (int offset = 16; offset > 0; offset >>= 1) {
+      14|         val *= __shfl_down_sync(0xffffffff, val, offset);
+      15|     }
+      16|     return val;
+      17| }
+      18| 
+      19| template<typename scalar_t>
+      20| __global__ void prod_reduction_kernel_optimized(
+      21|     const scalar_t* __restrict__ input,
+      22|     scalar_t* __restrict__ output,
+      23|     const int64_t outer_size,
+      24|     const int64_t reduction_size,
+      25|     const int64_t inner_size
+```
+
+## Mutated Code (around mutation site)
+```
+       1| import torch
+       2| import torch.nn as nn
+       3| from torch.utils.cpp_extension import load_inline
+       4| 
+       5| # Define the custom CUDA kernel for product reduction
+       6| prod_reduction_source = """
+       7| #include <torch/extension.h>
+       8| #include <cuda_runtime.h>
+       9| 
+      10| template<typename scalar_t>
+      11| __device__ __forceinline__ scalar_t warp_reduce_product(scalar_t val) {
+      12|     #pragma unroll
+>>>   13|     for (int offset = 17; offset > 0; offset >>= 1) {
+      14|         val *= __shfl_down_sync(0xffffffff, val, offset);
+      15|     }
+      16|     return val;
+      17| }
+      18| 
+      19| template<typename scalar_t>
+      20| __global__ void prod_reduction_kernel_optimized(
+      21|     const scalar_t* __restrict__ input,
+      22|     scalar_t* __restrict__ output,
+      23|     const int64_t outer_size,
+      24|     const int64_t reduction_size,
+      25|     const int64_t inner_size
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 13
+- Original fragment: `16`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Design an input where the first 32 elements along the reduction dimension contain two distinct non-identity values (e.g., 2.0 and 3.0) arranged such that the mutant's reduction tree produces a different product due to squaring of values in threads 15-31 during the first step. Specifically, set 15 threads to 2.0 and the next 17 threads to 3.0, with the remaining elements set to 1.0 to avoid overflow. The original will compute 2^15 * 3^17, while the mutant will compute 2^16 * 3^16.
+- Suggested code:
+```python
+import torch
+def generate_inputs(device):
+    tensor = torch.ones(16, 256, 256, dtype=torch.float32, device=device)
+    # Set the first warp (32 threads) for outer=0, inner=0 to [15*2.0, 17*3.0]
+    tensor[0, :15, 0] = 2.0
+    tensor[0, 15:32, 0] = 3.0
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=4.231665e+12, mean_diff=1.033121e+09, ref_range=[1.0000e+00,4.2317e+12], mut_range=[1.0000e+00,2.0000e+00]
+
+### Round 2
+- Strategy: Use a minimal, carefully crafted warp of 32 threads where the original reduction tree (starting offset 16) yields the correct product, but the mutant's tree (starting offset 17) yields a different product due to floating-point rounding non-associativity. Focus on values where the order of multiplication matters: use a sequence of moderately sized floats that cause rounding differences when paired differently. Ensure the reduction dimension is exactly 32 for the targeted warp to avoid inter-warp interference.
+- Suggested code:
+```python
+import torch
+
+def generate_inputs(device):
+    tensor = torch.ones(16, 256, 256, dtype=torch.float32, device=device)
+    # Set the first warp (32 threads) for outer=0, inner=0 to a sequence of values
+    # where rounding differences emerge due to different pairing in the first step.
+    # Example: alternating 1.0001 and 0.9999 for 32 elements.
+    for i in range(32):
+        if i % 2 == 0:
+            tensor[0, i, 0] = 1.0001
+        else:
+            tensor[0, i, 0] = 0.9999
+    return [tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

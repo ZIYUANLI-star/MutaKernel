@@ -1,0 +1,138 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived all stress tests AND your previous
+suggested inputs. Please re-analyze with the new information and try again.
+
+## Original Code (around mutation site)
+```
+      43|     const float eps
+      44| ) {
+      45|     // Each block handles one group in one sample
+      46|     const int group_idx = blockIdx.x % num_groups;
+      47|     const int sample_idx = blockIdx.x / num_groups;
+      48|     
+      49|     if (sample_idx >= batch_size || group_idx >= num_groups) return;
+      50|     
+      51|     const int group_start = group_idx * channels_per_group;
+      52|     const int group_elements = channels_per_group * spatial_size;
+      53|     
+      54|     // Shared memory for reductions
+>>>   55|     __shared__ float shared_data[256];
+      56|     
+      57|     // First pass: compute mean
+      58|     float thread_sum = 0.0f;
+      59|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+      60|         int c = group_start + (idx / spatial_size);
+      61|         int s = idx % spatial_size;
+      62|         int input_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+      63|         thread_sum += to_float(input[input_idx]);
+      64|     }
+      65|     
+      66|     // Block reduction for sum
+      67|     shared_data[threadIdx.x] = thread_sum;
+```
+
+## Mutated Code (around mutation site)
+```
+      43|     const float eps
+      44| ) {
+      45|     // Each block handles one group in one sample
+      46|     const int group_idx = blockIdx.x % num_groups;
+      47|     const int sample_idx = blockIdx.x / num_groups;
+      48|     
+      49|     if (sample_idx >= batch_size || group_idx >= num_groups) return;
+      50|     
+      51|     const int group_start = group_idx * channels_per_group;
+      52|     const int group_elements = channels_per_group * spatial_size;
+      53|     
+      54|     // Shared memory for reductions
+>>>   55|     __shared__ float shared_data[255];
+      56|     
+      57|     // First pass: compute mean
+      58|     float thread_sum = 0.0f;
+      59|     for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+      60|         int c = group_start + (idx / spatial_size);
+      61|         int s = idx % spatial_size;
+      62|         int input_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+      63|         thread_sum += to_float(input[input_idx]);
+      64|     }
+      65|     
+      66|     // Block reduction for sum
+      67|     shared_data[threadIdx.x] = thread_sum;
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 55
+- Original fragment: `256`
+
+## Input Specification
+forward() takes 1 tensor argument(s):
+  arg[0]: shape=[16, 64, 256, 256], dtype=torch.float32
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Force a kernel launch configuration where blockDim.x = 256, ensuring at least one thread writes to shared_data[255]. Then design input values so that thread 255's contribution to the reduction is non-zero and critical for correctness. This requires changing the kernel launch parameters (block/grid dimensions) via input shape modifications, since the kernel's block count is derived from batch_size and num_groups, and block size is typically inferred from spatial_size and channels_per_group. By adjusting spatial_size and channels_per_group to ensure group_elements >= 256 and the kernel launch uses 256 threads per block, the mutant will exhibit incorrect reduction results.
+- Suggested code:
+```python
+import torch
+import math
+
+def generate_inputs(device):
+    # Shape: [batch_size, num_channels, spatial_size, spatial_size]
+    batch_size = 16
+    num_channels = 64  # = channels_per_group * num_groups
+    spatial_size = 256  # Force group_elements = 256 when channels_per_group=1
+    
+    # Choose num_groups such that channels_per_group = 1, forcing block size 256
+    num_groups = 64
+    channels_per_group = num_channels // num_groups  # = 1
+    group_elements = channels_per_group * spatial_size * spatial_size  # = 65536, but kernel uses spatial_size (1D)??
+    # Wait: The kernel uses spatial_size as a 1D dimension? Actually line 52: group_elements = channels_per_group * spatial_size
+    # The original input has 2D spatial dimensions (256x256), but the kernel flattens them.
+    # We need to adjust spatial_size to be the product of spatial dimensions.
+    # Let's assume the kernel expects a 1D spatial_size representing total spatial elements.
+    # We'll set spatial_size = 256 (so total spatial elements per channel = 256).
+    # Then group_elements = 1 * 256 = 256.
+    # We'll reshape the input accordingly: [16, 64, 256] (3D) but the original shape is 4D.
+    # However, the input specification says shape [16,64,256,256]. The kernel likely treats spatial_size as 256*256=65536.
+    # To force block size 256, we need group_elements >= 256 and blockDim.x set to 256.
+    # The kernel launch likely uses blockDim.x = min(256, group_elements).
+    # So we need group_elements >= 256. Let's set spatial_size = 256 (so total spatial elements = 256).
+    # But the original spatial dimensions are 256x256, so we must change the shape to [16,64,256] (3D).
+    # Since the kernel expects 4D input, we'll keep the last dimension as 1 to simulate 1D spatial.
+    # New shape: [batch_size, num_channels, spatial_size, 1]
+    spatial_size = 256
+    shape = [batch_size, num_channels, spatial_size, 1]
+    
+    # Generate input where each spatial element is unique and non-zero
+    # Use linearly increasing values to ensure each thread gets a distinct value
+    total_elements = batch_size * num_channels * spatial_size
+    input_tensor = torch.arange(total_elements, device=device, dtype=torch.float32).view(*shape) + 1.0  # Avoid zeros
+    return [input_tensor]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Instructions
+Based on the failed attempts above, re-analyze WHY the mutant survives.
+Consider: Were the previous inputs wrong? Is there a fundamentally different
+numerical regime to try? Or is the mutant actually unkillable?
+
+Respond in **strict JSON** (no text before or after):
+{
+  "survival_reason": "<updated analysis incorporating insights from failed attempts — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new strategy different from previous attempts, or explain why no input works>",
+  "suggested_test": {
+    "description": "<what this NEW input specifically tests — must be DIFFERENT from previous attempts>",
+    "python_code": "<complete Python code defining `generate_inputs(device)` — DIFFERENT from previous>"
+  },
+  "recommendations": "<updated recommendations>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same number of tensors
+  as forward() expects (see Input Specification). Do NOT concatenate multiple scenarios.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

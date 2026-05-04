@@ -1,0 +1,830 @@
+{
+  "kernel": {
+    "problem_id": 25,
+    "level": 1,
+    "problem_name": "L1_P25",
+    "language": "cuda"
+  },
+  "summary": {
+    "total": 14,
+    "killed": 7,
+    "survived": 0,
+    "stillborn": 5,
+    "strict_equivalent": 0,
+    "candidate_equivalent": 2,
+    "equivalent": 2,
+    "mutation_score": 0.7778,
+    "mutation_score_optimistic": 1.0,
+    "score_by_category": {
+      "A": 0.5,
+      "B": 1.0,
+      "C": 0.0,
+      "D": 0.0
+    }
+  },
+  "mutants": [
+    {
+      "id": "L1_P25__arith_replace__1",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L14",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 969.3193435668945,
+      "site": {
+        "line_start": 14,
+        "line_end": 14,
+        "original_code": "+",
+        "node_type": "cuda_Add"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f - expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__arith_replace__12",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L88",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3526ms, CUDA strings identical)",
+      "kill_input_seed": null,
+      "execution_time_ms": 999.7797012329102,
+      "site": {
+        "line_start": 88,
+        "line_end": 88,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x / torch.sigmoid(x)",
+      "equiv_detail": {
+        "mutant_id": "L1_P25__arith_replace__12",
+        "operator": "arith_replace",
+        "line_start": 88,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P25",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/25_Swish.py",
+        "layer0": {
+          "cuda_strings_equal": true,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "python_host",
+          "cuda_norm_hash_orig": "0099932b8787148c",
+          "cuda_norm_hash_mut": "0099932b8787148c",
+          "py_norm_hash_orig": "14d5bab85fd5b928",
+          "py_norm_hash_mut": "fdbc3a5423ecbea8",
+          "mutation_site_line": 88,
+          "original_fragment": "*",
+          "host_diff_analysis": {
+            "mutation_location": "inside class ModelNew",
+            "mutated_variable": null,
+            "used_in_model": null,
+            "used_in_get_inputs": null
+          },
+          "verdict": "cuda_identical_host_differs"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "arith_replace",
+          "time_ms": 3526,
+          "cuda_was_identical": true,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "extreme_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "extreme_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "all_negative",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.515127182006836,
+                "mean": -0.0012394363293424249,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_boundary_last_element_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.131533622741699,
+                "max": 10000.0,
+                "mean": 0.0353255495429039,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the operator on line 88 from multiplication to division in the CPU fallback path. However, the input specification requires a CUDA tensor (shape [16, 16384], dtype=torch.float32), and the forward method checks `if x.is_cuda:` — since the input is on CUDA, the code always takes the CUDA branch (line 85) and never reaches the mutated CPU fallback. The CUDA kernel strings are identical between original and mutant, so the GPU execution path is unchanged. Layer 2's dynamic testing with 100+ value distributions on CUDA tensors confirmed bitwise identical outputs, which is consistent with the mutation being dead code. No value-level strategy can force execution of the CPU path because the input tensor is always on CUDA.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the operator on line 88 from multiplication to division in the CPU fallback path. However, the input specification requires a CUDA tensor (shape [16, 16384], dtype=torch.float32), and the forward method checks `if x.is_cuda:` — since the input is on CUDA, the code always takes the CUDA branch (line 85) and never reaches the mutated CPU fallback. The CUDA kernel strings are identical between original and mutant, so the GPU execution path is unchanged. Layer 2's dynamic testing with 100+ value distributions on CUDA tensors confirmed bitwise identical outputs, which is consistent with the mutation being dead code. No value-level strategy can force execution of the CPU path because the input tensor is always on CUDA.\",\n  \"kill_strategy\": null,\n  \"suggested_test\": null\n}",
+          "time_ms": 3641,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **True**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: cuda_identical_host_differs\n\n**Host-code diff analysis** (CUDA strings are identical, so mutation is in Python host code):\n- Mutation location: **inside class ModelNew**\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: arith_replace\n- All runs bitwise identical: **True**\n- Time taken: 3526ms\n- Note: CUDA kernel strings were identical (mutation in host code only)\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P25__arith_replace__6",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L26",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 749.1846084594727,
+      "site": {
+        "line_start": 26,
+        "line_end": 26,
+        "original_code": "*",
+        "node_type": "cuda_Mult"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x / blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__relop_replace__3",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L27",
+      "status": "candidate_equivalent",
+      "error_message": "Candidate equivalent (112 rounds (random+stress), 3012ms)",
+      "kill_input_seed": null,
+      "execution_time_ms": 697.5009441375732,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": "<",
+        "node_type": "cuda_Lt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx <= size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "equiv_detail": {
+        "mutant_id": "L1_P25__relop_replace__3",
+        "operator": "relop_replace",
+        "line_start": 27,
+        "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+        "kernel_name": "L1_P25",
+        "problem_file": "/home/kbuser/projects/KernelBench-0/KernelBench/level1/25_Swish.py",
+        "layer0": {
+          "cuda_strings_equal": false,
+          "python_host_equal": false,
+          "cuda_extracted": true,
+          "mutation_domain": "both",
+          "cuda_norm_hash_orig": "0099932b8787148c",
+          "cuda_norm_hash_mut": "c4bc2345b24d4f4c",
+          "py_norm_hash_orig": "14d5bab85fd5b928",
+          "py_norm_hash_mut": "c37d9db3d1b26256",
+          "mutation_site_line": 27,
+          "original_fragment": "<",
+          "cuda_diff_lines": [
+            {
+              "cuda_line": 18,
+              "original": "if (idx < size) {",
+              "mutated": "if (idx <= size) {"
+            }
+          ],
+          "verdict": "not_equivalent"
+        },
+        "layer1": {
+          "rules_available": true,
+          "rules_checked": [
+            "boundary_unreachable",
+            "dead_write",
+            "mask_noreach",
+            "dead_host_constant"
+          ],
+          "rule_hit": null,
+          "rule_description": null,
+          "rule_details": null,
+          "verdict": "no_rule_hit"
+        },
+        "layer2": {
+          "is_equivalent": true,
+          "equiv_runs": 100,
+          "operator_name": "relop_replace",
+          "time_ms": 3012,
+          "cuda_was_identical": false,
+          "tested_random_seeds": [
+            10000,
+            10001,
+            10002,
+            10003,
+            10004,
+            10005,
+            10006,
+            10007,
+            10008,
+            10009,
+            10010,
+            10011,
+            10012,
+            10013,
+            10014,
+            10015,
+            10016,
+            10017,
+            10018,
+            10019,
+            10020,
+            10021,
+            10022,
+            10023,
+            10024,
+            10025,
+            10026,
+            10027,
+            10028,
+            10029,
+            10030,
+            10031,
+            10032,
+            10033,
+            10034,
+            10035,
+            10036,
+            10037,
+            10038,
+            10039,
+            10040,
+            10041,
+            10042,
+            10043,
+            10044,
+            10045,
+            10046,
+            10047,
+            10048,
+            10049,
+            10050,
+            10051,
+            10052,
+            10053,
+            10054,
+            10055,
+            10056,
+            10057,
+            10058,
+            10059,
+            10060,
+            10061,
+            10062,
+            10063,
+            10064,
+            10065,
+            10066,
+            10067,
+            10068,
+            10069,
+            10070,
+            10071,
+            10072,
+            10073,
+            10074,
+            10075,
+            10076,
+            10077,
+            10078,
+            10079,
+            10080,
+            10081,
+            10082,
+            10083,
+            10084,
+            10085,
+            10086,
+            10087,
+            10088,
+            10089,
+            10090,
+            10091,
+            10092,
+            10093,
+            10094,
+            10095,
+            10096,
+            10097,
+            10098,
+            10099
+          ],
+          "tested_policies": [
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "relop_boundary_hit",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "boundary_last_element",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "structured_ramp",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "near_zero",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "sparse",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 0,
+              "seed": 10100,
+              "status": "passed"
+            },
+            {
+              "name": "large_magnitude",
+              "sub_index": 1,
+              "seed": 10101,
+              "status": "passed"
+            }
+          ],
+          "total_rounds": 112,
+          "first_input_summary": {
+            "round": "random_0",
+            "seed": 10000,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4.554584980010986,
+                "max": 4.515127182006836,
+                "mean": -0.0012394363293424249,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "last_input_summary": {
+            "round": "stress_large_magnitude_1",
+            "seed": 10101,
+            "tensors": [
+              {
+                "shape": [
+                  16,
+                  16384
+                ],
+                "dtype": "torch.float32",
+                "min": -4131.53369140625,
+                "max": 5140.97314453125,
+                "mean": -2.817762613296509,
+                "has_nan": false,
+                "has_inf": false
+              }
+            ]
+          },
+          "verdict": "CANDIDATE_EQUIVALENT"
+        },
+        "decided_at": "layer2",
+        "layer3": {
+          "model": "deepseek-chat",
+          "verdict": "confirmed_equivalent",
+          "confidence": 1.0,
+          "reasoning": "The mutation changes the condition from `idx < size` to `idx <= size`. For the fixed input shape [16, 16384], the total number of elements is 262144. The kernel uses a grid of 1024 blocks (262144 / 256) with 256 threads each, so the maximum index is 262143. The condition `idx <= size` would allow an out-of-bounds access at index 262144, but this index is never reached because the grid size is exactly ceil(size / block_size) = 1024, and the last thread index is 1023*256+255 = 262143. Thus, the extra iteration never occurs, and the behavior is identical for all valid inputs. Layer 2's dynamic testing with 100+ random seeds and stress policies confirmed bitwise identical outputs, which is expected since the execution path is unchanged. No value-level strategy can trigger the out-of-bounds access because the grid dimensions are fixed and exactly cover the valid indices.",
+          "kill_strategy": null,
+          "suggested_test": null,
+          "raw_response": "{\n  \"verdict\": \"confirmed_equivalent\",\n  \"confidence\": 1.0,\n  \"reasoning\": \"The mutation changes the condition from `idx < size` to `idx <= size`. For the fixed input shape [16, 16384], the total number of elements is 262144. The kernel uses a grid of 1024 blocks (262144 / 256) with 256 threads each, so the maximum index is 262143. The condition `idx <= size` would allow an out-of-bounds access at index 262144, but this index is never reached because the grid size is exactly ceil(size / block_size) = 1024, and the last thread index is 1023*256+255 = 262143. Thus, the extra iteration never occurs, and the behavior is identical for all valid inputs. Layer 2's dynamic testing with 100+ random seeds and stress policies confirmed bitwise identical outputs, which is expected since the execution path is unchanged. No value-level strategy can trigger the out-of-bounds access because the grid dimensions are fixed and exactly cover the valid indices.\",\n  \"kill_strategy\": null,\n  \"suggested_test\"",
+          "time_ms": 4654,
+          "input_spec": "forward() expects 1 argument(s):\n  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32\n\nThese shapes are FIXED and NEVER change during testing.\nOnly the numerical values inside these tensors vary.",
+          "equiv_evidence_sent_to_llm": "### Layer 0 — Source Code Normalization\n- CUDA kernel strings extracted: True\n- CUDA strings equal after normalization: **False**\n- Python host code equal after normalization: **False**\n- Layer 0 verdict: not_equivalent\n\n### Layer 1 — Static Equivalence Rules\n- Rules engine available: True\n- Rule hit: **none**\n- Layer 1 verdict: no_rule_hit\n\n### Layer 2 — Dynamic Bitwise Comparison\n- Number of test runs: 100 (random seeds + operator-directed stress policies)\n- Operator: relop_replace\n- All runs bitwise identical: **True**\n- Time taken: 3012ms\n- Layer 2 verdict: CANDIDATE_EQUIVALENT\n\n**Decision made at**: layer2",
+          "action": "confirmed"
+        }
+      }
+    },
+    {
+      "id": "L1_P25__relop_replace__5",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L74",
+      "status": "stillborn",
+      "error_message": "Compilation: expected ':' (mutant_L1_P25__relop_replace__5.py, line 74)",
+      "kill_input_seed": null,
+      "execution_time_ms": 0.24819374084472656,
+      "site": {
+        "line_start": 74,
+        "line_end": 74,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) ->= torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__relop_replace__2",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L24",
+      "status": "stillborn",
+      "error_message": "Compilation: Error building extension 'swish_activation_mutant_L1_P25__relop_replace__2': [1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=swish_activation_mutant_L1_P25__relop_replace__2 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPIL",
+      "kill_input_seed": null,
+      "execution_time_ms": 12355.775356292725,
+      "site": {
+        "line_start": 24,
+        "line_end": 24,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>=\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__index_replace__4",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L26",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 880.2342414855957,
+      "site": {
+        "line_start": 26,
+        "line_end": 26,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|y"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.y;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__index_replace__3",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L26",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 790.1904582977295,
+      "site": {
+        "line_start": 26,
+        "line_end": 26,
+        "original_code": "blockDim.x",
+        "node_type": "cuda_dim|z"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.z + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__index_replace__5",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L26",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 720.954418182373,
+      "site": {
+        "line_start": 26,
+        "line_end": 26,
+        "original_code": "threadIdx.x",
+        "node_type": "cuda_dim|z"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.z;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__mask_boundary__0",
+      "operator_name": "mask_boundary",
+      "operator_category": "B",
+      "description": "Weaken or tighten boundary checks in mask/tl.where (Triton) or thread/block guards (CUDA) @ L27",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 717.4201011657715,
+      "site": {
+        "line_start": 27,
+        "line_end": 27,
+        "original_code": "idx < size",
+        "node_type": "rhs-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size - 1) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__launch_config_mutate__0",
+      "operator_name": "launch_config_mutate",
+      "operator_category": "B",
+      "description": "Perturb grid/block sizing expressions (// BLOCK, triton.cdiv) by ±1 @ L38",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 825.2091407775879,
+      "site": {
+        "line_start": 38,
+        "line_end": 38,
+        "original_code": "(size + block_size - 1) / block_size",
+        "node_type": "-1"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size - 1;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__acc_downgrade__0",
+      "operator_name": "acc_downgrade",
+      "operator_category": "C",
+      "description": "Downgrade FP32 accumulators to FP16 / half precision @ L19",
+      "status": "stillborn",
+      "error_message": "Compilation: Error building extension 'swish_activation_mutant_L1_P25__acc_downgrade__0': [1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=swish_activation_mutant_L1_P25__acc_downgrade__0 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPIL",
+      "kill_input_seed": null,
+      "execution_time_ms": 11211.85564994812,
+      "site": {
+        "line_start": 19,
+        "line_end": 19,
+        "original_code": "__half2float(x)",
+        "node_type": "acc:cuda_half2float"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = x;\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__cast_remove__0",
+      "operator_name": "cast_remove",
+      "operator_category": "C",
+      "description": "Remove explicit dtype casts (.to, .float, tl.cast, static_cast) @ L19",
+      "status": "stillborn",
+      "error_message": "Compilation: Error building extension 'swish_activation_mutant_L1_P25__cast_remove__0': [1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=swish_activation_mutant_L1_P25__cast_remove__0 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_T",
+      "kill_input_seed": null,
+      "execution_time_ms": 11662.911176681519,
+      "site": {
+        "line_start": 19,
+        "line_end": 19,
+        "original_code": "__half2float(x)",
+        "node_type": "cast:cuda_intrinsic"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = x;\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    },
+    {
+      "id": "L1_P25__cast_remove__1",
+      "operator_name": "cast_remove",
+      "operator_category": "C",
+      "description": "Remove explicit dtype casts (.to, .float, tl.cast, static_cast) @ L21",
+      "status": "stillborn",
+      "error_message": "Compilation: Error building extension 'swish_activation_mutant_L1_P25__cast_remove__1': [1/2] /usr/local/cuda/bin/nvcc --generate-dependencies-with-compile --dependency-output cuda.cuda.o.d -DTORCH_EXTENSION_NAME=swish_activation_mutant_L1_P25__cast_remove__1 -DTORCH_API_INCLUDE_EXTENSION_H -DPYBIND11_COMPILER_T",
+      "kill_input_seed": null,
+      "execution_time_ms": 11829.277276992798,
+      "site": {
+        "line_start": 21,
+        "line_end": 21,
+        "original_code": "__float2half(result)",
+        "node_type": "cast:cuda_intrinsic"
+      },
+      "original_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return __float2half(result);\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)",
+      "mutated_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for Swish activation\nswish_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__device__ T sigmoid(T x) {\n    return 1.0f / (1.0f + expf(-x));\n}\n\ntemplate<>\n__device__ __half sigmoid(__half x) {\n    float x_f = __half2float(x);\n    float result = 1.0f / (1.0f + expf(-x_f));\n    return result;\n}\n\ntemplate<typename T>\n__global__ void swish_kernel(const T* x, T* out, int size) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    if (idx < size) {\n        T sigmoid_val = sigmoid(x[idx]);\n        out[idx] = x[idx] * sigmoid_val;\n    }\n}\n\ntorch::Tensor swish_cuda(torch::Tensor x) {\n    auto size = x.numel();\n    auto out = torch::empty_like(x);\n    \n    const int block_size = 256;\n    const int num_blocks = (size + block_size - 1) / block_size;\n    \n    AT_DISPATCH_FLOATING_TYPES_AND_HALF(x.scalar_type(), \"swish_cuda\", [&] {\n        swish_kernel<scalar_t><<<num_blocks, block_size>>>(\n            x.data_ptr<scalar_t>(), \n            out.data_ptr<scalar_t>(), \n            size\n        );\n    });\n    \n    return out;\n}\n\"\"\"\n\nswish_cpp_source = \"torch::Tensor swish_cuda(torch::Tensor x);\"\n\n# Compile the inline CUDA code for Swish activation\nswish_module = load_inline(\n    name=\"swish_activation\",\n    cpp_sources=swish_cpp_source,\n    cuda_sources=swish_source,\n    functions=[\"swish_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs Swish activation using custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n        self.swish_op = swish_module\n    \n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies Swish activation to the input tensor using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of any shape.\n            \n        Returns:\n            torch.Tensor: Output tensor with Swish applied, same shape as input.\n        \"\"\"\n        if x.is_cuda:\n            return self.swish_op.swish_cuda(x)\n        else:\n            # Fallback to PyTorch implementation for CPU tensors\n            return x * torch.sigmoid(x)"
+    }
+  ]
+}
