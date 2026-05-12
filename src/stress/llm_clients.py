@@ -66,8 +66,20 @@ def make_bedrock_caller(
             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = alt
 
     import boto3
+    from botocore.config import Config
 
-    client = boto3.client("bedrock-runtime", region_name=region)
+    # Extended thinking can take a long time (especially for hard mutants).
+    # Default boto3 read_timeout (~5 min) was empirically hit on ~7% of L1_P100
+    # mutants. Bump to 10 minutes and enable adaptive retries on
+    # transient throttling / read timeouts.
+    boto_config = Config(
+        connect_timeout=30,
+        read_timeout=600,
+        retries={"max_attempts": 4, "mode": "adaptive"},
+    )
+    client = boto3.client(
+        "bedrock-runtime", region_name=region, config=boto_config,
+    )
 
     # Sanity-check: Bedrock requires max_tokens > thinking.budget_tokens.
     effective_max_tokens = max_tokens
