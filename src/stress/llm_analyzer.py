@@ -1687,3 +1687,270 @@ def build_phase1_direct_reanalysis_prompt(
         previous_rounds=rounds_text,
         emd_total_rounds=stats["emd_total_rounds"],
     )
+
+
+# ===========================================================================
+# Task B — STRENGTHEN_PROMPT_B (kernel hardening using A/C evidence)
+# ===========================================================================
+STRENGTHEN_PROMPT_B = """\
+You are a CUDA/Triton kernel engineering expert.
+
+A mutation testing framework (MutaKernel) has run a four-phase campaign on
+the kernel below:
+- Phase I  — 4-layer Equivalence-Mutant Detection (EMD)
+- Phase II — 5-dimension deterministic stress testing + LLM iterative
+            analysis (DeepSeek-R1)
+- Phase III Task A — Opus 4.5 rerun of LLM iterative analysis on Phase II
+            survivors (with Phase II evidence)
+- Phase III Task C — Opus 4.5 direct from Phase I evidence only
+            (ablation arm; no Phase II)
+
+The campaign produced two artifacts:
+1. The set of mutants this kernel ultimately FAILED to detect (i.e. the
+   test suite let them slip through).
+2. The set of survival reasons clustered by reason_category, derived from
+   the LLM analyses in Tasks A and C.
+
+Your task: **strengthen the kernel** so that it becomes more defensively
+correct against the failure-mode categories revealed by these unkilled
+mutants, WHILE remaining bitwise-equivalent to the reference module under
+both standard and stress testing.
+
+## Reference Module (ground truth — DO NOT modify; context only)
+```python
+{reference_module_code}
+```
+
+## Original Kernel Implementation (the one to strengthen)
+```python
+{original_kernel_code}
+```
+
+## Input Specification (FIXED — shapes never change)
+{input_spec}
+
+## Mutation Testing Evidence Summary
+
+### Kernel-level statistics
+
+| Stage | Killed | Survived |
+|---|---|---|
+| Phase I — 4-layer EMD (bitwise, ~{phase1_rounds} rounds) | {phase1_killed} | {phase1_survived} |
+| Phase II — 5-dimension stress (deterministic) | {phase2_killed_det} | {phase2_survived_det} |
+| Phase II — LLM iterative (DeepSeek-R1, 3 rounds) | {phase2_killed_llm} | {phase2_survived_llm} |
+| Phase III Task A — Opus 4.5 rerun (5 rounds, with Phase II evidence) | {taskA_killed} | {taskA_survived} |
+| Phase III Task C — Opus 4.5 direct (5 rounds, Phase I evidence only) | {taskC_killed} | {taskC_survived} |
+| **Final unkilled non-equivalent mutants** | — | **{final_unkilled}** |
+
+### Aggregated survival reasons (clustered by reason_category)
+{survival_reason_clusters}
+
+### Representative unkilled mutants (top {n_examples} by impact / diversity)
+{top_unkilled_examples}
+
+## Hardening Constraints
+
+You MUST satisfy ALL of the following:
+
+1. **V1 — Standard Correctness**: The strengthened kernel MUST produce
+   results matching the reference module on KernelBench's `get_inputs()`
+   for >=5 random seeds (atol=1e-2, rtol=1e-2).
+
+2. **V2 — Robustness**: The strengthened kernel MUST produce results
+   matching the reference module on **21 stress policies** for >=2 random
+   seeds each. Stress policies cover:
+   - Value-distribution stress (extreme magnitudes, near-zero, sparse,
+     boundary integers, adversarial patterns)
+   - Dtype stress (float32 / float16 mixed)
+   - Repeated execution stress (state pollution check)
+   - Training mode stress (.train() vs .eval() consistency)
+   - Configuration stress (alternative batch sizes — informational only;
+     V2 PASS is judged on the main fixed-shape track)
+
+3. **Interface invariance**:
+   - The exported class MUST be named `ModelNew`.
+   - `ModelNew.forward(...)` signature MUST be unchanged.
+   - `get_inputs()` and `get_init_inputs()` MUST NOT be modified.
+
+4. **Shape invariance**: Tensor shapes from `get_inputs()` are FIXED. Do
+   NOT introduce shape-dependent assertions that would reject the standard
+   shapes.
+
+5. **Self-contained**: Use only `torch`, `torch.nn`, `math`, and
+   `torch.utils.cpp_extension.load_inline`. No external dependencies.
+
+6. **Performance ceiling**: Strengthening may reduce performance, but the
+   strengthened kernel SHOULD NOT be more than 2x slower than the original
+   on the standard input.
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure-mode inventory**: List the 2-4 categories of correctness
+or robustness gaps that the unkilled mutants reveal. For each category,
+cite the relevant mutant ids.
+
+**Step 2 — Hardening proposal**: For each category propose ONE concrete
+code change drawn from this menu (or extend it):
+  - add_assertion (e.g. static_assert on tile alignment)
+  - tighten_boundary (e.g. <= -> < on a guard)
+  - numerical_stabilize (e.g. epsilon proportional to input scale; Kahan)
+  - guard_path (e.g. early-return for degenerate cases)
+  - explicit_cast (e.g. force fp32 accumulator)
+  - bounded_accumulator (e.g. clamp running sum)
+  - other (please name it)
+Argue why each change preserves V1 correctness AND closes the gap.
+
+**Step 3 — Synthesis**: Combine all proposed changes into a single
+coherent strengthened kernel. Verify mentally that none of the changes
+conflict with each other or with the fixed-shape contract.
+
+**Step 4 — Self-review V1 + V2**: Mentally trace the standard input from
+`get_inputs()` through the new code; then trace ONE example from each
+stress category. If anything looks wrong, fix it before output.
+
+## Output Format (strict JSON, no text before/after)
+
+{{
+  "hardening_strategy": "<2-4 sentence high-level summary of approach>",
+  "addressed_mutants": ["<mutant_id_1>", "<mutant_id_2>"],
+  "key_changes": [
+    {{
+      "type": "<add_assertion | tighten_boundary | numerical_stabilize | guard_path | explicit_cast | bounded_accumulator | other>",
+      "location": "<file:line range or function name>",
+      "rationale": "<why this change addresses the gap and preserves correctness>"
+    }}
+  ],
+  "strengthened_code": "<COMPLETE strengthened kernel.py source code, ready to load via importlib>",
+  "expected_tradeoffs": "<performance / readability impact, in 1-3 sentences>"
+}}
+
+CRITICAL rules for strengthened_code:
+- Must be a single complete `.py` file ready to load via importlib.
+- Must define `class ModelNew(nn.Module)` with the same forward() signature.
+- Must NOT modify the reference `get_inputs()` / `get_init_inputs()`.
+- If your analysis concludes ALL unkilled mutants are true equivalents and
+  no defensive code change is justified, set "strengthened_code" to the
+  EXACT original code unchanged and set "key_changes" to an empty list -
+  but justify this conclusion in "hardening_strategy".
+"""
+
+
+REANALYZE_STRENGTHEN_PROMPT_B = """\
+You are a CUDA/Triton kernel engineering expert. Your previous strengthened
+kernel FAILED validation. Re-analyze and produce a corrected version.
+
+## Reference Module (DO NOT modify)
+```python
+{reference_module_code}
+```
+
+## Original Kernel (un-modified baseline)
+```python
+{original_kernel_code}
+```
+
+## Input Specification (FIXED — shapes never change)
+{input_spec}
+
+## Previous Strengthening Attempt(s)
+{previous_attempts}
+
+## Mutation Testing Evidence Summary
+{kernel_evidence_summary}
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each failed previous attempt,
+identify the EXACT line / function that caused V1 or V2 failure. Use the
+diff and diff_summary info to localize.
+
+**Step 2 — Root-cause classification**: Was the failure due to:
+  (a) overly aggressive assertion / boundary tightening that excluded
+      valid standard inputs;
+  (b) numerical instability introduced by your change (e.g., new epsilon
+      too large for the standard test);
+  (c) interface drift (changed ModelNew signature or a tensor dtype);
+  (d) downstream propagation (one stabilizer broke another stage);
+  (e) something else?
+
+**Step 3 — Repair**: Adjust the strengthening to fix the failure WITHOUT
+reverting all hardening. Decide which previous key_changes to KEEP, which
+to MODIFY, and which to DROP.
+
+**Step 4 — Self-review V1 + V2**: Mentally trace the standard input
+through the new code; then trace ONE example from each stress category.
+
+## Output Format (same JSON schema as round 1)
+
+{{
+  "hardening_strategy": "<updated approach explaining what's kept/modified/dropped>",
+  "addressed_mutants": ["<mutant_id_1>"],
+  "key_changes": [
+    {{"type": "...", "location": "...", "rationale": "..."}}
+  ],
+  "strengthened_code": "<COMPLETE new strengthened kernel.py>",
+  "expected_tradeoffs": "<perf / readability impact, 1-3 sentences>"
+}}
+
+If after this round you conclude the original kernel cannot be further
+strengthened without breaking V1 or V2, set "strengthened_code" to the
+EXACT original code, set "key_changes" to empty, and explain in
+"hardening_strategy" why ALL unkilled mutants are true equivalents and
+no defensive code change is justified.
+"""
+
+
+def build_strengthen_prompt(
+    *,
+    reference_module_code: str,
+    original_kernel_code: str,
+    input_spec: str,
+    evidence_summary: Dict[str, Any],
+    n_examples: int = 5,
+) -> str:
+    """Build Task B round-1 prompt for kernel strengthening.
+
+    evidence_summary expected keys (string-typed, pre-formatted):
+        phase1_rounds, phase1_killed, phase1_survived,
+        phase2_killed_det, phase2_survived_det,
+        phase2_killed_llm, phase2_survived_llm,
+        taskA_killed, taskA_survived,
+        taskC_killed, taskC_survived,
+        final_unkilled,
+        survival_reason_clusters,
+        top_unkilled_examples,
+    """
+    return STRENGTHEN_PROMPT_B.format(
+        reference_module_code=reference_module_code,
+        original_kernel_code=original_kernel_code,
+        input_spec=input_spec,
+        n_examples=n_examples,
+        **{k: evidence_summary.get(k, "n/a") for k in [
+            "phase1_rounds", "phase1_killed", "phase1_survived",
+            "phase2_killed_det", "phase2_survived_det",
+            "phase2_killed_llm", "phase2_survived_llm",
+            "taskA_killed", "taskA_survived",
+            "taskC_killed", "taskC_survived",
+            "final_unkilled",
+            "survival_reason_clusters",
+            "top_unkilled_examples",
+        ]},
+    )
+
+
+def build_strengthen_reanalysis_prompt(
+    *,
+    reference_module_code: str,
+    original_kernel_code: str,
+    input_spec: str,
+    previous_attempts_text: str,
+    kernel_evidence_summary: str,
+) -> str:
+    """Build Task B round 2+ prompt with failure history."""
+    return REANALYZE_STRENGTHEN_PROMPT_B.format(
+        reference_module_code=reference_module_code,
+        original_kernel_code=original_kernel_code,
+        input_spec=input_spec,
+        previous_attempts=previous_attempts_text,
+        kernel_evidence_summary=kernel_evidence_summary,
+    )
