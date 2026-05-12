@@ -59,7 +59,13 @@ fixed-shape contract, or whether a still-missed value-level test exists.
 2. **Values CAN vary**: diverse numerical values within the fixed shapes —
    random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
    adversarial distributions, etc.
-3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+3. **Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`** (NaN-aware: if
+   reference produces NaN/Inf, mutant must produce matching NaN/Inf at the
+   same positions). To kill the mutant, your input must produce a result
+   whose **maximum absolute element-wise difference vs reference exceeds
+   `atol + rtol * |ref|`** (with `atol=rtol=1e-2`). Differences below this
+   threshold will NOT count as a kill — design inputs with clear, large
+   divergences, not minimal ones.
 
 ### Auxiliary configuration-stress track
 We additionally tested alternative batch sizes as a **separate probe** (see
@@ -176,7 +182,8 @@ Re-analyze with the failure information and try a fundamentally different approa
 
 ### Main contract (fixed-shape, variable-value)
 - Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
-- Only VALUES can vary. Comparison is BITWISE (NaN-aware).
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
 - **Do NOT suggest shape or batch size changes.**
 
 ### Auxiliary configuration-stress track
@@ -470,8 +477,8 @@ Our mutation testing framework follows a **fixed-shape, variable-value** princip
    values — random seeds, extreme magnitudes, near-zero, sparse, boundary
    integers, adversarial distributions, etc. Layer 2 already tested {l2_total_rounds}
    value combinations ({l2_random_seeds} random seeds + operator-directed stress policies).
-3. **Comparison is BITWISE**: Original and mutant outputs must match bit-for-bit
-   (NaN-aware). This is stricter than allclose.
+3. **Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`** (NaN-aware).
+   To kill, the input must produce `max|ref - mut| > atol + rtol * |ref|`.
 
 This means:
 - If a mutation changes a module-level constant (e.g., N=2048→2049) but the
@@ -1462,7 +1469,13 @@ applied.** Your task is to either:
 2. **Values CAN vary**: diverse numerical values within the fixed shapes —
    random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
    adversarial distributions, etc.
-3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+3. **Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`** (NaN-aware: if
+   reference produces NaN/Inf, mutant must produce matching NaN/Inf at the
+   same positions). To kill the mutant, your input must produce a result
+   whose **maximum absolute element-wise difference vs reference exceeds
+   `atol + rtol * |ref|`** (with `atol=rtol=1e-2`). Differences below this
+   threshold will NOT count as a kill — design inputs with clear, large
+   divergences, not minimal ones.
 4. **Do NOT suggest shape or batch size changes.**
 
 ## Full Original Source Code
@@ -1550,7 +1563,8 @@ strategy.
 
 ## Testing Contract (fixed-shape, variable-value)
 - Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
-- Only VALUES can vary. Comparison is BITWISE (NaN-aware).
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
 - **Do NOT suggest shape or batch size changes.**
 
 ## Full Original Source Code

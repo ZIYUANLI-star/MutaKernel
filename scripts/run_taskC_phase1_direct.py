@@ -314,7 +314,9 @@ def run_one_mutant_taskC(
             if err:
                 print(f"      -> not killed (error: {err[:80]})", flush=True)
             else:
-                print(f"      -> not killed (bitwise identical)", flush=True)
+                ds = exec_result.get("diff_summary") or ""
+                print(f"      -> not killed (within atol/rtol)  {ds[:120]}",
+                      flush=True)
             rounds_history.append(round_record)
 
     result: Dict[str, Any] = {

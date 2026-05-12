@@ -1,63 +1,71 @@
-"""Generate progress report from stress_enhance_results."""
+"""Quick analysis of Task A / Task C live progress.
+
+For each completed mutant detail, report:
+  - killed yes/no
+  - max round reached
+  - whether LLM ever judged "killable=true" (i.e. actually tried inputs)
+  - reason_category distribution
+"""
+from __future__ import annotations
 import json
-from collections import Counter
+import sys
+from collections import Counter, defaultdict
 from pathlib import Path
 
-PROJECT = Path(__file__).resolve().parent.parent
-STRESS = PROJECT / "stress_enhance_results" / "details"
+ROOT = Path(__file__).resolve().parent.parent
+TASKA_DIR = ROOT / "第二次实验汇总" / "第二次实验汇总_补充" / "task_a_phase2_rerun" / "details"
+TASKC_DIR = ROOT / "第二次实验汇总" / "第二次实验汇总_补充" / "task_c_phase1_direct" / "details"
 
-killed_by = Counter()
-killed_details = []
-survived_ops = Counter()
-survived_cats = Counter()
-killed_ops = Counter()
-killed_cats = Counter()
-total = 0
 
-for jf in sorted(STRESS.glob("*.json")):
-    d = json.loads(jf.read_text())
-    total += 1
-    op = d["operator_name"]
-    cat = d["operator_category"]
-    if d.get("killed"):
-        mode = d.get("killing_mode", "unknown")
-        policy = d.get("killing_policy") or d.get("killing_dtype", "")
-        killed_by[f"{mode}/{policy}"] += 1
-        killed_ops[op] += 1
-        killed_cats[cat] += 1
-        killed_details.append(f"  {d['mutant_id']:45s} | {op:18s} ({cat}) | {mode}/{policy}")
-    else:
-        survived_ops[op] += 1
-        survived_cats[cat] += 1
+def analyze(name: str, details_dir: Path) -> None:
+    files = sorted(details_dir.glob("*.json")) if details_dir.exists() else []
+    print(f"\n{'='*70}")
+    print(f"  {name}   completed={len(files)}")
+    print(f"{'='*70}")
+    if not files:
+        return
 
-killed_total = sum(killed_by.values())
-survived_total = sum(survived_ops.values())
+    killed_ids = []
+    max_round_dist = Counter()
+    ever_tried_input = 0  # at least one round had killable=true
+    reason_cats = Counter()
+    total_rounds = 0
+    deepseek_baseline_killed = 0  # Task A only
 
-print(f"=== PROGRESS REPORT ===")
-print(f"Total completed: {total} / 322")
-print(f"Killed: {killed_total} ({killed_total/total*100:.1f}%)")
-print(f"Survived: {survived_total}")
-print()
-print(f"=== Kill breakdown by method ===")
-for k, v in killed_by.most_common():
-    print(f"  {k}: {v}")
-print()
-print(f"=== Kill breakdown by operator ===")
-for k, v in killed_ops.most_common():
-    print(f"  {k}: {v}")
-print()
-print(f"=== Kill breakdown by category ===")
-for k, v in killed_cats.most_common():
-    print(f"  {k}: {v}")
-print()
-print(f"=== Survived by operator ===")
-for k, v in survived_ops.most_common():
-    print(f"  {k}: {v}")
-print()
-print(f"=== Survived by category ===")
-for k, v in survived_cats.most_common():
-    print(f"  {k}: {v}")
-print()
-print(f"=== Killed mutant details ===")
-for d in killed_details:
-    print(d)
+    for f in files:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if d.get("killed"):
+            killed_ids.append((d["mutant_id"], d.get("killing_round")))
+        rounds = d.get("rounds") or []
+        if rounds:
+            max_round_dist[len(rounds)] += 1
+            total_rounds += len(rounds)
+            tried = any(r.get("killable") is True for r in rounds)
+            if tried:
+                ever_tried_input += 1
+            for r in rounds:
+                cat = r.get("reason_category")
+                if cat:
+                    reason_cats[cat] += 1
+        baseline = d.get("deepseek_baseline") or {}
+        if baseline.get("killed"):
+            deepseek_baseline_killed += 1
+
+    print(f"  Killed by Opus 4.5     : {len(killed_ids)} / {len(files)}")
+    for mid, kr in killed_ids:
+        print(f"      -> {mid}  (killing_round={kr})")
+    print(f"  Ever tried an input    : {ever_tried_input} / {len(files)}  "
+          f"(rest gave killable=false on round 1, early-stopped)")
+    print(f"  Avg rounds per mutant  : {total_rounds/len(files):.2f}")
+    print(f"  Round distribution     : {dict(sorted(max_round_dist.items()))}")
+    print(f"  reason_category counts : {dict(reason_cats.most_common())}")
+    if deepseek_baseline_killed:
+        print(f"  (Task A only) DeepSeek baseline killed: "
+              f"{deepseek_baseline_killed} of same set")
+
+
+analyze("Task A", TASKA_DIR)
+analyze("Task C", TASKC_DIR)
