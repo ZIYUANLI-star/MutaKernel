@@ -1429,3 +1429,261 @@ def _extract_json(text: str) -> Optional[Dict]:
             return c
 
     return candidates[-1]
+
+
+# ===========================================================================
+# Task C — Phase I Direct (Opus 4.5)
+# ===========================================================================
+# These prompts intentionally exclude Phase II's 5-dimension stress testing.
+# They give the LLM ONLY Phase I EMD 4-layer evidence and ask it to construct
+# inputs that distinguish original vs mutant. This is the ablation arm against
+# Task A's "Phase II + LLM" pipeline.
+
+ANALYSIS_PROMPT_C = """\
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+
+A mutation testing tool applied a mutation to a GPU kernel. The 4-layer
+Equivalence-Mutant Detection (EMD) pipeline ran on this mutant:
+- Layer 0 — source-code normalization
+- Layer 1 — static equivalence rules
+- Layer 2 — multi-seed differential testing ({emd_total_rounds} total rounds, including baseline)
+- Layer 3 — LLM-based equivalence reasoning (if executed)
+
+EMD concluded this mutant is **possibly killable** (or has not been definitively
+declared equivalent). **NO downstream deterministic stress testing has been
+applied.** Your task is to either:
+1. Confirm the mutant is unkillable under the fixed-shape contract, OR
+2. Construct a value-level test input that exposes its behavioral difference.
+
+## Testing Contract (fixed-shape, variable-value)
+
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison is BITWISE**: NaN-aware bit-for-bit match (stricter than allclose).
+4. **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+{full_original_code}
+```
+
+## Full Mutated Source Code
+```
+{full_mutated_code}
+```
+
+## Mutation Details
+- Operator: {operator_name} — {operator_desc}
+- Location: line {line_start}
+- Original fragment: `{original_fragment}`
+- node_type: {node_type}
+
+## Input Specification (FIXED)
+{input_spec}
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain mathematical
+errors. Reason independently from the source code — do not blindly trust
+prior reasoning.
+
+{equiv_evidence}
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Value-pattern construction**: If a difference IS reachable,
+construct one concrete numerical pattern (e.g., one specific tensor value
+distribution) that triggers the divergence within the fixed shapes.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario.
+
+Respond in **strict JSON** (no text before or after):
+{{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {{
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  }},
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null
+"""
+
+
+REANALYSIS_PROMPT_C = """\
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection ({emd_total_rounds} rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison is BITWISE (NaN-aware).
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+{full_original_code}
+```
+
+## Full Mutated Source Code
+```
+{full_mutated_code}
+```
+
+## Mutation Details
+- Operator: {operator_name} — {operator_desc}
+- Location: line {line_start}
+- Original fragment: `{original_fragment}`
+- node_type: {node_type}
+
+## Input Specification (FIXED)
+{input_spec}
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+{equiv_evidence}
+
+## Previous Round(s) — failed attempts
+{previous_rounds}
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {{
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  }},
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null
+"""
+
+
+def build_phase1_direct_prompt(
+    original_code: str,
+    mutated_code: str,
+    operator_name: str,
+    site: Dict[str, Any],
+    input_spec: str,
+    equiv_detail: Dict[str, Any],
+) -> str:
+    """Build Task C round-1 prompt (Phase I evidence only, no Phase II).
+
+    Uses EMD layer 0-3 evidence; intentionally omits enhanced testing data.
+    """
+    line_start = site.get("line_start", 0)
+    original_fragment = site.get("original_code", "")
+    node_type = site.get("node_type", "")
+    op_desc = OPERATOR_DESCRIPTIONS.get(operator_name, operator_name)
+
+    equiv_evidence = _format_equiv_evidence(equiv_detail or {})
+    stats = _compute_testing_stats(equiv_detail or {}, {})
+
+    return ANALYSIS_PROMPT_C.format(
+        full_original_code=original_code,
+        full_mutated_code=mutated_code,
+        operator_name=operator_name,
+        operator_desc=op_desc,
+        line_start=line_start,
+        original_fragment=original_fragment,
+        node_type=node_type,
+        input_spec=input_spec,
+        equiv_evidence=equiv_evidence,
+        emd_total_rounds=stats["emd_total_rounds"],
+    )
+
+
+def build_phase1_direct_reanalysis_prompt(
+    original_code: str,
+    mutated_code: str,
+    operator_name: str,
+    site: Dict[str, Any],
+    input_spec: str,
+    previous_rounds: List[Dict[str, Any]],
+    equiv_detail: Dict[str, Any],
+) -> str:
+    """Build Task C round 2+ prompt with previous-round failure feedback."""
+    line_start = site.get("line_start", 0)
+    original_fragment = site.get("original_code", "")
+    node_type = site.get("node_type", "")
+    op_desc = OPERATOR_DESCRIPTIONS.get(operator_name, operator_name)
+
+    equiv_evidence = _format_equiv_evidence(equiv_detail or {})
+    rounds_text = _format_rounds_text(previous_rounds)
+    stats = _compute_testing_stats(equiv_detail or {}, {})
+
+    return REANALYSIS_PROMPT_C.format(
+        full_original_code=original_code,
+        full_mutated_code=mutated_code,
+        operator_name=operator_name,
+        operator_desc=op_desc,
+        line_start=line_start,
+        original_fragment=original_fragment,
+        node_type=node_type,
+        input_spec=input_spec,
+        equiv_evidence=equiv_evidence,
+        previous_rounds=rounds_text,
+        emd_total_rounds=stats["emd_total_rounds"],
+    )
