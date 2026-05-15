@@ -64,8 +64,7 @@ N_SEEDS_REPEATED = 3
 N_SEEDS_TRAINING = 3
 
 LLM_API_KEY = os.environ.get(
-    "LLM_API_KEY", os.environ.get(
-        "DEEPSEEK_API_KEY", "sk-b896056753ec440cb735873f0179bb67"))
+    "LLM_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-reasoner")
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "16384"))

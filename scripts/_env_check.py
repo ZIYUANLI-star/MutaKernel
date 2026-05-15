@@ -20,10 +20,11 @@ except ImportError:
 
 # Test DeepSeek R1 API connectivity
 try:
+    import os as _os
     from openai import OpenAI
     client = OpenAI(
-        api_key="sk-b896056753ec440cb735873f0179bb67",
-        base_url="https://api.deepseek.com",
+        api_key=_os.environ.get("DEEPSEEK_API_KEY", ""),
+        base_url=_os.environ.get("LLM_API_BASE", "https://api.deepseek.com"),
     )
     resp = client.chat.completions.create(
         model="deepseek-reasoner",

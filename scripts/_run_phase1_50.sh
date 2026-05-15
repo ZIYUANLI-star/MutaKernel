@@ -5,7 +5,7 @@ set -e
 
 export VENV_PYTHON="/home/kbuser/projects/KernelBench-0/.venv/bin/python"
 export PROJECT="/mnt/d/doctor_learning/Academic_Project/paper_1/MutaKernel"
-export DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY:-sk-b896056753ec440cb735873f0179bb67}"
+: "${DEEPSEEK_API_KEY:?DEEPSEEK_API_KEY must be set (export it before running this script)}"
 export LLM_MODEL="${LLM_MODEL:-deepseek-reasoner}"
 export LLM_API_BASE="${LLM_API_BASE:-https://api.deepseek.com/v1}"
 export LLM_API_KEY="$DEEPSEEK_API_KEY"

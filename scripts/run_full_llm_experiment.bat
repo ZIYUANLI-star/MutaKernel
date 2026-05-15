@@ -2,7 +2,10 @@
 echo ============================================================
 echo  Phase 1: LLM Attribution (all 322 survived mutants)
 echo ============================================================
-set DEEPSEEK_API_KEY=sk-b896056753ec440cb735873f0179bb67
+if "%DEEPSEEK_API_KEY%"=="" (
+    echo ERROR: DEEPSEEK_API_KEY env var is not set. Set it before running this script.
+    exit /b 1
+)
 set LLM_MODEL=deepseek-reasoner
 set LLM_API_BASE=https://api.deepseek.com/v1
 set LLM_MAX_MUTANTS=0

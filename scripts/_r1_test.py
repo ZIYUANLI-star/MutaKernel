@@ -1,9 +1,11 @@
 """Test DeepSeek R1 response structure."""
+import os
+
 from openai import OpenAI
 
 client = OpenAI(
-    api_key="sk-b896056753ec440cb735873f0179bb67",
-    base_url="https://api.deepseek.com",
+    api_key=os.environ.get("DEEPSEEK_API_KEY", ""),
+    base_url=os.environ.get("LLM_API_BASE", "https://api.deepseek.com"),
 )
 resp = client.chat.completions.create(
     model="deepseek-reasoner",

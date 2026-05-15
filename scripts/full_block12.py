@@ -68,8 +68,8 @@ MAX_KERNEL_RETRIES = 3
 MAX_KERNELS = 0        # 0 = unlimited; set >0 to limit kernels for debugging
 
 # Layer 3: LLM equiv verification
-LLM_API_KEY = os.environ.get("LLM_API_KEY", os.environ.get(
-    "DEEPSEEK_API_KEY", "sk-b896056753ec440cb735873f0179bb67"))
+LLM_API_KEY = os.environ.get(
+    "LLM_API_KEY", os.environ.get("DEEPSEEK_API_KEY", ""))
 LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
 LLM_TEMPERATURE = 0.0

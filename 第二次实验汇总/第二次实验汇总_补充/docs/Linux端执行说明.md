@@ -84,6 +84,40 @@ python scripts/run_taskC_phase1_direct.py --rounds 5 --filter-status survived
 
 `scripts/run_taskB_kernel_strengthen.py`（44 个 kernel，引入 Task A/C 的杀死信息）。
 
+## 4.5 Task A 补强：3 个原 LLM-only 杀死的变异体
+
+> 论文最终方法学移除了 Phase II 的 DeepSeek-R1 兜底，因此原本只被该兜底杀掉的 3 个变异体，
+> 在新方法学下应视为 Phase II 存活，需要走 Task A（Opus 4.5, 5 轮，extended thinking）审计。
+>
+> 目标：`L1_P49__arith_replace__11`、`L1_P49__init_modify__0`、`L1_P23__init_modify__0`
+>
+> 输出会**直接归并**到 `task_a_phase2_rerun/details/` 现有目录，不需要单独统计。
+
+```bash
+cd /home/kbuser/projects/KernelBench-0
+git pull
+
+# 烟测（dry-run，不调用 LLM，确认 3 个 mutant 都能解析到 Phase I/II）
+python scripts/run_taskA_3_extra.py --dry-run
+
+# 正式跑（约 2-4 分钟，3 个 mutant × 最多 5 轮）
+python scripts/run_taskA_3_extra.py --rounds 5 \
+    > 第二次实验汇总/第二次实验汇总_补充/task_a_phase2_rerun/run_extra3.log 2>&1
+
+# 检查结果
+tail -n 20 第二次实验汇总/第二次实验汇总_补充/task_a_phase2_rerun/run_extra3.log
+ls 第二次实验汇总/第二次实验汇总_补充/task_a_phase2_rerun/details/L1_P49__arith_replace__11.json \
+   第二次实验汇总/第二次实验汇总_补充/task_a_phase2_rerun/details/L1_P49__init_modify__0.json \
+   第二次实验汇总/第二次实验汇总_补充/task_a_phase2_rerun/details/L1_P23__init_modify__0.json
+
+# 单独的 manifest 落在 task_a_phase2_rerun/run_manifest_extra3.json，
+# 原 run_manifest.json 不被覆盖。
+```
+
+跑完后告诉我每个 mutant 的 `killed` / `rounds` 摘要（或我直接读 details JSON），我会重新统计 Task A 总数（365 → 368）、
+`reason_category` 分布、`provably_equivalent` / `operationally_indistinguishable` / `ourtool-missed` 计数，并同步更新
+论文 RQ3 + 所有相关数字宏。
+
 ## 5. 故障排查
 
 | 现象 | 处理 |

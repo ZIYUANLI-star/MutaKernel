@@ -364,6 +364,10 @@ def main():
                         help="Skip first N mutants")
     parser.add_argument("--mutant-id", type=str, default="",
                         help="Run only this single mutant_id")
+    parser.add_argument("--only-mutants", type=str, default="",
+                        help="Path to a text file with one mutant_id per "
+                             "line; rerun only those (ignores completed.json "
+                             "for these ids)")
     parser.add_argument("--no-resume", action="store_true",
                         help="Ignore existing completed.json")
     parser.add_argument("--out-dir", type=str,
@@ -376,6 +380,8 @@ def main():
     parser.add_argument("--filter-status", type=str, default="",
                         choices=["", "survived", "candidate_equivalent"],
                         help="Restrict to one Phase I status")
+    parser.add_argument("--sleep-between-mutants", type=float, default=0.0,
+                        help="Seconds to sleep between mutants (rate limit)")
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -418,6 +424,17 @@ def main():
                    if t["phase1_record"]["id"] == args.mutant_id]
         print(f"[FILTER] mutant_id={args.mutant_id} -> "
               f"{len(targets)} target(s)", flush=True)
+
+    only_ids: Optional[set] = None
+    if args.only_mutants:
+        with open(args.only_mutants, "r", encoding="utf-8") as f:
+            only_ids = {ln.strip() for ln in f if ln.strip()}
+        targets = [t for t in targets
+                   if t["phase1_record"]["id"] in only_ids]
+        completed -= only_ids
+        print(f"[FILTER] only-mutants={args.only_mutants} ({len(only_ids)} "
+              f"ids) -> {len(targets)} target(s); "
+              f"removed from completed.", flush=True)
 
     if args.start > 0:
         targets = targets[args.start:]
@@ -548,6 +565,9 @@ def main():
         (out_dir / "run_manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2),
             encoding="utf-8")
+
+        if args.sleep_between_mutants > 0:
+            time.sleep(args.sleep_between_mutants)
 
     print("\n[DONE] Task C finished.", flush=True)
     print(f"  Mutants attempted: {len(targets)}", flush=True)

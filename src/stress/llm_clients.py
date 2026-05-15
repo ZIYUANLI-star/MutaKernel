@@ -66,16 +66,20 @@ def make_bedrock_caller(
             os.environ["AWS_BEARER_TOKEN_BEDROCK"] = alt
 
     import boto3
+    import random
     from botocore.config import Config
+    from botocore.exceptions import ClientError
 
     # Extended thinking can take a long time (especially for hard mutants).
-    # Default boto3 read_timeout (~5 min) was empirically hit on ~7% of L1_P100
-    # mutants. Bump to 10 minutes and enable adaptive retries on
-    # transient throttling / read timeouts.
+    # boto3 built-in adaptive retries was empirically insufficient when
+    # Bedrock per-region capacity was exhausted; ~52% of Task C rounds were
+    # throttled. We now layer an explicit retry loop with exponential backoff
+    # + jitter on top of the boto3 retry, specifically to absorb
+    # ThrottlingException bursts that span > 1 minute.
     boto_config = Config(
         connect_timeout=30,
         read_timeout=600,
-        retries={"max_attempts": 4, "mode": "adaptive"},
+        retries={"max_attempts": 6, "mode": "adaptive"},
     )
     client = boto3.client(
         "bedrock-runtime", region_name=region, config=boto_config,
@@ -89,6 +93,34 @@ def make_bedrock_caller(
             "max_tokens (%d) <= thinking_budget (%d); bumping max_tokens to %d",
             max_tokens, thinking_budget, effective_max_tokens,
         )
+
+    # Outer retry policy for transient errors that survive boto3 retries.
+    # Sequence (s): 5, 15, 30, 60, 120, 240 with ±20% jitter.
+    OUTER_MAX_RETRIES = 6
+    BACKOFFS = [5.0, 15.0, 30.0, 60.0, 120.0, 240.0]
+
+    def _is_retryable(exc: Exception) -> bool:
+        msg = str(exc)
+        if isinstance(exc, ClientError):
+            err_code = exc.response.get("Error", {}).get("Code", "")
+            if err_code in (
+                "ThrottlingException",
+                "TooManyRequestsException",
+                "ServiceUnavailableException",
+                "ModelTimeoutException",
+                "InternalServerException",
+                "ModelErrorException",
+            ):
+                return True
+        # boto3 wraps some retryable conditions in generic Exception.
+        return any(s in msg for s in (
+            "ThrottlingException",
+            "Throttled",
+            "TooManyRequests",
+            "ServiceUnavailable",
+            "ReadTimeoutError",
+            "Connection",
+        ))
 
     def call(prompt: str) -> Dict[str, Any]:
         body: Dict[str, Any] = {
@@ -105,18 +137,32 @@ def make_bedrock_caller(
             # Bedrock default is fine; we just don't pass temperature.
 
         t0 = time.time()
-        try:
-            resp = client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(body),
-                contentType="application/json",
-                accept="application/json",
-            )
-        except Exception as e:
-            elapsed_ms = (time.time() - t0) * 1000
-            raise RuntimeError(
-                f"Bedrock invoke_model failed in {elapsed_ms:.0f} ms: {e!s}"
-            ) from e
+        last_exc: Optional[Exception] = None
+        resp = None
+        for attempt in range(OUTER_MAX_RETRIES):
+            try:
+                resp = client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(body),
+                    contentType="application/json",
+                    accept="application/json",
+                )
+                break  # success
+            except Exception as e:
+                last_exc = e
+                if not _is_retryable(e) or attempt == OUTER_MAX_RETRIES - 1:
+                    elapsed_ms = (time.time() - t0) * 1000
+                    raise RuntimeError(
+                        f"Bedrock invoke_model failed in {elapsed_ms:.0f} ms "
+                        f"after {attempt+1} attempts: {e!s}"
+                    ) from e
+                base = BACKOFFS[min(attempt, len(BACKOFFS) - 1)]
+                sleep_s = base * (0.8 + 0.4 * random.random())
+                logger.warning(
+                    "Bedrock retryable error on attempt %d/%d (sleep %.1fs): %s",
+                    attempt + 1, OUTER_MAX_RETRIES, sleep_s, str(e)[:160],
+                )
+                time.sleep(sleep_s)
         elapsed_ms = (time.time() - t0) * 1000
 
         payload = json.loads(resp["body"].read())
