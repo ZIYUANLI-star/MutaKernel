@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P37__sync_remove__1",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P37",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4093,
+        "completion_tokens": 2568,
+        "total_tokens": 6661,
+        "reasoning_tokens": 926
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation removes `__syncthreads()` inside the parallel reduction loop (line 36). With block_size=1024, the reduction loop iterates s=512,256,128,64,32,16,8,4,2,1. Without synchronization between iterations, thread tid might read shared_mem[tid+s] before another thread has written its updated value from the previous iteration. With 1024 threads per block, this race condition is virtually guaranteed to corrupt the partial sum computation, leading to an incorrect Frobenius norm and thus incorrect normalized output values.",
+      "survival_reason": "The removed __syncthreads() is critical for correctness of the parallel reduction algorithm. In each iteration of the reduction loop, threads with tid < s read from shared_mem[tid + s] and accumulate into shared_mem[tid]. Without the barrier, the next iteration begins before all threads complete the current iteration. For example, when transitioning from s=512 to s=256, thread 0 might read shared_mem[256] before thread 256 has finished writing its sum from the s=512 iteration. This data race causes partial sums to be computed incorrectly, resulting in an incorrect norm value. Since all output elements are divided by this norm, the entire output tensor will be scaled incorrectly. With 67M elements spread across 1024 blocks of 1024 threads, the race condition probability approaches certainty.",
+      "killable": true,
+      "kill_strategy": "Use any non-trivial input tensor. The race condition in the parallel reduction will cause incorrect block partial sums with near-certainty given the large thread count. Using uniform non-zero values (like all 1.0s) makes the expected result predictable: norm should be sqrt(67108864) = 8192, so each output element should be ~1.22e-4. The mutant will compute a different norm due to lost partial sums in the racy reduction.",
+      "recommendations": "Always include __syncthreads() verification tests for parallel reduction patterns. Race condition mutations in reduction loops are subtle but devastating - test with predictable inputs (like uniform tensors) where the correct result is analytically known, making any deviation from the race condition immediately detectable.",
+      "suggested_code": "def generate_inputs(device):\n    # Uniform values make expected result predictable\n    # Total elements = 16*64*256*256 = 67,108,864\n    # Expected frobenius norm = sqrt(67108864) = 8192\n    # Expected output value = 1.0 / 8192 ≈ 0.000122\n    x = torch.ones(16, 64, 256, 256, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4018,
+        "completion_tokens": 4841,
+        "total_tokens": 8859,
+        "reasoning_tokens": 2314
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With uniform values (all 1.0), every shared_mem[tid] entry equals the same local_sum (64). The parallel reduction race reads from higher indices and writes to lower indices, but with identical values, even 'wrong' reads produce correct results. Non-uniform values make the reduction order-dependent, so the race condition corrupts block sums. With variance ~1e6 in input and atol/rtol=1e-2, a 2%+ norm error in outputs near 1.0 triggers failure.",
+      "survival_reason": "The previous attempt used uniform 1.0 values, making all shared_mem[tid] entries identical (each thread's local_sum = 64 since each processes 64 elements). The parallel reduction race condition reads shared_mem[tid+s] potentially before thread tid+s finishes its prior iteration's write. However, with uniform values, the 'wrong' value equals the 'right' value, so the race is mathematically undetectable. Non-uniform input values create different shared_mem entries per thread, making the reduction sum sequence-dependent and exposing the missing __syncthreads() as corruption in block partial sums.",
+      "killable": true,
+      "kill_strategy": "Use non-uniform input values (sequential or random) so each thread's local_sum differs, making the parallel reduction order-dependent. The missing __syncthreads() in the reduction loop causes threads to read stale/wrong values from shared_mem, corrupting block sums and the final norm, producing output errors exceeding the tolerance.",
+      "recommendations": "When testing parallel reduction kernels, always use non-uniform input values with high variance to detect synchronization race conditions; uniform values can mask missing __syncthreads() calls because all partial sums are identical.",
+      "suggested_code": "def generate_inputs(device):\n    # Sequential values: 0, 1, 2, ... scaled to reasonable magnitude\n    # Each thread gets different local_sum, making reduction order-dependent\n    # Total elements: 16*64*256*256 = 67,108,864\n    x = torch.arange(16 * 64 * 256 * 256, dtype=torch.float32, device=device)\n    # Scale to range where errors are detectable\n    # With values 0 to 67M, sum of squares is huge; scale down\n    x = (x / 1e4).view(16, 64, 256, 256)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4304,
+        "completion_tokens": 4339,
+        "total_tokens": 8643,
+        "reasoning_tokens": 1858
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With uniform/sequential values, all threads compute similar local_sums. Even if the parallel reduction race causes incorrect ordering, the error is small relative to the tolerance (atol=1e-2, rtol=1e-2). With normalized outputs ~1e-4, even a 10% norm error gives |error| ~1e-5 << 1e-2. Need inputs that produce larger normalized outputs and amplify reduction errors.",
+      "survival_reason": "Previous attempts failed because: (1) Uniform values (all 1.0) make all partial sums equal, so reduction order doesn't matter - commutativity masks the race. (2) Sequential values still result in similar magnitude partial sums across threads, and the normalized output values (~1e-4) are so small that even significant norm errors don't exceed the tolerance threshold. The race condition exists but its effect doesn't propagate to detectable output differences. We need sparse inputs with large magnitude differences to create (a) larger normalized output values closer to 1, and (b) significant differences between correct and incorrect reduction orderings.",
+      "killable": true,
+      "kill_strategy": "Use highly sparse input: mostly zeros with a few very large values concentrated in positions that would be processed by specific threads. This creates: (1) normalized output values near 1.0 for the large elements, making errors more detectable, and (2) highly unequal partial sums across threads, making reduction order critically important. The race condition will cause some blocks to read stale zeros instead of updated partial sums.",
+      "recommendations": "When testing parallel reduction kernels, use inputs that create highly imbalanced partial sums between different thread groups (e.g., threads 0-511 vs 512-1023) to expose synchronization bugs, and ensure output magnitudes are large enough (~0.1-1.0) that errors exceed the comparison tolerance.",
+      "suggested_code": "def generate_inputs(device):\n    # Create sparse input: mostly zeros, with large values at specific positions\n    # Total elements = 16*64*256*256 = 67,108,864\n    # Using block_size=1024, num_blocks=1024, stride=1,048,576\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    flat = x.view(-1)\n    \n    # Place large values at positions processed by threads 768-1023 in block 0\n    # These threads' local_sums need to be combined with threads 256-511 at s=512,\n    # then threads 0-255 need to read from positions 256-511 at s=256\n    # Put large values (1e6) at positions that create imbalanced partial sums\n    \n    # Threads 768-1023 process: 768, 768+1M, 768+2M, ... for thread 768, etc.\n    stride = 1024 * 1024  # blockDim.x * gridDim.x\n    for tid in range(768, 1024):  # threads in upper quarter of block 0\n        for k in range(0, 67108864, stride):\n            if tid + k < 67108864:\n                flat[tid + k] = 1e6\n    \n    # Also add some large values for threads 0-255 to make normalized output large\n    for tid in range(0, 256):\n        if tid < 67108864:\n            flat[tid] = 1e6\n    \n    return [x.view(16, 64, 256, 256)]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4852,
+        "completion_tokens": 5472,
+        "total_tokens": 10324,
+        "reasoning_tokens": 2301
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The race condition from missing __syncthreads() at s=256 causes threads 0-255 to potentially read shared_mem[256-511] BEFORE threads 256-511 have incorporated contributions from shared_mem[768-1023] at s=512. If input mass is concentrated in positions processed by threads 768-1023, a race causes their squared contributions to be missed, drastically altering the norm and creating output errors >> tolerance.",
+      "survival_reason": "Previous attempts failed because: (1) Uniform values create equal local_sums across all threads, so even if some partial sums are missed, the error is distributed and small relative to the huge total norm (~8192). (2) Sequential/sparse attempts didn't concentrate enough 'mass' in the race-affected thread range (768-1023) relative to the total. (3) The output values were too small (~1e-4) so even 50% norm error yields absolute error < atol=0.01. The new strategy puts ALL significant values in positions mapped to threads 768-1023, making their loss catastrophic for the norm while keeping output values large (~0.1) so errors exceed tolerance.",
+      "killable": true,
+      "kill_strategy": "Concentrate ALL input energy in positions processed by threads 768-1023 in block 0 (the race-affected range). Use values ~100 to keep norm reasonable but make output values ~0.1, large enough that norm errors propagate to detectable output errors. Zero out all other positions so race-induced loss of these contributions causes massive norm error.",
+      "recommendations": "Always verify parallel reduction correctness with inputs that isolate contributions to specific thread ranges, particularly those involved in inter-warp communication at reduction boundaries (e.g., threads 256-511, 768-1023 for block_size=1024).",
+      "suggested_code": "def generate_inputs(device):\n    # Total elements: 16*64*256*256 = 67,108,864\n    # block_size = 1024, num_blocks = 1024, stride = 1,048,576\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    flat = x.view(-1)\n    \n    # Threads 768-1023 in block 0 process elements: tid + k*stride\n    # where stride = 1024 * 1024 = 1,048,576\n    # These threads' contributions go to shared_mem[768-1023],\n    # which feed into shared_mem[256-511] at s=512,\n    # then into shared_mem[0-255] at s=256.\n    # The missing syncthreads causes race at s=256.\n    \n    stride = 1024 * 1024  # blockDim.x * gridDim.x\n    value = 100.0  # Large enough to dominate, small enough to avoid overflow\n    \n    # Put values only for threads 768-1023 of block 0\n    for tid in range(768, 1024):  # 256 threads\n        for k in range(64):  # Multiple elements per thread\n            pos = tid + k * stride\n            if pos < 67108864:\n                flat[pos] = value\n    \n    # Expected: 256 threads * 64 elements * 100^2 = 256 * 64 * 10000 = 163,840,000\n    # Correct norm = sqrt(163840000 + 1e-8) ≈ 12800\n    # Correct output for value=100: 100/12800 ≈ 0.0078\n    # If race loses half the contributions: norm ≈ 9051, output ≈ 0.011\n    # Error ≈ 0.003, maybe not enough. Use larger values.\n    \n    # Actually use value = 1000 for bigger effect\n    flat.zero_()\n    value = 1000.0\n    for tid in range(768, 1024):\n        for k in range(64):\n            pos = tid + k * stride\n            if pos < 67108864:\n                flat[pos] = value\n    \n    # Now: sum_sq = 256*64*1e6 = 1.6384e10, norm ≈ 128000\n    # output ≈ 1000/128000 ≈ 0.0078\n    # If race loses contributions: output could be orders of magnitude off\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5634,
+        "completion_tokens": 5520,
+        "total_tokens": 11154,
+        "reasoning_tokens": 2307
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The race at s=256 occurs when threads 0-255 read shared_mem[256-511] before threads 256-511 finish writing updated values from s=512 step. Previous attempts used values where the 'before' and 'after' states of shared_mem[256-511] were similar, or the race probabilistically didn't trigger. Using inf-producing values at specific thread positions will cause shared_mem[768-1023]=inf, which at s=512 makes shared_mem[256-511]=inf. If race occurs, threads 0-255 read finite (stale) values; if not, they read inf. This inf-vs-finite difference is definitively detectable.",
+      "survival_reason": "Previous attempts failed because: (1) Uniform values (round 1) meant all shared_mem positions had equal values, so racing reads still got 'equivalent' values. (2) Sequential values (round 2) created gradual differences that were masked by floating-point tolerance. (3-4) Sparse large values were placed at threads 768-1023 which ARE read at s=512 by threads 256-511, but threads 0-255 only read from 256-511, so the race at s=256 wasn't properly targeted. The new approach places inf-generating values at positions processed by threads 768-1023 AND finite values at threads 256-511, creating a maximally distinct 'before' (finite) vs 'after' (inf) state at shared_mem[256-511].",
+      "killable": true,
+      "kill_strategy": "Place values that produce infinity when squared at positions processed by threads 768-1023, and small finite values at threads 256-511. This creates maximum distinguishability at the race point: shared_mem[256-511] is finite before s=512 but inf after. If threads 0-255 race ahead, they read finite; if synced, they read inf. The final norm will be either inf or finite.",
+      "recommendations": "When testing parallel reduction kernels, use extreme values (inf, -inf, NaN, float_max) at specific thread positions corresponding to reduction tree dependencies to definitively expose synchronization races that might be masked by probabilistic scheduling or numerical tolerance.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    flat = x.view(-1)\n    \n    # Total elements: 67,108,864\n    # block_size=1024, num_blocks=1024, stride=1,048,576\n    stride = 1024 * 1024\n    \n    # Value that overflows to inf when squared: 1e20^2 = 1e40 > float_max\n    inf_val = 1e20\n    \n    # Threads 768-1023 process positions: tid + k*stride\n    # Put inf-producing values only at first position per thread (k=0) in block 0\n    for tid in range(768, 1024):\n        flat[tid] = inf_val\n    \n    # Threads 256-511: finite values (will be added to inf at s=512)\n    for tid in range(256, 512):\n        flat[tid] = 1.0\n    \n    # Threads 0-255: finite values (read from 256-511 at s=256)\n    for tid in range(0, 256):\n        flat[tid] = 1.0\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 456.03
+}

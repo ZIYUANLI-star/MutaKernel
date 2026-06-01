@@ -1,0 +1,255 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a matrix multiplication, scaling, and residual addition.
+
+    Args:
+        in_features (int): Number of input features.
+        out_features (int): Number of output features.
+        scaling_factor (float): Scaling factor to apply after matrix multiplication.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.matmul(x)
+        original_x = x.clone().detach()
+        x = x * self.scaling_factor
+        x = x + original_x
+        return x
+
+batch_size = 16384
+in_features = 4096
+out_features = 4096
+scaling_factor = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, scaling_factor]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_bias_scale_residual.cu ===
+
+#include <cuda_runtime.h>
+
+__global__ void fused_bias_scale_residual_kernel(
+    const float* matmul_out,
+    const float* bias,
+    float* output,
+    int batch_size,
+    int out_features) {
+    
+    int tid = blockIdx.x * 128 + threadIdx.x;
+    
+    if (tid < batch_size * out_features) {
+        float val = matmul_out[tid];
+        float b = bias[tid % out_features];
+        output[tid] = (val + b) * 1.5f;
+    }
+}
+
+extern "C" void fused_bias_scale_residual_launcher(
+    const float* matmul_out,
+    const float* bias,
+    float* output,
+    int batch_size,
+    int out_features,
+    cudaStream_t stream) {
+    
+    int blocks = (batch_size * out_features + 128 - 1) / 128;
+    fused_bias_scale_residual_kernel<<<blocks, 128, 0, stream>>>(
+        matmul_out, bias, output, batch_size, out_features);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_bias_scale_residual_binding.cpp ===
+
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_bias_scale_residual_launcher(
+    const float* matmul_out,
+    const float* bias,
+    float* output,
+    int batch_size,
+    int out_features,
+    cudaStream_t stream);
+
+torch::Tensor fused_bias_scale_residual_forward(
+    torch::Tensor matmul_out,
+    torch::Tensor bias,
+    int batch_size,
+    int out_features) {
+    
+    // Input validation
+    TORCH_CHECK(matmul_out.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(matmul_out.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(matmul_out.dtype() == torch::kFloat32, "Input must be float32");
+    
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    
+    auto output = torch::empty_like(matmul_out);
+    
+    // Get current CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    // Call CUDA launcher
+    fused_bias_scale_residual_launcher(
+        matmul_out.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        out_features,
+        stream);
+    
+    return output;
+}
+
+void register_fused_bias_scale_residual(pybind11::module& m) {
+    m.def("fused_bias_scale_residual_forward", &fused_bias_scale_residual_forward,
+          "Fused bias addition, scaling, and residual forward",
+          py::arg("matmul_out"),
+          py::arg("bias"),
+          py::arg("batch_size"),
+          py::arg("out_features"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_bias_scale_residual_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs fused matrix multiplication, scaling, and residual addition.
+    
+    Args:
+        in_features (int): Number of input features.
+        out_features (int): Number of output features.
+        scaling_factor (float): Scaling factor to apply after matrix multiplication.
+    """
+    def __init__(self, in_features, out_features, scaling_factor):
+        super(ModelNew, self).__init__()
+        # Initialize parameters with the same names as in the original model
+        self.matmul = nn.Linear(in_features, out_features)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the optimized model.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        batch_size = 16384
+        out_features = 4096
+        
+        # Enable TF32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Compute matrix multiplication without bias
+        matmul_out = x @ self.matmul.weight.t()
+        
+        # Use custom fused kernel for bias addition + scaling/residual
+        output = cuda_extension.fused_bias_scale_residual_forward(
+            matmul_out, self.matmul.bias, batch_size, out_features)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return output
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 56
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.401001e+00, mean_diff=1.920835e-01, ref_range=[-5.1034e+03,5.0438e+03], orig_range=[-5.1038e+03,5.0436e+03]
+  - [large_magnitude seed=50001] max_diff=1.353149e+00, mean_diff=1.920691e-01, ref_range=[-5.0152e+03,5.5418e+03], orig_range=[-5.0146e+03,5.5421e+03]
+  - [near_overflow seed=50002] max_diff=1.364802e+27, mean_diff=1.916773e+26, ref_range=[-4.8267e+30,4.6745e+30], orig_range=[-4.8266e+30,4.6743e+30]
+  - [near_overflow seed=50003] max_diff=1.467541e+27, mean_diff=1.916382e+26, ref_range=[-4.7953e+30,5.7242e+30], orig_range=[-4.7952e+30,5.7241e+30]
+  - [all_negative seed=50008] max_diff=1.373329e-01, mean_diff=1.912835e-02, ref_range=[-4.3991e+02,4.5995e+02], orig_range=[-4.3989e+02,4.5998e+02]
+  - [all_negative seed=50009] max_diff=1.440639e-01, mean_diff=1.924243e-02, ref_range=[-4.6187e+02,4.3366e+02], orig_range=[-4.6188e+02,4.3368e+02]
+  - [all_positive seed=50010] max_diff=1.408005e-01, mean_diff=1.914853e-02, ref_range=[-4.2965e+02,4.3307e+02], orig_range=[-4.2962e+02,4.3306e+02]
+  - [all_positive seed=50011] max_diff=1.388893e-01, mean_diff=1.911322e-02, ref_range=[-4.7275e+02,4.6644e+02], orig_range=[-4.7276e+02,4.6645e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.329720e+00, mean_diff=1.920132e-01, ref_range=[-4.7479e+03,5.0718e+03], orig_range=[-4.7480e+03,5.0720e+03]
+  - [large_magnitude seed=70001] max_diff=1.513428e+00, mean_diff=1.921041e-01, ref_range=[-4.7311e+03,4.8175e+03], orig_range=[-4.7310e+03,4.8173e+03]
+  - [near_overflow seed=70002] max_diff=1.324983e+27, mean_diff=1.916478e+26, ref_range=[-4.9351e+30,4.7732e+30], orig_range=[-4.9348e+30,4.7734e+30]
+  - [near_overflow seed=70003] max_diff=1.411270e+27, mean_diff=1.916517e+26, ref_range=[-5.0960e+30,4.7678e+30], orig_range=[-5.0961e+30,4.7676e+30]
+  - [all_negative seed=70008] max_diff=1.418114e-01, mean_diff=1.925422e-02, ref_range=[-4.2900e+02,4.7493e+02], orig_range=[-4.2899e+02,4.7491e+02]
+  - [all_negative seed=70009] max_diff=1.362610e-01, mean_diff=1.913549e-02, ref_range=[-4.4606e+02,4.7712e+02], orig_range=[-4.4603e+02,4.7711e+02]
+  - [all_positive seed=70010] max_diff=1.433945e-01, mean_diff=1.918980e-02, ref_range=[-4.5427e+02,4.5918e+02], orig_range=[-4.5428e+02,4.5917e+02]
+  - [all_positive seed=70011] max_diff=1.395416e-01, mean_diff=1.924336e-02, ref_range=[-4.7372e+02,4.7027e+02], orig_range=[-4.7374e+02,4.7027e+02]
+  ... and 20 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

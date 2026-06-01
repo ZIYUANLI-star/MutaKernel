@@ -1,0 +1,131 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed 3D convolution, applies ReLU, and then applies group normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.relu = nn.ReLU()
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, D, H, W).
+        """
+        x = self.conv_transpose(x)
+        x = self.relu(x)
+        x = self.group_norm(x)
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+D, H, W = 32, 32, 32
+kernel_size = 3
+groups = 8
+bias = False
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, D, H, W)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, groups, bias]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Ultra-optimized model using Tensor Cores, TF32, and fused operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, groups, bias=False):
+        super(ModelNew, self).__init__()
+        # Initialize parameters to match original model
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, bias=bias)
+        self.group_norm = nn.GroupNorm(num_groups=groups, num_channels=out_channels)
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def forward(self, x):
+        # Enable Tensor Core optimization
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.enabled = True
+        torch.backends.cuda.use_tensor_core = True
+        
+        # Step 1: Transposed convolution with Tensor Cores
+        x = torch.conv_transpose3d(
+            x, 
+            self.conv_transpose.weight, 
+            self.conv_transpose.bias, 
+            self.conv_transpose.stride, 
+            self.conv_transpose.padding,
+            self.conv_transpose.output_padding,
+            self.conv_transpose.groups
+        )
+        
+        # Step 2: Fused ReLU + GroupNorm
+        x = torch.relu(x)
+        x = torch.group_norm(x, self.group_norm.num_groups, self.group_norm.weight, self.group_norm.bias)
+        x = x.view(16, 128, 34, 34, 34)
+        
+        # Disable Tensor Core optimization
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.enabled = False
+        torch.backends.cuda.use_tensor_core = False
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 6
+Failing dimensions: value_stress, training_stress, repeated_run
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (2 failures)
+  - [near_overflow seed=50002] max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,0.0000e+00], orig_range=[nan,nan]
+  - [near_overflow seed=50003] max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,0.0000e+00], orig_range=[nan,nan]
+
+### training_stress (2 failures)
+  - [near_overflow seed=70002] max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,0.0000e+00], orig_range=[nan,nan]
+  - [near_overflow seed=70003] max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,0.0000e+00], orig_range=[nan,nan]
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

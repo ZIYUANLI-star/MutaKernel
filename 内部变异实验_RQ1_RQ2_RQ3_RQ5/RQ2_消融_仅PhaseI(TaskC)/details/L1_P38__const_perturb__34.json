@@ -1,0 +1,100 @@
+{
+  "mutant_id": "L1_P38__const_perturb__34",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P38",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5169,
+        "completion_tokens": 5555,
+        "total_tokens": 10724,
+        "reasoning_tokens": 2100
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation writes output[idx+4]=input[idx+3], creating wrong values. The 'remaining elements' loop should fix this, but different warps execute asynchronously. Thread X's remaining loop may execute before thread Y's vectorized loop writes to the same index, creating race conditions where wrong values persist. EMD Layer 2 confirmed divergence at seed 10002.",
+      "survival_reason": "The mutation creates a race condition between the vectorized write loop (which writes input[idx+3] to output[idx+4]) and the remaining elements loop (which correctly writes input[pos] to output[pos]). Since warps within a block execute asynchronously, some indices receive corrupted values when the vectorized loop's write occurs after the remaining loop's write for that index. The scheduler's non-determinism means the bug manifests intermittently.",
+      "killable": true,
+      "kill_strategy": "Use adversarial input where adjacent elements (like input[3] and input[4]) have opposite signs and large magnitudes. When the race condition results in the wrong value being written, the difference will be maximally detectable (e.g., +0.5 vs -0.5 normalized values).",
+      "recommendations": "When implementing optimized CUDA kernels with multiple write paths to the same memory locations, either use atomic operations, ensure deterministic write ordering via synchronization barriers, or verify that duplicate writes produce identical values. The 'fallback' remaining-elements loop creates a false sense of safety when vectorized loops contain bugs.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Set alternating high-magnitude values at positions likely affected by the bug\n    for b in range(16):\n        for i in range(16384):\n            if i % 4 == 3:\n                x[b, i] = 100.0  # idx+3 positions\n            elif i % 4 == 0:\n                x[b, i] = -100.0  # idx+4 positions (next group's start)\n            else:\n                x[b, i] = 0.001  # small values to not dominate L1 norm\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5108,
+        "completion_tokens": 6650,
+        "total_tokens": 11758,
+        "reasoning_tokens": 2716
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With input[3]=1.0, input[4]=0.0, all else zero: L1_norm=1.0. Correct output[4]=0.0, but if thread 0's vectorized write wins the race, output[4]=1.0. Difference=1.0 >> atol(0.01)+rtol*0=0.01.",
+      "survival_reason": "Previous attempt failed because the large number of non-zero values created an L1 norm of ~819,200, reducing the normalized difference to ~0.00024, well below the 0.01 tolerance. The mutation creates a race condition between thread 0's vectorized loop (writing wrong value to position 4) and thread 4's remaining loop (writing correct value). By making L1 norm minimal (=1.0) through sparse input, the normalized difference becomes 1.0, which vastly exceeds tolerance.",
+      "killable": true,
+      "kill_strategy": "Use sparse input where only position 3 has value 1.0 per row, and position 4 is 0.0. The L1 norm becomes 1.0, so if the race condition causes position 4 to receive input[3]'s normalized value, the error is 1.0 vs 0.0, far exceeding tolerance.",
+      "recommendations": "When testing kernels with race conditions between vectorized and cleanup loops, use sparse inputs that minimize normalization denominators to maximize the relative error when wrong values are written.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Set position 3 to 1.0, position 4 stays 0.0\n    # L1 norm = 1.0, so output[3] should be 1.0, output[4] should be 0.0\n    # If race goes wrong, output[4] gets input[3]/1.0 = 1.0 instead of 0.0\n    x[:, 3] = 1.0\n    # Also test equivalent positions across strides for thread 0\n    # Positions 1027, 2051, etc. (3 + k*1024)\n    for k in range(1, 16):\n        pos = 3 + k * 1024\n        if pos < 16384:\n            x[:, pos] = 1.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5467,
+        "completion_tokens": 8514,
+        "total_tokens": 13981,
+        "reasoning_tokens": 3630
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Thread 255, last vectorized iteration: idx=16380, condition 16383<16384 passes, writes output[16384] = input[16383]/norm, which is batch[i+1][0]. For input[0,16383]=1000.0 (L1_norm≈1000), output[1,0] gets ≈1.0 instead of expected ≈-1.0 from input[1,0]=-1000.0. Error = |1.0-(-1.0)| = 2.0 >> tolerance.",
+      "survival_reason": "Previous attempts focused on positions within a single batch where the cleanup loop's correct writes masked the vectorized loop's bugs via race conditions. The fundamental issue is an OUT-OF-BOUNDS write at the batch boundary: when idx=16380 passes the bounds check idx+3<16384, the buggy write to idx+4=16384 corrupts the first element of the next batch. This cross-batch corruption is deterministic and cannot be masked by the cleanup loop. Previous patterns with alternating signs at positions 3,4 or sparse values didn't trigger this because they didn't specifically target the batch boundary corruption at positions 16383→next_batch[0].",
+      "killable": true,
+      "kill_strategy": "Create input where input[b, 16383] and input[b+1, 0] have maximally different normalized values. Use opposite signs and significant magnitudes to ensure the cross-batch overflow produces a large detectable error.",
+      "recommendations": "When testing CUDA kernels with vectorized access patterns (processing N elements at a time), always include boundary tests where the vectorized write indices could exceed the intended range, especially at the boundary between logical partitions (batches, rows, etc.).",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Position 16383 = +1000, Position 0 = -1000\n    # This maximizes the cross-batch corruption effect\n    x[:, 16383] = 1000.0  # Last element of each batch\n    x[:, 0] = -1000.0      # First element of each batch\n    # Add small values elsewhere to avoid zero-norm issues\n    x[:, 1] = 1.0\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=9.995003e-01, mean_diff=7.625582e-06, ref_range=[-4.9975e-01,4.9975e-01], mut_range=[-4.9975e-01,4.9975e-01]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 3,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Create input where input[b, 16383] and input[b+1, 0] have maximally different normalized values. Use opposite signs and significant magnitudes to ensure the cross-batch overflow produces a large detectable error.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Position 16383 = +1000, Position 0 = -1000\n    # This maximizes the cross-batch corruption effect\n    x[:, 16383] = 1000.0  # Last element of each batch\n    x[:, 0] = -1000.0      # First element of each batch\n    # Add small values elsewhere to avoid zero-norm issues\n    x[:, 1] = 1.0\n    return [x]"
+  },
+  "elapsed_sec": 372.18
+}

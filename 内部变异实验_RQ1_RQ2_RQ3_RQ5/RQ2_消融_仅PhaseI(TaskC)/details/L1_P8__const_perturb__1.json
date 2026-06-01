@@ -1,0 +1,143 @@
+{
+  "mutant_id": "L1_P8__const_perturb__1",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P8",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6099,
+        "completion_tokens": 6677,
+        "total_tokens": 12776,
+        "reasoning_tokens": 2660
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "TILE_M=128→127 changes which rows each block processes. Row 127 is computed by mutant (block 1, row_in_tile=0) but not original (falls outside rows 0-3 of block 0). With near-zero inputs, both kernels pass internal 1e-4 tolerance check and return different custom results.",
+      "survival_reason": "The mutation changes the tile-to-row mapping, causing row 127 (and other rows at positions 127+127k for small k) to be computed by different thread blocks. With standard random inputs, both kernels fail the internal correctness check and fall back to PyTorch. However, with near-zero inputs, the absolute errors are tiny enough to pass the 1e-4 threshold, causing both to return their custom (but different) results.",
+      "killable": true,
+      "kill_strategy": "Use near-zero magnitude inputs to ensure both kernels pass the internal tolerance check. The different row coverage between original (rows at multiples of 128) and mutant (rows at multiples of 127) will produce different outputs that exceed the test threshold.",
+      "recommendations": "Tile size constants should be validated against BLOCK_SIZE to ensure all tile elements are covered. The current kernel only computes 4 rows per 128-row tile, indicating a fundamental design flaw that any TILE_M mutation would expose.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    A = torch.randn(8205, 2949, device=device, dtype=torch.float32) * 1e-8\n    B = torch.randn(2949, 5921, device=device, dtype=torch.float32) * 1e-8\n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5944,
+        "completion_tokens": 5180,
+        "total_tokens": 11124,
+        "reasoning_tokens": 2787
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes TILE_M from 128 to 127, affecting row-to-block mapping. With TILE_M=127, row indices are computed differently. However, the forward() has a fallback: if custom_result differs from torch_result by >1e-4 tolerance, it returns torch_result (correct). To kill, we need inputs where BOTH kernels' custom_results pass the internal 1e-4 check but differ from each other by >1e-2. Using large uniform values (~100) causes each output element to be ~2.949e7, amplifying any subtle accumulation-order differences between the two tile configurations.",
+      "survival_reason": "Round 1 failed because near-zero inputs (1e-8 scale) produced near-zero outputs where absolute differences stayed within 1e-2 atol, regardless of relative errors. The forward() method's fallback mechanism returns torch_result when custom kernel deviates by >1e-4, making both models return correct results. The key insight is that with different TILE_M values, the same thread indices map to different row offsets (via `(thread_id / THREADS_PER_COL) % TILE_M`), causing subtle numerical differences in accumulation order. Large uniform values will make both kernels pass their internal checks (since both compute approximately correct results via tiled matmul), but the accumulation-order differences scale with input magnitude and can exceed the 1e-2 test tolerance.",
+      "killable": true,
+      "kill_strategy": "Use large uniform values (magnitude ~100) so that accumulation errors from different tiling patterns scale up beyond the 1e-2 tolerance threshold. Both kernels should pass their internal 1e-4 checks against torch.matmul (both compute correct-ish matmul), but the subtle differences in which threads compute which rows with TILE_M=128 vs 127 create distinguishable numerical noise at large scales.",
+      "recommendations": "When testing CUDA kernels with built-in correctness fallbacks, mutation testing should bypass the fallback mechanism or test the kernel directly. The self-correcting behavior makes the module appear correct even when the kernel is buggy, masking important mutations.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(12345)\n    # Use large values with slight random perturbation to avoid symmetry\n    # This creates results ~O(1e7) where accumulation differences become visible\n    A = torch.ones(8205, 2949, device=device, dtype=torch.float32) * 100.0\n    A += torch.randn(8205, 2949, device=device, dtype=torch.float32) * 0.01\n    B = torch.ones(2949, 5921, device=device, dtype=torch.float32) * 100.0\n    B += torch.randn(2949, 5921, device=device, dtype=torch.float32) * 0.01\n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6278,
+        "completion_tokens": 6871,
+        "total_tokens": 13149,
+        "reasoning_tokens": 3000
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation (TILE_M: 128→127) changes which rows each thread block computes. Original computes rows {0,1,2,3} + 128*k, mutant computes rows {0,1,2,3} + 127*k. However, the forward() has a self-correcting fallback: when custom_result differs from torch.matmul by >1e-4, it returns torch_result instead. For inputs where both pass/fail the internal 1e-4 check identically, outputs are equivalent. For inputs causing divergent check results, the failing kernel returns torch_result (correct), masking the difference.",
+      "survival_reason": "Previous near-zero inputs (1e-8 magnitude) made both kernels pass the internal 1e-4 check since all output values were ~1e-12 (effectively 0), making both return custom results that only differed by ~1e-12 at boundary rows—well under the 1e-2 test threshold. Large uniform inputs (~100) caused both kernels to fail the internal check at multiple rows (uncomputed rows returned 0 vs torch values ~1e7), so both fell back to torch.matmul, returning identical correct results. The fallback mechanism creates a 'self-healing' behavior where significant errors trigger correction. To kill, we need one kernel to pass internal check while the other fails, AND their outputs must differ by >1e-2.",
+      "killable": true,
+      "kill_strategy": "Construct inputs where row 127 (computed by mutant but NOT original) has torch.matmul output magnitude in the narrow band (1e-4, 1e-2], while rows only computed by original (128, 129, 130, 131 from block 1) have torch output < 1e-4. This makes original fail internal check at row 127 (falling back to torch=correct), while mutant passes (since its only missing rows have ~0 torch values). But mutant's custom result for row 127 differs from original's torch result by 0 vs ~1e-3, which under rtol=1e-2 comparison is distinguishable.",
+      "recommendations": "When testing tiled GPU kernels with self-correcting fallback mechanisms, the fallback creates a 'survivability shield' that masks tile-boundary mutations. Testing should either disable fallbacks during mutation testing or use inputs carefully calibrated to threshold boundaries that cause divergent pass/fail behavior in the internal verification.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(99999)\n    A = torch.zeros(8205, 2949, device=device, dtype=torch.float32)\n    B = torch.ones(2949, 5921, device=device, dtype=torch.float32)\n    # Row 127 is computed by mutant (block 1 at TILE_M=127) but NOT by original (block 0 ends at row 3, block 1 starts at row 128)\n    # Set A[127,:] so that C[127,:] = sum(A[127,:] * B[:,j]) ≈ 1e-3 (between 1e-4 internal and 1e-2 test thresholds)\n    # With B=1, we need A[127,:] ≈ 1e-3/2949 ≈ 3.4e-7\n    A[127, :] = 3.4e-7\n    # Ensure rows 128-131 (computed by original block 1) have zero output so mutant passes its internal check\n    # They're already zero in A\n    # Add small noise to B to break symmetry\n    B += torch.randn(2949, 5921, device=device, dtype=torch.float32) * 1e-9\n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6810,
+        "completion_tokens": 9761,
+        "total_tokens": 16571,
+        "reasoning_tokens": 4535
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation TILE_M=128→127 changes grid partitioning: original block i covers rows [128i, 128i+3], mutant covers [127i, 127i+3]. With M=8205, original block 64 computes rows 8192-8195, mutant block 64 computes rows 8128-8131. Row 8128 is computed by mutant but falls in original's gap (8068-8191). Row 8192 is computed by original but exceeds mutant's highest computed row (8131). The internal torch.allclose(rtol=1e-4,atol=1e-4) fallback masks differences when one kernel errs. To kill: make BOTH kernels pass internal check with accumulated floating-point errors that differ beyond test tolerance (1e-2).",
+      "survival_reason": "Previous attempts failed because: (1) Near-zero inputs (1e-8) produced outputs too small to accumulate distinguishable errors. (2) Large uniform inputs produced identical accumulation patterns since both kernels use same thread-to-row mapping within tiles. (3) Sparse row-127 targeting backfired because when original failed internal check (row 127 not computed), it fell back to torch, matching mutant's correct computation. The key insight is that divergence was detected with near_zero policy, meaning accumulated floating-point errors CAN differ. I need values that pass internal 1e-4 check for both but create accumulated errors differing by >1e-2 at specific rows where the two kernels have different block boundaries (specifically around rows 127, 8128, 8192).",
+      "killable": true,
+      "kill_strategy": "Use moderately large values (magnitude ~10) with specific patterns at boundary rows (127, 128, 8128, 8192) where block assignments differ. The K=2949 accumulations will create floating-point rounding differences that compound differently due to different row-to-block mappings. Seed-controlled random values maximize accumulation variance.",
+      "recommendations": "When testing tiled matrix multiplication kernels with internal correctness fallbacks, focus on boundary rows between tiles and use input magnitudes that stress floating-point accumulation while staying within internal tolerance bounds. The fallback mechanism can mask many mutations, so tests should target the narrow band where custom results pass internal checks but differ from each other.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(314159)\n    # Base matrices with moderate magnitude for meaningful accumulation\n    A = torch.randn(8205, 2949, device=device, dtype=torch.float32) * 5.0\n    B = torch.randn(2949, 5921, device=device, dtype=torch.float32) * 5.0\n    \n    # Boost boundary rows where TILE_M=128 vs 127 creates different block assignments\n    # Row 127: mutant block 1 computes, original doesn't (gap row)\n    # Row 128: original block 1 computes, mutant block 1 also computes\n    # Row 8128: mutant block 64 computes, original doesn't (gap)\n    # Row 8192: original block 64 computes, mutant doesn't compute\n    boundary_rows = [127, 128, 254, 255, 8128, 8129, 8130, 8131, 8192, 8193, 8194, 8195]\n    for row in boundary_rows:\n        if row < 8205:\n            A[row, :] *= 3.0  # Amplify these rows\n    \n    # Also boost columns that align with TILE_K boundaries to stress accumulation\n    for k in range(0, 2949, 8):\n        B[k, :] *= 1.5\n    \n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7295,
+        "completion_tokens": 6426,
+        "total_tokens": 13721,
+        "reasoning_tokens": 3257
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "TILE_M 128→127 changes row-to-block mapping, but the kernel only computes 4 rows per tile (row_in_tile ∈ {0,1,2,3} due to THREADS_PER_COL=64). Both versions have identical internal fallback logic: if custom_result differs from torch.matmul by >1e-4, return torch.matmul. For large inputs where torch_result exceeds 1e-4 at any uncomputed row, BOTH kernels fail internal check → return identical torch_result. For tiny inputs where torch_result < 1e-4 everywhere, BOTH pass internal check → return custom_result with differences < 1e-4 (well within test tolerance 1e-2). The mathematical constraint requires: (1) torch_result < 1e-4 for internal check pass, BUT (2) |custom_orig - custom_mut| > 1e-2 at differing rows. Since differing rows have custom_result ≈ 0 (not computed) or ≈ torch_result (computed correctly), difference ≤ torch_result < 1e-4 << 1e-2.",
+      "survival_reason": "Round 1 used 1e-8 magnitude inputs: torch_result ≈ 1e-8 * 1e-8 * 2949 ≈ 3e-13, well below internal 1e-4 threshold—both pass and return custom results. But difference in computed rows (127 vs 131) is also ~1e-13, far below test 1e-2 threshold. Round 2 used 100.0 magnitude: torch_result ≈ 100*100*2949 ≈ 2.9e7 at uncomputed rows, causing BOTH to fail internal check and return identical torch_result. Rounds 3-4 tried boundary amplification, but the fallback mechanism synchronizes outputs: whenever one version fails internal check due to large torch_result at its uncomputed rows, the other likely fails too at its different uncomputed rows. The fundamental problem is that the 1e-4 internal threshold vs 1e-2 test threshold creates a 100x gap—any input small enough to pass internal check produces differences too small to fail the test.",
+      "killable": false,
+      "kill_strategy": "This mutant is effectively unkillable through value manipulation alone. The internal fallback mechanism (torch.allclose at rtol=1e-4, atol=1e-4 triggering return torch_result) acts as a safety net that makes both versions output-equivalent. The only theoretical kill path requires inputs where exactly one version passes internal check while the other fails, AND the differing rows have values between 1e-4 and 1e-2—but this is mathematically impossible since the same torch_result values determine both the check outcome and the potential difference magnitude.",
+      "recommendations": "The fallback-to-reference pattern (if !torch.allclose then return reference) creates mutation-resistant code. For mutation testing effectiveness, consider: (1) removing the fallback in production code, (2) testing the custom kernel directly without the wrapper, or (3) using tighter tolerances in the internal check that align with test tolerances. Additionally, the tiling constants should be verified independently—TILE_M perturbations should trigger build-time assertions that TILE_M divides evenly into expected thread work distributions.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 624.97
+}

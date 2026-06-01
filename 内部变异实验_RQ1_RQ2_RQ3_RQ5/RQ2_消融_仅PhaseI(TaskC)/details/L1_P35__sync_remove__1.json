@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P35__sync_remove__1",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P35",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6329,
+        "completion_tokens": 3352,
+        "total_tokens": 9681,
+        "reasoning_tokens": 1185
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With blockDim.x=256, the reduction loop runs 8 iterations (strides 128,64,32,16,8,4,2,1). Without __syncthreads(), thread i at stride S may read shared_data[i+S] before thread (i+S) at stride 2S has written its updated value. This corrupts the sum, producing wrong mean, wrong variance, and wrong normalized output.",
+      "survival_reason": "This mutant does NOT survive. The removed synchronization barrier inside the parallel reduction loop causes a classic race condition. Threads in later reduction iterations read shared memory locations that should have been updated by other threads in the previous iteration. Without the barrier, faster threads may read stale values before slower threads complete their writes. This corrupts the computed mean, which then propagates to incorrect variance and normalization, producing output that differs significantly from the reference.",
+      "killable": true,
+      "kill_strategy": "Use high-variance random input data with large magnitudes. The diverse partial sums across threads maximize the probability that race conditions cause observable corruption in the mean computation. The error propagates through variance calculation and normalization, producing large output differences.",
+      "recommendations": "Always include __syncthreads() after every iteration of a parallel reduction loop in shared memory. Consider using warp-level primitives (__shfl_down_sync) for the final 32 elements where warp-synchronous execution is guaranteed, but explicit barriers remain essential for cross-warp coordination.",
+      "suggested_code": "def generate_inputs(device):\n    # High variance random data with large magnitude\n    # Race condition in reduction corrupts mean computation\n    torch.manual_seed(42)\n    x = torch.randn(16, 64, 256, 256, dtype=torch.float32, device=device) * 100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6158,
+        "completion_tokens": 3594,
+        "total_tokens": 9752,
+        "reasoning_tokens": 1604
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The missing __syncthreads() in the mean reduction loop causes race conditions where threads 0-63 may read stale values from threads 64-127 before stride-128 reduction completes. With uniform random data, partial sum errors may average out. With highly asymmetric data where threads 128-255 hold massive values and threads 0-127 hold zeros, any race-induced data loss produces catastrophic mean error that propagates to output.",
+      "survival_reason": "Round 1 failed because uniform random data distributes partial sums somewhat evenly across threads, so race condition errors partially cancel or stay within tolerance. The critical insight is that the reduction loop iterates: stride=128 updates threads 0-127 using 128-255, then stride=64 updates threads 0-63 using 64-127. Without sync, threads 0-63 may read from 64-127 before those were updated by the stride=128 pass. To expose this, we need asymmetric data where threads 128-255 have the majority of magnitude. If their contribution fails to propagate, the mean shifts enormously (e.g., from ~1.875e7 to near 0), causing massive normalized output differences exceeding tolerance.",
+      "killable": true,
+      "kill_strategy": "Create spatially-biased data where columns 192-255 (processed by threads 192-255) contain value 1e8, all other positions are 0. This makes ~25% of spatial positions hold all the magnitude. Race condition dropping any high-thread partial sums catastrophically corrupts mean, yielding huge output divergence.",
+      "recommendations": "When testing GPU reduction kernels, always include asymmetric test patterns where large values are concentrated in specific thread ranges to maximize race condition detectability - uniform distributions can hide synchronization bugs through statistical averaging.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    # Place large values only in columns 192-255\n    # These columns are processed by threads 192-255 in the kernel\n    # Correct mean requires their sums to propagate through reduction\n    # Race condition from missing __syncthreads can drop these contributions\n    x[:, :, :, 192:] = 1e8\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.999919e-01, mean_diff=8.680681e-03, ref_range=[-5.7735e-01,1.7321e+00], mut_range=[-5.7736e-01,1.9415e+00]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Create spatially-biased data where columns 192-255 (processed by threads 192-255) contain value 1e8, all other positions are 0. This makes ~25% of spatial positions hold all the magnitude. Race condition dropping any high-thread partial sums catastrophically corrupts mean, yielding huge output divergence.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    # Place large values only in columns 192-255\n    # These columns are processed by threads 192-255 in the kernel\n    # Correct mean requires their sums to propagate through reduction\n    # Race condition from missing __syncthreads can drop these contributions\n    x[:, :, :, 192:] = 1e8\n    return [x]"
+  },
+  "elapsed_sec": 170.16
+}

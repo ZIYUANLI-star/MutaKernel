@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P97__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P97",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5532,
+        "completion_tokens": 2608,
+        "total_tokens": 8140,
+        "reasoning_tokens": 1245
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation removes __syncthreads() between shared memory writes (lines 52-54) and the reduction loop (lines 57+). With THREADS_PER_BLOCK=256, the first reduction iteration has stride=128, meaning thread tid reads shared_*[tid+128]. Without the barrier, thread 0 may read shared_dot[128] before thread 128 writes its value, causing a data race.",
+      "survival_reason": "The removed __syncthreads() at line 57 serves as a critical barrier between the phase where all 256 threads write their partial sums to shared memory (shared_dot[tid], shared_pred_norm[tid], shared_target_norm[tid]) and the reduction phase where threads with tid < stride read values from indices tid+stride. Without this barrier, threads 0-127 in the first reduction iteration (stride=128) may read from indices 128-255 before threads 128-255 have written their values. This creates a race condition that can cause threads to read uninitialized (zero) or stale values, resulting in incorrect sum reductions and ultimately wrong cosine similarity loss values.",
+      "killable": true,
+      "kill_strategy": "Use random values to ensure each thread has distinct partial sums. When the race condition triggers, the missing contributions from threads 128-255 will produce noticeably different final results. The seed 10000 was already shown to expose this divergence.",
+      "recommendations": "Always verify that __syncthreads() barriers are present between shared memory write phases and subsequent read phases that access different indices. Mutation testing should specifically target synchronization primitives with race-detection tools like cuda-memcheck or compute-sanitizer.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10000)\n    predictions = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5363,
+        "completion_tokens": 4497,
+        "total_tokens": 9860,
+        "reasoning_tokens": 1961
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The missing __syncthreads() at line 57 creates a race where threads 0-127 may read stale values from shared memory locations 128-255 during the first reduction iteration (stride=128). With random data, the partial sums from threads 0-127 vs 128-255 are roughly balanced, so even if some data is stale, the error may fall within tolerance. By concentrating ALL meaningful data in indices processed by threads 128-255 (indices 512-1023, 1536-2047, 2560-3071, 3584-4095), if the race triggers, the result will be loss=1.0 (zero vectors) vs loss≈0.0 (identical vectors), a difference of ~1.0 which far exceeds the 0.01-0.02 tolerance.",
+      "survival_reason": "The previous random input attempt failed because random data distributes partial sums roughly evenly across all 256 threads. When threads 0-127 sum their results, they already have approximately half the total, so even if the race condition causes them to miss some data from threads 128-255, the error is dampened and stays within tolerance. Additionally, race conditions are non-deterministic and may not manifest consistently. By structuring inputs so that ONLY threads 128-255 have non-zero data to accumulate, any manifestation of the race will cause threads 0-127 to compute with entirely zero values, producing a catastrophically different result (loss=1.0 vs loss≈0.0) that cannot be hidden by tolerance.",
+      "killable": true,
+      "kill_strategy": "Structure input data so all non-zero values fall in indices processed by threads 128-255 (specifically indices 512-1023, 1536-2047, 2560-3071, 3584-4095). Set predictions=targets=1.0 for these indices, 0 elsewhere. If the race manifests, result will be 1.0; correct result is ~0.0. This creates a maximal ~1.0 difference.",
+      "recommendations": "When testing synchronization mutations in reductions, structure inputs to maximize data asymmetry across thread ranges that depend on the synchronization point. Concentrating data in higher-indexed threads (or lower, depending on reduction direction) amplifies the impact of missing barriers.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    # Threads 128-255 process indices: 512-1023, 1536-2047, 2560-3071, 3584-4095\n    # With ELEMENTS_PER_THREAD=4, thread t processes base + t*4 to base + t*4 + 3\n    # So threads 128-255 get indices 512-1023 in first chunk, etc.\n    # Put all meaningful data there\n    for offset in [512, 1536, 2560, 3584]:\n        predictions[:, offset:offset+512] = 1.0\n        targets[:, offset:offset+512] = 1.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=7.291656e-02, mean_diff=7.291656e-02, ref_range=[5.9605e-08,5.9605e-08], mut_range=[7.2917e-02,7.2917e-02]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Structure input data so all non-zero values fall in indices processed by threads 128-255 (specifically indices 512-1023, 1536-2047, 2560-3071, 3584-4095). Set predictions=targets=1.0 for these indices, 0 elsewhere. If the race manifests, result will be 1.0; correct result is ~0.0. This creates a maximal ~1.0 difference.",
+    "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    # Threads 128-255 process indices: 512-1023, 1536-2047, 2560-3071, 3584-4095\n    # With ELEMENTS_PER_THREAD=4, thread t processes base + t*4 to base + t*4 + 3\n    # So threads 128-255 get indices 512-1023 in first chunk, etc.\n    # Put all meaningful data there\n    for offset in [512, 1536, 2560, 3584]:\n        predictions[:, offset:offset+512] = 1.0\n        targets[:, offset:offset+512] = 1.0\n    \n    return [predictions, targets]"
+  },
+  "elapsed_sec": 160.81
+}

@@ -1,0 +1,89 @@
+{
+  "mutant_id": "L1_P33__scale_modify__1",
+  "operator_name": "scale_modify",
+  "kernel_name": "L1_P33",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9271,
+        "completion_tokens": 3918,
+        "total_tokens": 13189,
+        "reasoning_tokens": 1686
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation in apply_batchnorm_kernel only executes when training=True. rsqrt(v+ε) vs (v+ε) differ unless v+ε=1. For v=0 (constant input): rsqrt(1e-5)≈316.23 vs 1e-5, a 31M× difference. Layer 2 equivalence suggests eval mode was used.",
+      "survival_reason": "The mutation is in the training code path (`apply_batchnorm_kernel`), which is only executed when `self.training=True`. Layer 2's 112 rounds of bitwise equivalence strongly indicates the test harness called `model.eval()` before testing, routing execution to `batchnorm2d_forward_inference_kernel` instead. In inference mode, the mutated code is never reached. However, if the model is tested in its default training mode, the mutation produces drastically different results for any input with variance ≠ 1-ε.",
+      "killable": true,
+      "kill_strategy": "Ensure model is in training mode (default state). Use constant-valued input to force variance=0, maximizing divergence between rsqrt(eps)≈316 and eps=1e-5. The scale factor difference is ~31 million, causing output differences far exceeding tolerance.",
+      "recommendations": "Test harnesses should explicitly test BOTH training and eval modes for nn.Module-based kernels, as code paths differ significantly. The mutation testing contract should clarify whether model.train() or model.eval() is used, as this affects which kernel code paths are exercised.",
+      "suggested_code": "def generate_inputs(device):\n    # Constant tensor: each channel has identical values -> variance = 0\n    # Original: inv_std = rsqrt(0 + 1e-5) ≈ 316.23\n    # Mutant:   inv_std = 0 + 1e-5 = 0.00001\n    # Difference factor: ~31,623,000x\n    x = torch.full((16, 64, 256, 256), 5.0, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9171,
+        "completion_tokens": 5928,
+        "total_tokens": 15099,
+        "reasoning_tokens": 2579
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With variance v=100: original_scale = 1/sqrt(100) = 0.1, mutant_scale = 100. For typical element x=5 (after scaling), diff = |5*0.1 - 5*100| = 499.5. Tolerance = 0.01 + 0.01*0.5 = 0.015. Error >> tolerance.",
+      "survival_reason": "Previous constant input failed because (x - mean) = 0 for all elements, making scale irrelevant (output = beta = 0 for both). Standard random testing survived because variance ≈ 1, where rsqrt(1) ≈ 1 ≈ 1 + eps. High-variance input creates massive scale divergence (0.1 vs 100) AND has non-zero (x - mean) terms, allowing the scale difference to propagate to output.",
+      "killable": true,
+      "kill_strategy": "Use high-variance random input (scale standard normal by 10) to create variance ≈ 100 per channel. This produces scale factors of 0.1 (original) vs 100 (mutant), a 1000x difference that propagates through non-constant element values.",
+      "recommendations": "When testing BatchNorm-style kernels with variance-dependent scaling, always include inputs with variance significantly different from 1.0 (both high variance like 100 and low variance like 0.01), since standard random data has variance ≈ 1 which can mask mutations in rsqrt computations.",
+      "suggested_code": "def generate_inputs(device):\n    # Scale standard normal by 10 to get variance = 100\n    # Original: rsqrt(100 + eps) ≈ 0.1\n    # Mutant: 100 + eps ≈ 100\n    # Ratio: 1000x difference in scale factor\n    # Since x - mean != 0 for random data, this scale difference propagates\n    torch.manual_seed(42)\n    x = 10.0 * torch.randn(16, 64, 256, 256, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9437,
+        "completion_tokens": 4532,
+        "total_tokens": 13969,
+        "reasoning_tokens": 1898
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation is in `apply_batchnorm_kernel` which is ONLY called when `training=True`. For var=V: original scale = 1/sqrt(V+eps), mutant scale = V+eps. When V=1e6: original≈0.001, mutant≈1e6, ratio=1e9. For V=1: original≈1, mutant≈1 (equivalent). Previous tests with variance≈1 (standard normal) or variance≈100 survived because either: (1) the test harness runs in eval mode (bypassing mutated path), or (2) variance was still close enough to 1 for numerical tolerance to mask differences.",
+      "survival_reason": "Round 1 failed because constant inputs have zero deviation from mean, so (x-mean)*scale=0 regardless of scale. Round 2 with 10x scaling (var≈100) should have produced 1000x scale difference, yet survived—this indicates the training code path is likely NOT being executed (model in eval mode). The mutation at line 121 is in `apply_batchnorm_kernel`, called only in the training branch. The 112 rounds of bitwise-identical results with random data mathematically CANNOT occur if this path were exercised with variance≠1, as rsqrt(V)≠V except when V=1. My strategy is to use extreme variance (1e6) to definitively prove whether training path is active.",
+      "killable": false,
+      "kill_strategy": "The mutation requires training mode (self.training=True) to be executed. If the testing framework runs model.eval(), the mutated kernel (apply_batchnorm_kernel) is never called—instead batchnorm2d_forward_inference_kernel runs. Under value-only testing constraints, we cannot force training mode activation. If framework does use training mode, input with extreme variance (std=1000, var=1e6) will produce scale ratio of 1e9, trivially exceeding tolerance.",
+      "recommendations": "Mutation testing frameworks for dual-mode kernels (train/eval) should explicitly test BOTH modes. The testing harness should verify that model.training matches the expected path for mutations in mode-specific code branches, or flag such mutations as requiring multi-mode coverage.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 245.6
+}

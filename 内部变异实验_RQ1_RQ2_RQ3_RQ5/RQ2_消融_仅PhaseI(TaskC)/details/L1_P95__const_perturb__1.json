@@ -1,0 +1,89 @@
+{
+  "mutant_id": "L1_P95__const_perturb__1",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P95",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4660,
+        "completion_tokens": 5013,
+        "total_tokens": 9673,
+        "reasoning_tokens": 1805
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "reduce_threads=256 means tid ∈ [0,255]. shared[255] is mutated to size 255, making valid indices [0,254]. When tid=255, shared[tid]=val writes out-of-bounds. During reduction, stride=128 causes shared[127+128]=shared[255] to read garbage, corrupting each block's sum.",
+      "survival_reason": "The mutation reduces shared memory array from 256 to 255 elements, but the kernel launches 256 threads per block. Thread 255 writes to shared[255] which is out-of-bounds, and during block reduction, thread 127 reads from shared[255] (garbage memory). This corrupts each of the 16 blocks' partial sums, causing incorrect final loss computation. The undefined memory access affects every block since batch_size=4096 requires exactly 16 full blocks of 256 threads.",
+      "killable": true,
+      "kill_strategy": "Use any input that produces non-zero losses. The undefined behavior from reading garbage memory at shared[255] in each of the 16 blocks will corrupt the reduction. Simple uniform logits ensure predictable expected loss while the mutant produces garbage-corrupted results.",
+      "recommendations": "Shared memory array sizes should be parameterized based on launch configuration (e.g., `__shared__ T shared[THREADS_PER_BLOCK]` with compile-time constant) to prevent mismatch between allocation size and thread count. Consider adding bounds-checking in debug builds.",
+      "suggested_code": "def generate_inputs(device):\n    # Uniform logits -> loss = log(10) ≈ 2.3 per sample\n    # All 16 blocks will have corrupted reductions due to shared[255] OOB access\n    logits = torch.zeros(4096, 10, dtype=torch.float32, device=device)\n    targets = torch.zeros(4096, dtype=torch.int64, device=device)\n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4528,
+        "completion_tokens": 5190,
+        "total_tokens": 9718,
+        "reasoning_tokens": 2201
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes shared[256] to shared[255], causing thread 255 to access shared[255] which is OOB (valid indices 0-254). However, CUDA shared memory is typically allocated in aligned chunks (e.g., 1KB boundaries), so the OOB access at index 255 falls within the allocated memory region and the write/read pair is self-consistent. With tolerances atol=0.01, rtol=0.01, for mean loss ~2.3, tolerance = 0.01 + 0.01*2.3 = 0.033. The OOB access doesn't corrupt the value enough to exceed this.",
+      "survival_reason": "The previous attempt with uniform zeros produced loss ~log(10)≈2.3 per sample. Thread 255 in each block wrote to shared[255] (OOB in mutant) and the reduction read from the same location. Since CUDA allocates shared memory in padded chunks, the OOB access happens to work correctly - the same value is written and read back. The uniform values didn't stress the system enough to expose any race conditions or memory conflicts. A new approach focusing on extreme value differences for thread 255 positions might expose any subtle corruption from the OOB access, particularly if the memory location is not properly isolated.",
+      "killable": true,
+      "kill_strategy": "Create extreme value disparity between samples processed by thread 255 (indices 255, 511, 767, 1023, 1279, 1535, 1791, 2047, 2303, 2559, 2815, 3071, 3327, 3583, 3839, 4095) and all other samples. If the OOB shared memory location has any corruption, interference, or uninitialized garbage, the extreme magnitude difference (~1000x) will amplify the error beyond tolerance thresholds.",
+      "recommendations": "When mutation testing shared memory bounds, include tests where data at boundary indices (last valid index + 1) carries significantly different magnitudes than other data, as subtle OOB corruptions are often masked when all values are similar.",
+      "suggested_code": "def generate_inputs(device):\n    logits = torch.zeros(4096, 10, dtype=torch.float32, device=device)\n    targets = torch.zeros(4096, dtype=torch.int64, device=device)\n    \n    # Default: all samples have very low loss (target logit high)\n    logits[:, 0] = 50.0  # Target class = 0 has high logit\n    logits[:, 1:] = 0.0   # Other classes neutral\n    \n    # Thread 255 in each of 16 blocks processes these specific indices\n    # Make these have VERY HIGH loss to maximize corruption impact\n    thread_255_indices = [255 + b * 256 for b in range(16)]\n    for idx in thread_255_indices:\n        logits[idx, 0] = -500.0   # Target class has very low logit\n        logits[idx, 1:] = 0.0     # Other classes neutral\n        # Loss for these samples ≈ 500 + log(1 + 9) ≈ 502\n    \n    # Expected mean ≈ (16 * 502 + 4080 * ~0) / 4096 ≈ 1.96\n    # Any corruption at shared[255] would cause significant deviation\n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5028,
+        "completion_tokens": 3641,
+        "total_tokens": 8669,
+        "reasoning_tokens": 1530
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes `__shared__ T shared[256]` to `__shared__ T shared[255]`. Thread 255 writes to shared[255] (OOB) and thread 127 reads shared[255] during reduction. However, CUDA shared memory allocation typically rounds up for alignment - a 255-float array (1020 bytes) is likely padded to 1024 bytes (256 floats). The OOB access at shared[255] accesses this padding, making the mutation functionally equivalent.",
+      "survival_reason": "Previous attempts failed because the CUDA shared memory allocator likely pads the 255-element array to 256 elements (1024-byte alignment). Thread 255's write to shared[255] and thread 127's read from shared[255] both access valid padded memory. Round 1 used uniform values which couldn't detect subtle differences. Round 2 used extreme values at thread 255 indices, but since the OOB access hits valid padding, the values are correctly stored and retrieved. The mutation produces identical results because the underlying memory access pattern is unchanged.",
+      "killable": false,
+      "kill_strategy": "This mutation is likely unkillable through value changes alone. The undefined behavior (OOB shared memory access) is made safe by CUDA's memory alignment/padding, making shared[255] accessible even though only 255 elements were declared. To kill this mutant would require either: (1) a configuration where shared memory isn't padded, (2) running with memory sanitizers enabled, or (3) changing batch size to trigger different thread configurations.",
+      "recommendations": "When writing CUDA kernels, always ensure shared memory array sizes exactly match the number of threads that will access them. Even if the code appears to work due to memory alignment, this constitutes undefined behavior that could fail on different GPU architectures, driver versions, or compiler optimizations. Add runtime assertions or static_asserts to verify shared memory sizing matches thread count.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 293.52
+}

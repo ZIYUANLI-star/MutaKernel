@@ -1,0 +1,496 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a reverse cumulative sum operation along a specified dimension.
+
+    Parameters:
+        dim (int): The dimension along which to perform the reverse cumulative sum.
+    """
+
+    def __init__(self, dim):
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        return torch.cumsum(x.flip(self.dim), dim=self.dim).flip(self.dim)
+
+batch_size = 128
+input_shape = (4000,)
+dim = 1
+
+def get_inputs():
+    return [torch.randn(batch_size, *input_shape)]
+
+def get_init_inputs():
+    return [dim]
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized reverse cumulative sum
+reverse_cumsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void reverse_cumsum_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    // Each thread handles one inner element across the entire dimension
+    const int64_t outer_idx = blockIdx.y;
+    const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+    
+    const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+    
+    // Direct computation without shared memory overhead
+    scalar_t sum = 0;
+    
+    // Process in reverse order for cumulative sum
+    for (int64_t dim_idx = dim_size - 1; dim_idx >= 0; --dim_idx) {
+        const int64_t input_offset = base_offset + dim_idx * inner_size;
+        sum += input[input_offset];
+        output[input_offset] = sum;
+    }
+}
+
+template<typename scalar_t>
+__global__ void reverse_cumsum_kernel_unrolled(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    const int64_t outer_idx = blockIdx.y;
+    const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+    
+    const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+    
+    scalar_t sum = 0;
+    int64_t dim_idx = dim_size - 1;
+    
+    // Unroll by 4 for better instruction-level parallelism
+    for (; dim_idx >= 3; dim_idx -= 4) {
+        const int64_t offset0 = base_offset + dim_idx * inner_size;
+        const int64_t offset1 = base_offset + (dim_idx - 1) * inner_size;
+        const int64_t offset2 = base_offset + (dim_idx - 2) * inner_size;
+        const int64_t offset3 = base_offset + (dim_idx - 3) * inner_size;
+        
+        const scalar_t val0 = input[offset0];
+        const scalar_t val1 = input[offset1];
+        const scalar_t val2 = input[offset2];
+        const scalar_t val3 = input[offset3];
+        
+        sum += val0;
+        output[offset0] = sum;
+        
+        sum += val1;
+        output[offset1] = sum;
+        
+        sum += val2;
+        output[offset2] = sum;
+        
+        sum += val3;
+        output[offset3] = sum;
+    }
+    
+    // Handle remaining elements
+    for (; dim_idx >= 0; --dim_idx) {
+        const int64_t offset = base_offset + dim_idx * inner_size;
+        sum += input[offset];
+        output[offset] = sum;
+    }
+}
+
+torch::Tensor reverse_cumsum_cuda_optimized(torch::Tensor input, int64_t dim) {
+    auto input_contiguous = input.contiguous();
+    auto output = torch::empty_like(input_contiguous);
+    
+    const int64_t ndim = input_contiguous.dim();
+    dim = dim < 0 ? ndim + dim : dim;
+    
+    // Calculate sizes
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= input_contiguous.size(i);
+    }
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) {
+        inner_size *= input_contiguous.size(i);
+    }
+    
+    const int64_t dim_size = input_contiguous.size(dim);
+    
+    // Configure kernel launch
+    const int block_size = 256;
+    const int grid_x = (inner_size + block_size - 1) / block_size;
+    const dim3 grid(grid_x, outer_size);
+    
+    AT_DISPATCH_FLOATING_TYPES(
+        input_contiguous.scalar_type(),
+        "reverse_cumsum_cuda_optimized",
+        ([&] {
+            if (dim_size >= 32) {
+                // Use unrolled kernel for better performance
+                reverse_cumsum_kernel_unrolled<scalar_t><<<grid, block_size>>>(
+                    input_contiguous.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    outer_size,
+                    dim_size,
+                    inner_size
+                );
+            } else {
+                // Use simple kernel for small dimensions
+                reverse_cumsum_kernel<scalar_t><<<grid, block_size>>>(
+                    input_contiguous.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    outer_size,
+                    dim_size,
+                    inner_size
+                );
+            }
+        })
+    );
+    
+    return output;
+}
+"""
+
+reverse_cumsum_cpp_source = """
+torch::Tensor reverse_cumsum_cuda_optimized(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+reverse_cumsum_module = load_inline(
+    name="reverse_cumsum_optimized",
+    cpp_sources=reverse_cumsum_cpp_source,
+    cuda_sources=reverse_cumsum_source,
+    functions=["reverse_cumsum_cuda_optimized"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a reverse cumulative sum operation 
+    using a streamlined custom CUDA kernel.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the reverse cumulative sum.
+    """
+
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.reverse_cumsum = reverse_cumsum_module
+
+    def forward(self, x):
+        # Use optimized CUDA kernel
+        return self.reverse_cumsum.reverse_cumsum_cuda_optimized(x, self.dim)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 116)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=mixed_extremes, seed=42, mode=eval_value:
+      max_diff=1.500000e+00, mean_diff=1.202042e-01, ref_range=[-1.0836e+06,1.2844e+06], orig_range=[-1.0836e+06,1.2844e+06]
+[2] policy=mixed_extremes, seed=43, mode=eval_value:
+      max_diff=1.500000e+00, mean_diff=1.335102e-01, ref_range=[-1.2894e+06,1.4039e+06], orig_range=[-1.2894e+06,1.4039e+06]
+[3] policy=mixed_extremes, seed=44, mode=eval_value:
+      max_diff=1.187500e+00, mean_diff=1.369423e-01, ref_range=[-1.0886e+06,1.2855e+06], orig_range=[-1.0886e+06,1.2855e+06]
+[4] policy=mixed_extremes, seed=45, mode=eval_value:
+      max_diff=1.750000e+00, mean_diff=1.325047e-01, ref_range=[-1.3432e+06,1.2481e+06], orig_range=[-1.3432e+06,1.2481e+06]
+[5] policy=mixed_extremes, seed=46, mode=eval_value:
+      max_diff=1.062500e+00, mean_diff=1.275298e-01, ref_range=[-1.1250e+06,1.0937e+06], orig_range=[-1.1250e+06,1.0937e+06]
+[6] policy=near_overflow, seed=52, mode=eval_value:
+      max_diff=4.255419e+26, mean_diff=2.662099e+25, ref_range=[-2.0975e+32,1.8874e+32], orig_range=[-2.0975e+32,1.8874e+32]
+[7] policy=near_overflow, seed=53, mode=eval_value:
+      max_diff=3.288278e+26, mean_diff=2.443153e+25, ref_range=[-1.9863e+32,1.4673e+32], orig_range=[-1.9863e+32,1.4673e+32]
+[8] policy=near_overflow, seed=54, mode=eval_value:
+      max_diff=3.675134e+26, mean_diff=2.711657e+25, ref_range=[-2.0797e+32,1.7868e+32], orig_range=[-2.0797e+32,1.7868e+32]
+[9] policy=near_overflow, seed=55, mode=eval_value:
+      max_diff=4.158705e+26, mean_diff=2.365497e+25, ref_range=[-1.6116e+32,1.7244e+32], orig_range=[-1.6116e+32,1.7244e+32]
+[10] policy=near_overflow, seed=56, mode=eval_value:
+      max_diff=2.224424e+26, mean_diff=2.660606e+25, ref_range=[-1.8936e+32,1.7348e+32], orig_range=[-1.8936e+32,1.7348e+32]
+[11] policy=head_heavy, seed=82, mode=eval_value:
+      max_diff=1.687500e+00, mean_diff=6.834259e-02, ref_range=[-1.1114e+06,1.7021e+06], orig_range=[-1.1114e+06,1.7021e+06]
+[12] policy=head_heavy, seed=83, mode=eval_value:
+      max_diff=2.125000e+00, mean_diff=6.152599e-02, ref_range=[-1.1610e+06,1.1488e+06], orig_range=[-1.1610e+06,1.1488e+06]
+[13] policy=head_heavy, seed=84, mode=eval_value:
+      max_diff=2.750000e+00, mean_diff=6.761929e-02, ref_range=[-1.3360e+06,1.4558e+06], orig_range=[-1.3360e+06,1.4558e+06]
+[14] policy=head_heavy, seed=85, mode=eval_value:
+      max_diff=2.375000e+00, mean_diff=5.102307e-02, ref_range=[-1.6009e+06,1.0183e+06], orig_range=[-1.6009e+06,1.0183e+06]
+[15] policy=head_heavy, seed=86, mode=eval_value:
+      max_diff=3.187500e+00, mean_diff=7.203694e-02, ref_range=[-1.3165e+06,1.3657e+06], orig_range=[-1.3165e+06,1.3657e+06]
+[16] policy=tail_heavy, seed=87, mode=eval_value:
+      max_diff=2.250000e+00, mean_diff=6.765674e-02, ref_range=[-1.5426e+06,1.6121e+06], orig_range=[-1.5426e+06,1.6121e+06]
+[17] policy=tail_heavy, seed=88, mode=eval_value:
+      max_diff=2.500000e+00, mean_diff=6.277864e-02, ref_range=[-1.4340e+06,1.6462e+06], orig_range=[-1.4340e+06,1.6462e+06]
+[18] policy=tail_heavy, seed=89, mode=eval_value:
+      max_diff=2.875000e+00, mean_diff=5.055376e-02, ref_range=[-2.2526e+06,1.5257e+06], orig_range=[-2.2527e+06,1.5257e+06]
+[19] policy=tail_heavy, seed=90, mode=eval_value:
+      max_diff=2.750000e+00, mean_diff=7.433219e-02, ref_range=[-1.6949e+06,1.6389e+06], orig_range=[-1.6949e+06,1.6389e+06]
+[20] policy=tail_heavy, seed=91, mode=eval_value:
+      max_diff=2.375000e+00, mean_diff=6.547329e-02, ref_range=[-1.8835e+06,1.3145e+06], orig_range=[-1.8835e+06,1.3145e+06]
+[21] policy=large_magnitude, seed=42, mode=eval_value:
+      max_diff=3.203125e-01, mean_diff=2.751804e-02, ref_range=[-1.6535e+05,1.4603e+05], orig_range=[-1.6535e+05,1.4603e+05]
+[22] policy=large_magnitude, seed=43, mode=eval_value:
+      max_diff=3.281250e-01, mean_diff=2.519231e-02, ref_range=[-1.5824e+05,1.9214e+05], orig_range=[-1.5824e+05,1.9214e+05]
+[23] policy=large_magnitude, seed=44, mode=eval_value:
+      max_diff=2.812500e-01, mean_diff=2.691318e-02, ref_range=[-1.6689e+05,1.8606e+05], orig_range=[-1.6689e+05,1.8606e+05]
+[24] policy=mixed_extremes, seed=47, mode=eval_value:
+      max_diff=2.375000e+00, mean_diff=1.199145e-01, ref_range=[-1.2463e+06,1.2153e+06], orig_range=[-1.2463e+06,1.2153e+06]
+[25] policy=near_overflow, seed=51, mode=eval_value:
+      max_diff=2.127709e+26, mean_diff=2.319631e+25, ref_range=[-1.8233e+32,2.1835e+32], orig_range=[-1.8233e+32,2.1835e+32]
+[26] policy=head_heavy, seed=81, mode=eval_value:
+      max_diff=4.000000e+00, mean_diff=5.899606e-02, ref_range=[-1.2993e+06,2.0750e+06], orig_range=[-1.2993e+06,2.0750e+06]
+[27] policy=tail_heavy, seed=84, mode=eval_value:
+      max_diff=2.750000e+00, mean_diff=6.761930e-02, ref_range=[-1.3360e+06,1.4558e+06], orig_range=[-1.3360e+06,1.4558e+06]
+[28] policy=tail_heavy, seed=85, mode=eval_value:
+      max_diff=2.375000e+00, mean_diff=5.102306e-02, ref_range=[-1.6009e+06,1.0183e+06], orig_range=[-1.6009e+06,1.0183e+06]
+[29] policy=tail_heavy, seed=86, mode=eval_value:
+      max_diff=3.187500e+00, mean_diff=7.203694e-02, ref_range=[-1.3165e+06,1.3657e+06], orig_range=[-1.3165e+06,1.3657e+06]
+[30] policy=extreme_magnitude, seed=90, mode=eval_value:
+      max_diff=4.960000e+02, mean_diff=2.541418e+01, ref_range=[-1.8371e+08,1.8912e+08], orig_range=[-1.8371e+08,1.8912e+08]
+[31] policy=extreme_magnitude, seed=91, mode=eval_value:
+      max_diff=4.640000e+02, mean_diff=2.626205e+01, ref_range=[-1.9786e+08,2.4512e+08], orig_range=[-1.9786e+08,2.4512e+08]
+[32] policy=extreme_magnitude, seed=92, mode=eval_value:
+      max_diff=2.880000e+02, mean_diff=2.623646e+01, ref_range=[-1.7645e+08,2.0323e+08], orig_range=[-1.7645e+08,2.0323e+08]
+[33] policy=near_overflow, seed=42, mode=eval_value:
+      max_diff=3.336635e+26, mean_diff=2.699023e+25, ref_range=[-1.6535e+32,1.4603e+32], orig_range=[-1.6535e+32,1.4603e+32]
+[34] policy=near_overflow, seed=43, mode=eval_value:
+      max_diff=3.094850e+26, mean_diff=2.561410e+25, ref_range=[-1.5824e+32,1.9214e+32], orig_range=[-1.5824e+32,1.9214e+32]
+[35] policy=near_overflow, seed=44, mode=eval_value:
+      max_diff=2.707994e+26, mean_diff=2.654824e+25, ref_range=[-1.6689e+32,1.8606e+32], orig_range=[-1.6689e+32,1.8606e+32]
+[36] policy=near_overflow, seed=45, mode=eval_value:
+      max_diff=3.868563e+26, mean_diff=2.633697e+25, ref_range=[-2.1548e+32,1.9559e+32], orig_range=[-2.1548e+32,1.9559e+32]
+[37] policy=near_overflow, seed=46, mode=eval_value:
+      max_diff=3.191564e+26, mean_diff=2.388531e+25, ref_range=[-1.6617e+32,1.6714e+32], orig_range=[-1.6617e+32,1.6714e+32]
+[38] policy=mixed_extremes, seed=57, mode=eval_value:
+      max_diff=1.687500e+00, mean_diff=1.331683e-01, ref_range=[-1.5117e+06,9.9129e+05], orig_range=[-1.5117e+06,9.9129e+05]
+[39] policy=mixed_extremes, seed=58, mode=eval_value:
+      max_diff=1.437500e+00, mean_diff=1.323811e-01, ref_range=[-1.5382e+06,1.4650e+06], orig_range=[-1.5382e+06,1.4650e+06]
+[40] policy=mixed_extremes, seed=59, mode=eval_value:
+      max_diff=1.875000e+00, mean_diff=1.297363e-01, ref_range=[-1.1999e+06,1.4570e+06], orig_range=[-1.1999e+06,1.4570e+06]
+[41] policy=mixed_extremes, seed=60, mode=eval_value:
+      max_diff=1.328125e+00, mean_diff=1.279471e-01, ref_range=[-1.2552e+06,1.3376e+06], orig_range=[-1.2552e+06,1.3376e+06]
+[42] policy=mixed_extremes, seed=61, mode=eval_value:
+      max_diff=1.625000e+00, mean_diff=1.475995e-01, ref_range=[-1.4506e+06,1.3698e+06], orig_range=[-1.4506e+06,1.3698e+06]
+[43] policy=head_heavy, seed=72, mode=eval_value:
+      max_diff=2.500000e+00, mean_diff=5.739022e-02, ref_range=[-1.5987e+06,1.6277e+06], orig_range=[-1.5987e+06,1.6277e+06]
+[44] policy=head_heavy, seed=74, mode=eval_value:
+      max_diff=2.500000e+00, mean_diff=5.940429e-02, ref_range=[-1.6555e+06,1.3185e+06], orig_range=[-1.6555e+06,1.3185e+06]
+[45] policy=head_heavy, seed=75, mode=eval_value:
+      max_diff=1.625000e+00, mean_diff=6.341013e-02, ref_range=[-1.1200e+06,1.3164e+06], orig_range=[-1.1200e+06,1.3164e+06]
+[46] policy=head_heavy, seed=76, mode=eval_value:
+      max_diff=2.375000e+00, mean_diff=5.869922e-02, ref_range=[-1.3355e+06,1.9525e+06], orig_range=[-1.3355e+06,1.9525e+06]
+[47] policy=tail_heavy, seed=77, mode=eval_value:
+      max_diff=2.250000e+00, mean_diff=6.507170e-02, ref_range=[-1.2410e+06,1.5306e+06], orig_range=[-1.2410e+06,1.5306e+06]
+[48] policy=tail_heavy, seed=78, mode=eval_value:
+      max_diff=2.312500e+00, mean_diff=7.705114e-02, ref_range=[-1.3456e+06,1.0322e+06], orig_range=[-1.3456e+06,1.0322e+06]
+[49] policy=tail_heavy, seed=79, mode=eval_value:
+      max_diff=1.812500e+00, mean_diff=5.877573e-02, ref_range=[-1.2147e+06,1.2936e+06], orig_range=[-1.2147e+06,1.2936e+06]
+[50] policy=tail_heavy, seed=80, mode=eval_value:
+      max_diff=3.250000e+00, mean_diff=6.847068e-02, ref_range=[-1.4474e+06,1.5230e+06], orig_range=[-1.4474e+06,1.5230e+06]
+[51] policy=tail_heavy, seed=81, mode=eval_value:
+      max_diff=4.000000e+00, mean_diff=5.899606e-02, ref_range=[-1.2993e+06,2.0750e+06], orig_range=[-1.2993e+06,2.0750e+06]
+[52] policy=extreme_magnitude, seed=87, mode=eval_value:
+      max_diff=3.680000e+02, mean_diff=2.512353e+01, ref_range=[-1.7134e+08,1.5145e+08], orig_range=[-1.7134e+08,1.5145e+08]
+[53] policy=extreme_magnitude, seed=88, mode=eval_value:
+      max_diff=3.040000e+02, mean_diff=2.176485e+01, ref_range=[-1.9283e+08,2.0539e+08], orig_range=[-1.9283e+08,2.0539e+08]
+[54] policy=extreme_magnitude, seed=89, mode=eval_value:
+      max_diff=3.360000e+02, mean_diff=2.458223e+01, ref_range=[-1.3495e+08,1.7196e+08], orig_range=[-1.3495e+08,1.7196e+08]
+[55] policy=mixed_extremes, seed=67, mode=eval_value:
+      max_diff=2.625000e+00, mean_diff=1.342380e-01, ref_range=[-1.1967e+06,1.3317e+06], orig_range=[-1.1967e+06,1.3317e+06]
+[56] policy=mixed_extremes, seed=68, mode=eval_value:
+      max_diff=1.750000e+00, mean_diff=1.323968e-01, ref_range=[-1.3682e+06,1.5476e+06], orig_range=[-1.3682e+06,1.5476e+06]
+[57] policy=mixed_extremes, seed=69, mode=eval_value:
+      max_diff=2.125000e+00, mean_diff=1.346373e-01, ref_range=[-1.3116e+06,1.1845e+06], orig_range=[-1.3116e+06,1.1845e+06]
+[58] policy=mixed_extremes, seed=70, mode=eval_value:
+      max_diff=3.000000e+00, mean_diff=1.411759e-01, ref_range=[-1.3489e+06,1.5195e+06], orig_range=[-1.3489e+06,1.5195e+06]
+[59] policy=mixed_extremes, seed=71, mode=eval_value:
+      max_diff=1.375000e+00, mean_diff=1.406631e-01, ref_range=[-1.5112e+06,1.1590e+06], orig_range=[-1.5112e+06,1.1590e+06]
+[60] policy=extreme_magnitude, seed=69, mode=eval_value:
+      max_diff=3.200000e+02, mean_diff=2.399840e+01, ref_range=[-1.5686e+08,2.0638e+08], orig_range=[-1.5686e+08,2.0638e+08]
+[61] policy=extreme_magnitude, seed=70, mode=eval_value:
+      max_diff=3.080000e+02, mean_diff=2.517459e+01, ref_range=[-1.5284e+08,2.3153e+08], orig_range=[-1.5284e+08,2.3153e+08]
+[62] policy=extreme_magnitude, seed=71, mode=eval_value:
+      max_diff=4.320000e+02, mean_diff=2.625245e+01, ref_range=[-1.7702e+08,2.3861e+08], orig_range=[-1.7702e+08,2.3861e+08]
+[63] policy=near_overflow, seed=47, mode=eval_value:
+      max_diff=2.901422e+26, mean_diff=2.497728e+25, ref_range=[-1.7464e+32,1.5830e+32], orig_range=[-1.7464e+32,1.5830e+32]
+[64] policy=near_overflow, seed=48, mode=eval_value:
+      max_diff=4.545561e+26, mean_diff=2.887049e+25, ref_range=[-1.5351e+32,1.6934e+32], orig_range=[-1.5351e+32,1.6934e+32]
+[65] policy=near_overflow, seed=49, mode=eval_value:
+      max_diff=2.514566e+26, mean_diff=2.431504e+25, ref_range=[-1.7567e+32,1.6921e+32], orig_range=[-1.7567e+32,1.6921e+32]
+[66] policy=near_overflow, seed=50, mode=eval_value:
+      max_diff=2.707994e+26, mean_diff=2.818042e+25, ref_range=[-1.8513e+32,1.8179e+32], orig_range=[-1.8513e+32,1.8179e+32]
+[67] policy=mixed_extremes, seed=72, mode=eval_value:
+      max_diff=1.062500e+00, mean_diff=1.346905e-01, ref_range=[-1.3539e+06,9.3422e+05], orig_range=[-1.3539e+06,9.3423e+05]
+[68] policy=mixed_extremes, seed=73, mode=eval_value:
+      max_diff=1.812500e+00, mean_diff=1.396359e-01, ref_range=[-1.4440e+06,1.3440e+06], orig_range=[-1.4440e+06,1.3440e+06]
+[69] policy=mixed_extremes, seed=74, mode=eval_value:
+      max_diff=1.750000e+00, mean_diff=1.323845e-01, ref_range=[-1.2287e+06,1.1448e+06], orig_range=[-1.2287e+06,1.1448e+06]
+[70] policy=mixed_extremes, seed=76, mode=eval_value:
+      max_diff=1.500000e+00, mean_diff=1.194858e-01, ref_range=[-1.2009e+06,1.4571e+06], orig_range=[-1.2009e+06,1.4571e+06]
+[71] policy=extreme_magnitude, seed=93, mode=eval_value:
+      max_diff=2.640000e+02, mean_diff=2.738021e+01, ref_range=[-1.7262e+08,1.6596e+08], orig_range=[-1.7262e+08,1.6596e+08]
+[72] policy=extreme_magnitude, seed=94, mode=eval_value:
+      max_diff=3.040000e+02, mean_diff=2.433084e+01, ref_range=[-1.8668e+08,1.7091e+08], orig_range=[-1.8668e+08,1.7091e+08]
+[73] policy=extreme_magnitude, seed=95, mode=eval_value:
+      max_diff=4.160000e+02, mean_diff=2.397759e+01, ref_range=[-2.0356e+08,1.9923e+08], orig_range=[-2.0356e+08,1.9923e+08]
+[74] policy=extreme_magnitude, seed=96, mode=eval_value:
+      max_diff=3.920000e+02, mean_diff=2.791393e+01, ref_range=[-2.3051e+08,1.6031e+08], orig_range=[-2.3051e+08,1.6031e+08]
+[75] policy=mixed_extremes, seed=62, mode=eval_value:
+      max_diff=2.125000e+00, mean_diff=1.436469e-01, ref_range=[-1.3281e+06,1.4858e+06], orig_range=[-1.3281e+06,1.4858e+06]
+[76] policy=extreme_magnitude, seed=72, mode=eval_value:
+      max_diff=3.040000e+02, mean_diff=2.918826e+01, ref_range=[-2.6466e+08,2.1407e+08], orig_range=[-2.6466e+08,2.1407e+08]
+[77] policy=extreme_magnitude, seed=73, mode=eval_value:
+      max_diff=3.360000e+02, mean_diff=2.471872e+01, ref_range=[-1.8347e+08,1.8865e+08], orig_range=[-1.8347e+08,1.8865e+08]
+[78] policy=extreme_magnitude, seed=74, mode=eval_value:
+      max_diff=3.680000e+02, mean_diff=2.446135e+01, ref_range=[-1.6674e+08,1.7080e+08], orig_range=[-1.6674e+08,1.7080e+08]
+[79] policy=head_heavy, seed=66, mode=eval_value:
+      max_diff=2.500000e+00, mean_diff=6.246091e-02, ref_range=[-1.0739e+06,1.6935e+06], orig_range=[-1.0739e+06,1.6935e+06]
+[80] policy=head_heavy, seed=67, mode=eval_value:
+      max_diff=3.375000e+00, mean_diff=7.562952e-02, ref_range=[-1.2072e+06,2.0953e+06], orig_range=[-1.2072e+06,2.0953e+06]
+[81] policy=head_heavy, seed=68, mode=eval_value:
+      max_diff=1.625000e+00, mean_diff=5.801119e-02, ref_range=[-1.4902e+06,1.6488e+06], orig_range=[-1.4902e+06,1.6488e+06]
+[82] policy=tail_heavy, seed=69, mode=eval_value:
+      max_diff=1.875000e+00, mean_diff=4.846592e-02, ref_range=[-1.4132e+06,1.0119e+06], orig_range=[-1.4132e+06,1.0119e+06]
+[83] policy=tail_heavy, seed=70, mode=eval_value:
+      max_diff=2.437500e+00, mean_diff=5.655697e-02, ref_range=[-1.4881e+06,1.9701e+06], orig_range=[-1.4881e+06,1.9701e+06]
+[84] policy=tail_heavy, seed=71, mode=eval_value:
+      max_diff=2.312500e+00, mean_diff=8.685112e-02, ref_range=[-1.0895e+06,1.4673e+06], orig_range=[-1.0895e+06,1.4673e+06]
+[85] policy=large_magnitude, seed=342, mode=train_value:
+      max_diff=4.375000e-01, mean_diff=2.636529e-02, ref_range=[-2.1684e+05,1.8316e+05], orig_range=[-2.1684e+05,1.8316e+05]
+[86] policy=large_magnitude, seed=343, mode=train_value:
+      max_diff=4.062500e-01, mean_diff=2.813470e-02, ref_range=[-2.1060e+05,1.9895e+05], orig_range=[-2.1060e+05,1.9895e+05]
+[87] policy=large_magnitude, seed=344, mode=train_value:
+      max_diff=2.734375e-01, mean_diff=2.424685e-02, ref_range=[-1.5126e+05,2.0278e+05], orig_range=[-1.5126e+05,2.0278e+05]
+[88] policy=mixed_extremes, seed=345, mode=train_value:
+      max_diff=1.875000e+00, mean_diff=1.248838e-01, ref_range=[-1.4246e+06,1.1720e+06], orig_range=[-1.4246e+06,1.1720e+06]
+[89] policy=mixed_extremes, seed=346, mode=train_value:
+      max_diff=1.625000e+00, mean_diff=1.437708e-01, ref_range=[-1.0453e+06,1.2564e+06], orig_range=[-1.0453e+06,1.2564e+06]
+[90] policy=mixed_extremes, seed=347, mode=train_value:
+      max_diff=1.000000e+00, mean_diff=1.207212e-01, ref_range=[-1.2718e+06,1.4433e+06], orig_range=[-1.2718e+06,1.4433e+06]
+[91] policy=near_overflow, seed=351, mode=train_value:
+      max_diff=3.191564e+26, mean_diff=2.414123e+25, ref_range=[-2.1369e+32,1.8769e+32], orig_range=[-2.1369e+32,1.8769e+32]
+[92] policy=near_overflow, seed=352, mode=train_value:
+      max_diff=4.255419e+26, mean_diff=3.027354e+25, ref_range=[-1.9381e+32,1.5009e+32], orig_range=[-1.9381e+32,1.5009e+32]
+[93] policy=near_overflow, seed=353, mode=train_value:
+      max_diff=4.158705e+26, mean_diff=2.604371e+25, ref_range=[-2.0346e+32,1.7610e+32], orig_range=[-2.0346e+32,1.7610e+32]
+[94] policy=head_heavy, seed=381, mode=train_value:
+      max_diff=2.375000e+00, mean_diff=5.809784e-02, ref_range=[-1.1004e+06,1.1396e+06], orig_range=[-1.1004e+06,1.1396e+06]
+[95] policy=tail_heavy, seed=384, mode=train_value:
+      max_diff=1.625000e+00, mean_diff=5.779679e-02, ref_range=[-1.3656e+06,1.0943e+06], orig_range=[-1.3656e+06,1.0943e+06]
+[96] policy=tail_heavy, seed=385, mode=train_value:
+      max_diff=2.625000e+00, mean_diff=6.619441e-02, ref_range=[-1.0764e+06,1.6728e+06], orig_range=[-1.0764e+06,1.6728e+06]
+[97] policy=tail_heavy, seed=386, mode=train_value:
+      max_diff=2.625000e+00, mean_diff=5.933559e-02, ref_range=[-1.5037e+06,1.2981e+06], orig_range=[-1.5037e+06,1.2981e+06]
+[98] policy=extreme_magnitude, seed=390, mode=train_value:
+      max_diff=2.880000e+02, mean_diff=2.431331e+01, ref_range=[-1.6589e+08,1.6386e+08], orig_range=[-1.6589e+08,1.6386e+08]
+[99] policy=extreme_magnitude, seed=391, mode=train_value:
+      max_diff=3.200000e+02, mean_diff=2.634872e+01, ref_range=[-1.9399e+08,2.0413e+08], orig_range=[-1.9399e+08,2.0413e+08]
+[100] policy=extreme_magnitude, seed=392, mode=train_value:
+      max_diff=3.120000e+02, mean_diff=2.430653e+01, ref_range=[-1.4414e+08,1.4963e+08], orig_range=[-1.4414e+08,1.4963e+08]
+[101] policy=large_magnitude, seed=345, mode=train_value:
+      max_diff=4.531250e-01, mean_diff=2.895035e-02, ref_range=[-2.1044e+05,1.6560e+05], orig_range=[-2.1044e+05,1.6560e+05]
+[102] policy=large_magnitude, seed=346, mode=train_value:
+      max_diff=3.906250e-01, mean_diff=2.753812e-02, ref_range=[-1.9295e+05,1.4977e+05], orig_range=[-1.9295e+05,1.4977e+05]
+[103] policy=large_magnitude, seed=347, mode=train_value:
+      max_diff=2.460938e-01, mean_diff=2.479162e-02, ref_range=[-1.6501e+05,1.6542e+05], orig_range=[-1.6501e+05,1.6542e+05]
+[104] policy=near_overflow, seed=348, mode=train_value:
+      max_diff=3.384992e+26, mean_diff=2.370689e+25, ref_range=[-2.0024e+32,1.5566e+32], orig_range=[-2.0024e+32,1.5566e+32]
+[105] policy=near_overflow, seed=349, mode=train_value:
+      max_diff=4.061991e+26, mean_diff=2.593051e+25, ref_range=[-1.8581e+32,1.9436e+32], orig_range=[-1.8581e+32,1.9436e+32]
+[106] policy=near_overflow, seed=350, mode=train_value:
+      max_diff=2.417852e+26, mean_diff=2.493491e+25, ref_range=[-1.7539e+32,1.7779e+32], orig_range=[-1.7539e+32,1.7779e+32]
+[107] policy=mixed_extremes, seed=360, mode=train_value:
+      max_diff=1.187500e+00, mean_diff=1.256843e-01, ref_range=[-1.1149e+06,1.0658e+06], orig_range=[-1.1149e+06,1.0658e+06]
+[108] policy=mixed_extremes, seed=361, mode=train_value:
+      max_diff=2.562500e+00, mean_diff=1.449204e-01, ref_range=[-1.2337e+06,1.2302e+06], orig_range=[-1.2337e+06,1.2302e+06]
+[109] policy=mixed_extremes, seed=362, mode=train_value:
+      max_diff=1.343750e+00, mean_diff=1.284752e-01, ref_range=[-1.6782e+06,1.1327e+06], orig_range=[-1.6782e+06,1.1327e+06]
+[110] policy=head_heavy, seed=378, mode=train_value:
+      max_diff=3.312500e+00, mean_diff=6.010618e-02, ref_range=[-1.2455e+06,1.4617e+06], orig_range=[-1.2455e+06,1.4617e+06]
+[111] policy=head_heavy, seed=379, mode=train_value:
+      max_diff=2.375000e+00, mean_diff=7.335927e-02, ref_range=[-1.2313e+06,1.2301e+06], orig_range=[-1.2313e+06,1.2301e+06]
+[112] policy=head_heavy, seed=380, mode=train_value:
+      max_diff=2.062500e+00, mean_diff=6.771538e-02, ref_range=[-1.8683e+06,1.1029e+06], orig_range=[-1.8683e+06,1.1029e+06]
+[113] policy=tail_heavy, seed=381, mode=train_value:
+      max_diff=2.375000e+00, mean_diff=5.809785e-02, ref_range=[-1.1004e+06,1.1396e+06], orig_range=[-1.1004e+06,1.1396e+06]
+[114] policy=extreme_magnitude, seed=387, mode=train_value:
+      max_diff=4.000000e+02, mean_diff=2.529143e+01, ref_range=[-2.2608e+08,1.7161e+08], orig_range=[-2.2608e+08,1.7161e+08]
+[115] policy=extreme_magnitude, seed=388, mode=train_value:
+      max_diff=3.120000e+02, mean_diff=2.634988e+01, ref_range=[-1.7121e+08,1.7847e+08], orig_range=[-1.7121e+08,1.7847e+08]
+[116] policy=extreme_magnitude, seed=389, mode=train_value:
+      max_diff=3.520000e+02, mean_diff=2.706841e+01, ref_range=[-2.3391e+08,1.6799e+08], orig_range=[-2.3391e+08,1.6799e+08]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

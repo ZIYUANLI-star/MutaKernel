@@ -1,0 +1,343 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived:
+- EMD 4-layer equivalence detection (112 rounds)
+- Enhanced deterministic testing (4 dimensions, 75 rounds)
+- AND your previous suggested inputs (see below)
+
+Re-analyze with the failure information and try a fundamentally different approach.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+### Auxiliary configuration-stress track
+- Alternative batch sizes were tested separately (see below).
+- This does NOT redefine the main contract.
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Softsign activation
+softsign_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cmath>
+
+template<typename T>
+__global__ void softsign_kernel(const T* input, T* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        T val = input[idx];
+        output[idx] = val / (1.0f + fabsf(val));
+    }
+}
+
+template<>
+__global__ void softsign_kernel<half>(const half* input, half* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = __half2float(input[idx]);
+        output[idx] = __float2half(val / (1.0f + fabsf(val)));
+    }
+}
+
+torch::Tensor softsign_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+    
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "softsign_cuda", [&] {
+        softsign_kernel<scalar_t><<<num_blocks, block_size>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            size
+        );
+    });
+    
+    return output;
+}
+"""
+
+softsign_cpp_source = "torch::Tensor softsign_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code for Softsign
+softsign_module = load_inline(
+    name="softsign",
+    cpp_sources=softsign_cpp_source,
+    cuda_sources=softsign_source,
+    functions=["softsign_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softsign activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softsign_op = softsign_module
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softsign activation to the input tensor using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with Softsign applied, same shape as input.
+        """
+        # Only use custom kernel if tensor is on CUDA
+        if x.is_cuda:
+            return self.softsign_op.softsign_cuda(x)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return x / (1 + torch.abs(x))
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Softsign activation
+softsign_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cmath>
+
+template<typename T>
+__global__ void softsign_kernel(const T* input, T* output, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        T val = input[idx];
+        output[idx] = val / (1.0f + fabsf(val));
+    }
+}
+
+template<>
+__global__ void softsign_kernel<half>(const half* input, half* output, int size) {
+    int idx = blockIdx.x * blockDim.y + threadIdx.x;
+    if (idx < size) {
+        float val = __half2float(input[idx]);
+        output[idx] = __float2half(val / (1.0f + fabsf(val)));
+    }
+}
+
+torch::Tensor softsign_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+    
+    const int block_size = 256;
+    const int num_blocks = (size + block_size - 1) / block_size;
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "softsign_cuda", [&] {
+        softsign_kernel<scalar_t><<<num_blocks, block_size>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            size
+        );
+    });
+    
+    return output;
+}
+"""
+
+softsign_cpp_source = "torch::Tensor softsign_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code for Softsign
+softsign_module = load_inline(
+    name="softsign",
+    cpp_sources=softsign_cpp_source,
+    cuda_sources=softsign_source,
+    functions=["softsign_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softsign activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softsign_op = softsign_module
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softsign activation to the input tensor using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with Softsign applied, same shape as input.
+        """
+        # Only use custom kernel if tensor is on CUDA
+        if x.is_cuda:
+            return self.softsign_op.softsign_cuda(x)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return x / (1 + torch.abs(x))
+```
+
+## Mutation Details
+- Operator: index_replace — Swap thread/block dimension indices (x→y, y→z, etc.)
+- Location: line 23
+- Original fragment: `blockDim.x`
+- node_type: cuda_dim|y
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis may contain errors. Reason independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 23
+- Original fragment: `blockDim.x`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.515127182006836, 'mean': -0.0012394363293424249, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.131533622741699, 'max': 10000.0, 'mean': 0.0353255495429039, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes `blockDim.x` to `blockDim.y` on line 23 of the half-precision kernel. However, the kernel launch configuration uses a 1D grid and 1D block: `<<<num_blocks, block_size>>>` where `block_size` is 256. In CUDA, when a kernel is launched with a 1D block, `blockDim.y` is always 1. Therefore, `blockIdx.x * blockDim.y + threadIdx.x` is equivalent to `blockIdx.x * 1 + threadIdx.x`, which is the same as the original `blockIdx.x * blockDim.x + threadIdx.x` because `blockDim.x` is also 
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+### Value-Distribution Stress
+Tested 75 / 75 rounds. Result: ALL SURVIVED (bitwise identical)
+  - near_overflow seed=42: survived
+  - near_overflow seed=43: survived
+  - near_overflow seed=44: survived
+  - near_overflow seed=45: survived
+  - near_overflow seed=46: survived
+  - near_zero seed=47: survived
+  - near_zero seed=48: survived
+  - near_zero seed=49: survived
+  - near_zero seed=50: survived
+  - near_zero seed=51: survived
+  - denormals seed=52: survived
+  - denormals seed=53: survived
+  - denormals seed=54: survived
+  - denormals seed=55: survived
+  - denormals seed=56: survived
+  - all_negative seed=57: survived
+  - all_negative seed=58: survived
+  - all_negative seed=59: survived
+  - all_negative seed=60: survived
+  - all_negative seed=61: survived
+  - all_positive seed=62: survived
+  - all_positive seed=63: survived
+  - all_positive seed=64: survived
+  - all_positive seed=65: survived
+  - all_positive seed=66: survived
+  - mixed_extremes seed=67: survived
+  - mixed_extremes seed=68: survived
+  - mixed_extremes seed=69: survived
+  - mixed_extremes seed=70: survived
+  - mixed_extremes seed=71: survived
+### Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+### Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+### Training Mode
+SKIPPED: operator_not_applicable
+### Configuration-Stress Track
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Use torch.float16 dtype to trigger the mutated half-precision kernel specialization. With blockDim.y=1 instead of blockDim.x=256, the kernel only processes indices 0-1278, leaving 99.5% of output elements uninitialized. This causes massive numerical divergence from the reference implementation.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Use float16 to trigger the half-precision kernel with the mutation
+    # The mutation makes idx = blockIdx.x * 1 + threadIdx.x instead of blockIdx.x * 256 + threadIdx.x
+    # This only processes indices 0-1278, leaving indices 1279-262143 uninitialized
+    torch.manual_seed(999)
+    x = torch.randn(16, 16384, dtype=torch.float16, device=device)
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Reachability**: Derive concrete variable ranges from code constants.
+Do NOT claim a boundary case is reachable without deriving it.
+
+**Step 2 — Why previous attempts failed**: For each failed round, explain
+the specific mathematical reason it could not expose a difference.
+
+**Step 3 — Novel strategy or conclusion**: Either identify a fundamentally
+different value-level approach, or conclude unkillable with proof.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation or path argument>",
+  "survival_reason": "<updated analysis — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new VALUE-LEVEL strategy different from ALL previous, or why unkillable>",
+  "suggested_test": {
+    "description": "<what this NEW input tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... DIFFERENT from all previous>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same tensor count/shapes.
+- Shapes MUST EXACTLY MATCH Input Specification.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

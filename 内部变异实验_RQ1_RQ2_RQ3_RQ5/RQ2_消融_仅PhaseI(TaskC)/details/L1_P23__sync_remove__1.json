@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P23__sync_remove__1",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P23",
+  "phase1_status": "candidate_equivalent",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5666,
+        "completion_tokens": 3835,
+        "total_tokens": 9501,
+        "reasoning_tokens": 1496
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Removed __syncthreads() inside max reduction loop (s=128,64,32,16,8,4,2,1) creates inter-warp race. Thread 0 in warp 0 may read shared_max[64] at s=64 before thread 64 (warp 2) writes it at s=128. blockDim=256 means 8 warps requiring explicit synchronization. Race condition is non-deterministic.",
+      "survival_reason": "The mutation removes a __syncthreads() barrier inside the parallel max reduction loop. This creates a race condition between warps since thread t at iteration s needs values written by thread t+s at the previous iteration, and these threads may be in different warps. However, race conditions are timing-dependent: the GPU scheduler may happen to execute warps in the correct order, producing correct results despite the missing barrier. The EMD pipeline's 112 rounds of bitwise equivalence suggests the race doesn't manifest under typical conditions on the tested hardware, but it could theoretically fail on different hardware, different driver versions, or under different GPU load conditions.",
+      "killable": true,
+      "kill_strategy": "Place maximum values at positions processed by high-numbered threads (positions 255, 511, etc.) and extreme negative values elsewhere. If race causes wrong max computation, softmax will overflow/underflow producing dramatically different results. Run multiple times to increase probability of race manifestation.",
+      "recommendations": "When removing __syncthreads() barriers, test extensively across multiple GPU architectures and under varying system load. Race conditions may not manifest in controlled testing but appear in production. Consider using CUDA race detection tools like compute-sanitizer --tool racecheck.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape [16, 16384] - maximize race impact\n    # Thread tid processes positions: tid, tid+256, tid+512, ...\n    x = torch.full((16, 16384), -100.0, dtype=torch.float32, device=device)\n    \n    # Place max at positions processed by thread 255 (warp 7, last active warp)\n    # and thread 128 (warp 4, mid-point in reduction tree)\n    for row in range(16):\n        x[row, 255] = 100.0   # Thread 255 (warp 7)\n        x[row, 128] = 100.0   # Thread 128 (warp 4) - critical for s=128 iteration\n        x[row, 64] = 100.0    # Thread 64 (warp 2) - critical for s=64 iteration\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5652,
+        "completion_tokens": 5538,
+        "total_tokens": 11190,
+        "reasoning_tokens": 2484
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() inside the max reduction loop creates a race between warp 3 (thread 127 writes shared_max[127]) and warp 1 (thread 63 reads shared_max[127]). If s=64 iteration reads before s=128 write completes, the true max from position 255 won't propagate to shared_max[0]. With max at single position and -80 elsewhere, correct softmax[pos]≈1.0 vs uniform≈6e-5 gives error ~1.0 >> tolerance 0.02.",
+      "survival_reason": "The previous attempt placed max values at MULTIPLE positions (255, 128, 64). This redundancy meant that even if one propagation path failed due to race, another path might still deliver a high value to the reduction, producing similar-enough results. Additionally, positions 128 and 64 are read by threads in lower-numbered warps during earlier reduction stages, reducing cross-warp race exposure. The key insight is that the race specifically affects cross-warp memory visibility between consecutive reduction iterations (e.g., warp 3 writing at s=128, warp 1 reading at s=64). Using a SINGLE maximum at a position requiring full propagation through all 8 reduction iterations, combined with testing multiple critical thread positions across different batch rows, maximizes the probability of manifesting the race.",
+      "killable": true,
+      "kill_strategy": "Place a SINGLE extreme maximum value at positions that require cross-warp propagation (255, 191, 127, etc.) with all other values extremely negative (-80). Use different critical positions per row to test multiple reduction tree paths. The single-max pattern ensures no redundant paths can compensate for a failed propagation.",
+      "recommendations": "When testing GPU synchronization mutations, use single-point extreme values that require COMPLETE propagation through parallel reduction trees, rather than multiple extreme values that provide redundant paths. Test across multiple positions mapping to different cross-warp dependencies in the reduction algorithm.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((16, 16384), -80.0, dtype=torch.float32, device=device)\n    # Critical positions: each requires cross-warp communication in reduction\n    # Position 255: thread 127 (warp 3) -> thread 63 (warp 1)\n    # Position 127: thread 63 (warp 1) -> thread 31 (warp 0)\n    # Position 191: thread 63 reads shared_max[191] written by thread 191 (warp 5)\n    critical_positions = [\n        255,   # warp 7->3->1 dependency\n        191,   # warp 5->1 dependency  \n        127,   # warp 3->1->0 dependency\n        223,   # warp 6->3 dependency\n        159,   # warp 4->1 dependency\n        175,   # warp 5->1 dependency\n        239,   # warp 7->3 dependency\n        207,   # warp 6->2 dependency\n        143,   # warp 4->1 dependency\n        231,   # warp 7->3 dependency\n        183,   # warp 5->2 dependency\n        199,   # warp 6->2 dependency\n        247,   # warp 7->3 dependency\n        215,   # warp 6->2 dependency\n        167,   # warp 5->2 dependency\n        151    # warp 4->1 dependency\n    ]\n    for row in range(16):\n        x[row, critical_positions[row]] = 80.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6181,
+        "completion_tokens": 5073,
+        "total_tokens": 11254,
+        "reasoning_tokens": 2170
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The missing __syncthreads() inside the max reduction loop creates a potential cross-warp race. However, the softmax output is normalized (sums to 1.0), which masks most incorrect max computations. If wrong_max < true_max, all exp(x[i] - wrong_max) values scale by the same factor exp(true_max - wrong_max), and the normalization by sum cancels this factor. The output only changes when the wrong_max causes overflow/underflow before normalization, or when specific value distributions make relative differences exceed tolerance.",
+      "survival_reason": "Previous attempts placed extreme values (±80, ±100) at critical reduction positions, but softmax's normalization property masks the effect of wrong max computation. When max is computed incorrectly, ALL exponentials are scaled by the same factor (exp(correct_max - wrong_max)), and since softmax divides each exp by the total sum, this common factor cancels out. The only way to expose the bug is to create a scenario where: (1) the wrong max causes intermediate overflow/underflow that changes relative ratios, OR (2) values are in a narrow range where small max errors produce distinguishable relative differences before normalization. Previous tests used extreme values that either all overflow together or all underflow together, maintaining ratios.",
+      "killable": true,
+      "kill_strategy": "Use a narrow value range where all elements are close (near 0), but with the TRUE maximum at position 255 being just slightly higher (+0.5). If the race causes thread 0 to read stale data and miss this maximum, it uses a nearby value as max. The small difference (delta ~0.5) means exp values won't overflow, but the relative softmax probabilities will shift detectably. Add anti-correlated values at thread 0's position to ensure wrong max selection produces maximum divergence.",
+      "recommendations": "For parallel reduction kernels, mutation testing should verify with narrow-range floating-point values (all within ~1-2 orders of magnitude) where small errors in reduction produce detectable output differences, rather than extreme values where softmax normalization masks the bug.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((16, 16384), -0.5, dtype=torch.float32, device=device)\n    for row in range(16):\n        # Position 0: thread 0's local contribution - set to 0.0\n        x[row, 0] = 0.0\n        # Position 255: thread 255's contribution - true max at +0.5\n        # Requires FULL reduction chain (255->127->63->31->15->7->3->1->0)\n        x[row, 255] = 0.5\n        # Also add max at far positions to stress memory bandwidth\n        # These are processed by thread 255 in later iterations\n        x[row, 255 + 256] = 0.3  # Position 511\n        x[row, 255 + 512] = 0.3  # Position 767\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6565,
+        "completion_tokens": 4669,
+        "total_tokens": 11234,
+        "reasoning_tokens": 1950
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() is inside the max reduction loop. For s=64, thread 0 (warp 0) reads shared_max[64] which was updated by thread 64 (warp 2) during s=128. Without barrier, warp 0 might read stale data. However, on modern GPUs with L1/L2 coherence and round-robin warp scheduling, races rarely manifest. The 112 rounds of empirical equivalence suggest hardware-level implicit synchronization.",
+      "survival_reason": "Previous attempts placed max values at positions 255, 128, 64 (Rounds 1-3), but these don't specifically target the reduction chain vulnerability. The critical race is: thread 192 (warp 6) computes its local max, then during s=128 thread 64 (warp 2) should read shared_max[192] and update shared_max[64], then during s=64 thread 0 (warp 0) reads shared_max[64]. None of the previous tests isolated the TRUE global maximum at position 192 exclusively. Additionally, the GPU's warp scheduler and shared memory coherence likely mask the race. This attempt places the ONLY maximum at position 192 with extreme negative values elsewhere, and adds alternating rows with different max positions to stress different reduction tree paths simultaneously.",
+      "killable": true,
+      "kill_strategy": "Place the sole global maximum (+88.0) at positions processed exclusively by thread 192 (positions 192, 448, etc.) with all other values at extreme negative (-88.0). If the race causes thread 0 to read pre-updated shared_max[64] (which is -88.0) instead of the propagated value from position 192 (which is +88.0), then exp(88 - (-88)) = exp(176) causes overflow to inf, producing NaN in softmax vs correct normalized output.",
+      "recommendations": "When testing parallel reduction kernels, systematically enumerate all cross-warp data dependencies in the reduction tree and create inputs that isolate each dependency path. The maximum value should be placed at positions that require the full reduction chain to propagate correctly, with extreme value contrasts to expose synchronization failures.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((16, 16384), -88.0, dtype=torch.float32, device=device)\n    # Critical positions that stress specific reduction paths\n    # Thread 192 -> s=128 -> thread 64 -> s=64 -> thread 0\n    # Thread 160 -> s=128 -> thread 32 -> s=64 -> thread 0 (via s=32)\n    # Thread 224 -> s=128 -> thread 96 -> s=64 -> thread 32 -> s=32 -> thread 0\n    critical_positions_per_row = [\n        192,  # warp 6 -> warp 2 -> warp 0\n        160,  # warp 5 -> warp 1 -> warp 0\n        224,  # warp 7 -> warp 3 -> warp 0\n        176,  # warp 5 -> warp 1 -> warp 0\n        192,\n        208,  # warp 6 -> warp 2 -> warp 0\n        240,  # warp 7 -> warp 3 -> warp 1 -> warp 0\n        144,  # warp 4 -> warp 1 -> warp 0\n        192,\n        160,\n        224,\n        176,\n        200,  # warp 6 -> warp 2 -> warp 0\n        168,  # warp 5 -> warp 1 -> warp 0\n        232,  # warp 7 -> warp 3 -> warp 1 -> warp 0\n        152   # warp 4 -> warp 1 -> warp 0\n    ]\n    for row in range(16):\n        pos = critical_positions_per_row[row]\n        # Place sole maximum at this position\n        x[row, pos] = 88.0\n        # Ensure thread 0's positions stay low\n        x[row, 0] = -88.0\n        x[row, 256] = -88.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7254,
+        "completion_tokens": 4962,
+        "total_tokens": 12216,
+        "reasoning_tokens": 2044
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The race condition requires thread N to read shared_max[M] before thread M writes its updated value in the previous reduction step. With 256 threads across 8 warps, cross-warp races occur at s=128 (warp 0-3 reading from warp 4-7 init positions) and s=64 (warp 0-1 reading from warp 2-3 updated positions). Without __syncthreads(), thread 63 may read stale shared_max[127] before thread 127 completes its s=128 update. This requires the true max to exist ONLY in positions 128-255 and propagate through position 127.",
+      "survival_reason": "Previous attempts failed because: (1) Multiple max positions created redundant propagation paths that masked the race, (2) Extreme value ranges (±88-100) don't affect race probability, only consequence magnitude, (3) Modern GPUs often exhibit implicit warp-level synchronization making cross-warp races less frequent. The fundamental issue is that with uniform computational load per thread, all warps tend to complete iterations at similar times. To expose the race, we need the TRUE maximum to exist at a position that requires the LONGEST propagation chain (position 127) while making all other positions have -infinity, eliminating any alternate propagation paths and maximizing the consequence of a missed sync.",
+      "killable": true,
+      "kill_strategy": "Use -infinity for ALL positions except position 127 which has the sole maximum. This creates a scenario where: (1) The ONLY path for max propagation is 127->63->31->15->7->3->1->0, (2) If ANY step races, thread 0 sees -inf as max, causing exp(x - (-inf)) = exp(inf) = inf, producing NaN in output, (3) The stark -inf vs finite contrast maximizes detection. Additionally vary the critical position per row to stress different reduction paths.",
+      "recommendations": "Race condition bugs from missing __syncthreads() are hardware-dependent and probabilistic. Testing should include: (1) multiple GPU architectures with different memory models, (2) repeated execution (>1000 runs) to increase race manifestation probability, (3) extreme sparse patterns (-inf/+finite) that make race consequences catastrophic rather than merely different.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((16, 16384), float('-inf'), dtype=torch.float32, device=device)\n    # Positions that stress different cross-warp sync points in reduction\n    # 127: requires s=64 sync (warp 1->0), 191: requires s=128 sync (warp 5->1)\n    # 223: requires s=128 sync (warp 6->2), 95: requires s=32 sync (warp 2->0)\n    critical_positions = [\n        127,  # propagates through s=64: thread 63 reads shared_max[127]\n        191,  # propagates through s=128,64: thread 63 reads shared_max[127]\n        95,   # propagates through s=32: thread 31 reads shared_max[63]\n        223,  # propagates through s=128,64,32: long chain\n        127,\n        191,\n        159,  # propagates through s=128: thread 31 reads\n        175,  # propagates through s=128: different path\n        127,\n        207,  # stress warp 6\n        191,\n        239,  # stress warp 7\n        127,\n        223,\n        143,  # stress warp 4\n        255   # maximum thread index - longest propagation\n    ]\n    for row in range(16):\n        pos = critical_positions[row]\n        x[row, pos] = 50.0  # Only finite value in the row\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 468.9
+}

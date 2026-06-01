@@ -1,0 +1,155 @@
+{
+  "mutant_id": "L1_P96__launch_config_mutate__0",
+  "operator_name": "launch_config_mutate",
+  "kernel_name": "L1_P96",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6379,
+        "completion_tokens": 3860,
+        "total_tokens": 10239,
+        "reasoning_tokens": 1378
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Original launches 2048 blocks covering elements 0-524287. Mutant launches 2047 blocks covering only 0-524031. Last 256 elements (indices 524032-524287 = tensor[127,3840:4096]) are uninitialized garbage. If only these 256 positions have non-zero loss, mutant sums garbage while original sums correct values.",
+      "survival_reason": "All previous tests distributed loss values across the entire tensor, so the contribution from the last 256 uncomputed elements was diluted (only ~0.05% of elements). Additionally, CUDA memory allocations may return zeroed or near-zero values in many cases, making garbage values accidentally close to expected values when true losses were also small. No test specifically isolated the last 256 elements as the SOLE source of loss.",
+      "killable": true,
+      "kill_strategy": "Create inputs where predictions equals targets everywhere EXCEPT the last 256 flat elements (tensor[127, 3840:4096]). Set those positions to have large differences (e.g., predictions=100, targets=0), producing loss=99.5 each. Expected mean loss ≈ 256×99.5/524288 ≈ 0.0486. Mutant will compute near-zero (garbage) instead.",
+      "recommendations": "When testing grid/block launch mutations that reduce coverage, always test with loss concentrated EXCLUSIVELY in the potentially-uncovered region, not just with a spike at the boundary. The 'boundary_last_element' policy should be enhanced to cover entire boundary blocks, not just individual elements.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Last 256 flat indices = row 127, columns 3840-4095\n    # 127*4096 + 3840 = 524032 (start of uncomputed block)\n    predictions[127, 3840:] = 100.0\n    targets[127, 3840:] = 0.0\n    # Expected: loss = |100-0| - 0.5 = 99.5 per element\n    # Mean = 256 * 99.5 / 524288 ≈ 0.0486\n    # Mutant reads garbage, extremely unlikely to match\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6063,
+        "completion_tokens": 5986,
+        "total_tokens": 12049,
+        "reasoning_tokens": 2431
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Previous tests failed because torch::empty memory apparently contains values matching expected outputs (possibly due to CUDA allocator caching). Using NaN bypasses value-based tolerance - NaN propagates through sum to produce NaN mean in original, while mutant's uninitialized garbage remains finite. torch.allclose(NaN, finite_value) returns False.",
+      "survival_reason": "The mutation removes processing of the last 256 elements (indices 524032-524287). Previous value-based tests failed because `torch::empty` returns memory that either: (1) is zeroed by CUDA driver, or (2) contains cached values from prior computations that match expected outputs. The relative tolerance (1%) combined with the small fraction of affected elements (256/524288 ≈ 0.05%) makes value differences hard to detect when garbage happens to be close to expected values.",
+      "killable": true,
+      "kill_strategy": "Use NaN values in predictions for the last 256 elements (positions [127, 3840:]). The original kernel will compute NaN loss for these positions, which propagates through the reduction to produce NaN mean. The mutant doesn't compute these positions, so garbage (finite values) are summed instead, producing a finite mean. NaN ≠ finite always fails torch.allclose.",
+      "recommendations": "When testing GPU kernels with uninitialized memory (torch::empty), include NaN/Inf propagation tests to detect incomplete computation, as value-based tests can fail when uninitialized memory coincidentally matches expected values.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Last 256 flat indices = row 127, columns 3840-4095\n    # indices 524032-524287 which mutant doesn't process\n    predictions[127, 3840:] = float('nan')\n    targets[127, 3840:] = 0.0  # Keep finite\n    # Original: computes nan loss for last 256 -> sum=nan -> mean=nan\n    # Mutant: garbage values summed -> finite mean\n    # NaN vs finite always fails allclose\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6406,
+        "completion_tokens": 5345,
+        "total_tokens": 11751,
+        "reasoning_tokens": 2181
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Block 2047 processes indices 524032-524287. Mutant doesn't launch it, but torch::empty + CUDA caching may preserve correct values from prior kernel execution in same memory region. Garbage memory from allocator may coincidentally match expected values due to memory reuse.",
+      "survival_reason": "The CUDA memory allocator caches and reuses memory blocks. When element_losses is allocated with torch::empty, it may receive memory that previously held computed results from an identical or similar operation. If the original kernel runs first (as it does during testing), the memory contains correct values which the mutant then reads as 'garbage'. This creates false equivalence because the uninitialized region happens to contain the expected values.",
+      "killable": true,
+      "kill_strategy": "Force garbage values to be detectably wrong by: (1) using non-zero loss values throughout the ENTIRE tensor so memory reuse from zeros cannot help, (2) using distinctive irrational-looking values that couldn't appear from rounding, (3) making the loss pattern position-dependent so cached values from ANY previous run would be incorrect for these specific inputs.",
+      "recommendations": "When testing CUDA kernels with mutations affecting boundary blocks, ensure test inputs include distinctive non-cacheable values AND run multiple iterations with different inputs to defeat memory allocator caching. Consider explicitly zeroing or randomizing scratch buffers before kernel launch.",
+      "suggested_code": "def generate_inputs(device):\n    # Create position-dependent values that can't be cached\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    \n    # Fill with unique per-run timestamp-based noise to defeat caching\n    import time\n    seed_val = int(time.time() * 1000) % 10000\n    torch.manual_seed(seed_val)\n    \n    # First, ensure memory is 'dirty' with different values\n    # Set all elements to produce small loss\n    predictions.fill_(0.1)\n    targets.fill_(0.0)\n    \n    # Now set last 256 elements (flat indices 524032-524287) to large distinctive values\n    # Row 127, columns 3840-4095\n    predictions[127, 3840:] = 777.777\n    targets[127, 3840:] = -222.222\n    # diff = 999.999, abs_diff > beta=1.0, loss = 999.999 - 0.5 = 999.499\n    \n    # Expected: first 524032 elements: loss = 0.005 (0.5 * 0.1^2 / 1.0)\n    # Last 256 elements: loss = 999.499\n    # Total = 524032*0.005 + 256*999.499 = 2620.16 + 255871.744 = 258491.9\n    # Mean = 258491.9 / 524288 ≈ 0.493\n    # If garbage = 0.005 (from fill): mean ≈ 0.005, diff ≈ 0.488\n    # Threshold = 0.01 + 0.01*0.493 ≈ 0.015, diff >> threshold\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7015,
+        "completion_tokens": 4292,
+        "total_tokens": 11307,
+        "reasoning_tokens": 1827
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutant skips last 256 elements (indices 524032-524287). torch::empty returns recently-freed memory containing correct values from original's prior run. Using inf in last 256 positions breaks this: original computes inf loss → inf mean, mutant reads finite garbage → finite mean. inf ≠ finite always fails allclose.",
+      "survival_reason": "The mutant survived because CUDA's memory allocator returns previously-used memory from the caching pool. When the original kernel runs first and computes correct losses, then frees element_losses, the mutant's subsequent allocation receives the same memory block with correct values still present. This makes the 'uninitialized' memory contain exactly the correct values, causing bitwise-identical outputs.",
+      "killable": true,
+      "kill_strategy": "Use inf values in the last 256 tensor positions. When the original kernel computes loss for inf input, it produces inf (since |inf - 0| - 0.5 = inf). The mean becomes inf. Even if the mutant's garbage memory contains 'correct' values from a different prior run with different inputs, or zeros, it will produce a finite mean. inf vs finite always fails torch.allclose regardless of tolerances.",
+      "recommendations": "GPU mutation testing frameworks should run mutant kernels in isolated CUDA contexts or explicitly dirty memory between runs to prevent memory-reuse-based false equivalences. Consider clearing the CUDA memory pool between original and mutant executions.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Last 256 flat indices = row 127, columns 3840-4095\n    # Original: loss = |inf - 0| - 0.5 = inf for each of 256 elements\n    # Sum = inf, mean = inf\n    # Mutant: garbage values (finite) -> finite sum -> finite mean\n    # inf != finite -> allclose fails\n    predictions[127, 3840:] = float('inf')\n    targets[127, 3840:] = 0.0\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7365,
+        "completion_tokens": 4693,
+        "total_tokens": 12058,
+        "reasoning_tokens": 2249
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With 524288 elements and block_size=256, mutant launches 2047 blocks (524032 threads) instead of 2048, leaving last 256 elements uncomputed. Memory reuse from reference model run provides correct values in uninitialized positions, masking the mutation.",
+      "survival_reason": "The mutant survives because CUDA memory allocation reuses memory blocks. When the test harness runs the reference model first, it computes and stores correct element_losses values. The mutant then receives the same memory block (or memory with cached values), and since it only skips writing to positions 524032-524287, those positions retain the correct values from the reference run. This creates accidental behavioral equivalence within the same test execution.",
+      "killable": true,
+      "kill_strategy": "Force memory pool fragmentation by allocating and deallocating temporary tensors before the actual computation. This shifts memory addresses and may cause element_losses to receive memory with different garbage values. Additionally, use extreme value magnitudes (1e10) in the last 256 positions to maximize the detectable difference if garbage is zero or small.",
+      "recommendations": "When testing GPU kernels with uninitialized memory access bugs, the test harness should randomize execution order (mutant before reference sometimes) or clear CUDA memory pools between runs to prevent memory reuse from masking bugs.",
+      "suggested_code": "def generate_inputs(device):\n    # Fragment memory pool to prevent reuse of reference's element_losses memory\n    temp_tensors = []\n    for i in range(50):\n        t = torch.randn(128, 4096, dtype=torch.float32, device=device)\n        temp_tensors.append(t)\n    # Clear some but not all to create fragmentation\n    del temp_tensors[::2]\n    torch.cuda.synchronize()\n    \n    # Create inputs with massive loss in last 256 elements\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    \n    # Last 256 elements: flat indices 524032-524287 = row 127, cols 3840-4095\n    # Use extreme values: diff = 1e10, loss = 1e10 - 0.5 ≈ 1e10\n    predictions[127, 3840:] = 1e10\n    targets[127, 3840:] = 0.0\n    \n    # Expected: 256 * 1e10 / 524288 ≈ 4.88e6\n    # If garbage = 0: mean = 0, diff = 4.88e6 >> any tolerance\n    \n    # Clear remaining temp tensors\n    del temp_tensors\n    torch.cuda.synchronize()\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 2
+  },
+  "elapsed_sec": 484.02
+}

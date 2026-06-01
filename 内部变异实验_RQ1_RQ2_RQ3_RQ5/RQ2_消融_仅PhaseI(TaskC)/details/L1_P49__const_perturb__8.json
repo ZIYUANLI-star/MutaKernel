@@ -1,0 +1,143 @@
+{
+  "mutant_id": "L1_P49__const_perturb__8",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P49",
+  "phase1_status": "candidate_equivalent",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7030,
+        "completion_tokens": 5779,
+        "total_tokens": 12809,
+        "reasoning_tokens": 1877
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "tid=32 has lane_id=0 and mutant_warp_id=0 (32/33=0). Both tid=0 and tid=32 write to warp_maxs[0], creating a race. With block_size=256, original: 8 warps write to warp_maxs[0-7]. Mutant: tid=0,32 both write to warp_maxs[0]. If warp 1's value overwrites warp 0's value and warp 0 had the global max, incorrect result.",
+      "survival_reason": "The mutation causes a race condition where two threads write to the same shared memory location. However, CUDA's deterministic warp scheduling within a block after __syncthreads() may consistently result in warp 0 writing last (preserving the correct value), or the EMD testing may not have exercised the dim=2 kernel (only dim=1 was tested). The race exists but may be masked by hardware execution ordering.",
+      "killable": true,
+      "kill_strategy": "Create input where the global maximum along dim2 is ONLY in indices 0-31 (warp 0's domain) with significantly smaller values in indices 32-63 (warp 1's domain). If the race causes warp 1's value to overwrite warp 0's max, the output will be wrong. Use dim=2 reduction to trigger the mutated kernel.",
+      "recommendations": "When testing warp-level reduction kernels, verify that logical warp_id calculations correctly partition threads to avoid shared memory write collisions. Consider testing with adversarial value patterns where the maximum is isolated in specific warps to expose race conditions in warp-to-shared-memory mappings.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((16, 256, 256), -1000.0, device=device, dtype=torch.float32)\n    # Place max only in element 0 along dim2 (processed by warp 0)\n    x[:, :, 0] = 1000.0\n    # Element 32 along dim2 (processed by warp 1, tid=32) stays at -1000\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6929,
+        "completion_tokens": 7728,
+        "total_tokens": 14657,
+        "reasoning_tokens": 3314
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With tid/33, warp_id values for lane_id=0 threads are {0,0,1,2,3,4,5,6}. warp_maxs[7] never gets written but is read in final reduction (lane_id<8). Uninitialized shared memory garbage at warp_maxs[7] becomes output when all real values are extremely negative.",
+      "survival_reason": "Round 1 used -1000.0 as the background value, which is not extreme enough. If shared memory garbage happened to be <= -1000.0, the test passed. The race condition focus was wrong - the deterministic bug is that warp_maxs[7] is NEVER written. With extreme negative values like -1e38, any normal garbage value (even 0) would be >> -1e38 and become the erroneous output.",
+      "killable": true,
+      "kill_strategy": "Use extremely negative input values (near -FLT_MAX) so that uninitialized garbage at warp_maxs[7] (which is read but never written in the mutant) will almost certainly be larger and dominate the max reduction, producing garbage output.",
+      "recommendations": "Always initialize shared memory arrays to safe sentinel values (like -FLT_MAX for max reduction) rather than relying on all indices being written. This prevents uninitialized memory bugs from mutations affecting index calculations.",
+      "suggested_code": "def generate_inputs(device):\n    # Use extreme negative values so uninitialized warp_maxs[7] garbage wins\n    x = torch.full((16, 256, 256), -1e38, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7106,
+        "completion_tokens": 7349,
+        "total_tokens": 14455,
+        "reasoning_tokens": 2665
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "warp_maxs[7] never written in mutant (tid=224 has warp_id=224/33=6). Final reduction reads warp_maxs[lane_id] for lane_id<8, so warp_maxs[7] garbage participates. If garbage > actual_max, output is wrong.",
+      "survival_reason": "Previous attempts used extreme negative values (-1e38) but shared memory garbage might coincidentally be very negative or zero. Round 1 placed max at index 0 which doesn't isolate the warp_maxs[7] issue. The race condition on warp_maxs[0] is non-deterministic. A new approach: use small positive values as the true maximum (e.g., 1.0) so any garbage value in warp_maxs[7] that's moderately positive (>1.0) will corrupt the result. This has higher probability than relying on garbage beating -1e38.",
+      "killable": true,
+      "kill_strategy": "Use input where true max is a small positive constant (1.0), with other values at 0.0. If warp_maxs[7] garbage exceeds 1.0, mutant returns wrong max.",
+      "recommendations": "When testing parallel reduction kernels with warp-level optimizations, include tests with small positive maxima to detect uninitialized shared memory issues, rather than only extreme values.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros((16, 256, 256), device=device, dtype=torch.float32)\n    # Place max value only in dim2 indices 224-255 (hardware warp 7's domain)\n    # In mutant, this max goes to warp_maxs[6], but garbage warp_maxs[7] may corrupt\n    x[:, :, 224:256] = 1.0\n    # Make one element the clear maximum\n    x[:, :, 224] = 5.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7343,
+        "completion_tokens": 6811,
+        "total_tokens": 14154,
+        "reasoning_tokens": 2606
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "warp_maxs[7] is never written in mutant (no tid satisfies tid/33==7 && tid%32==0). Final reduction reads warp_maxs[lane_id] for lane_id 0-7. If garbage at warp_maxs[7] > true_max, output is corrupted.",
+      "survival_reason": "Previous attempts failed because: (1) the race between tid=0 and tid=32 is non-deterministic and sometimes tid=0 wins, (2) extreme values like -1e38 might coincidentally match garbage patterns. The uninitialized warp_maxs[7] read is deterministic but its value depends on previous kernel state. Using a moderate negative baseline (-1e10) makes it statistically more likely that typical shared memory garbage (often small positive or zero) will exceed the baseline and expose the bug.",
+      "killable": true,
+      "kill_strategy": "Use uniform moderate negative values (-1e10) so that any positive garbage in uninitialized warp_maxs[7] will dominate the reduction result. This targets the deterministic uninitialized-read bug rather than the non-deterministic race.",
+      "recommendations": "Test kernels with shared memory by explicitly initializing all shared memory slots, or add assertions that verify all slots are written before being read. Also test with multiple runs to catch non-deterministic race conditions.",
+      "suggested_code": "def generate_inputs(device):\n    # Moderate negative values - not too extreme\n    # Any positive garbage at warp_maxs[7] will win\n    x = torch.full((16, 256, 256), -1e10, device=device, dtype=torch.float32)\n    # Add tiny variation to avoid compiler optimizations\n    x[:, :, 128] = -1e10 + 1.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7556,
+        "completion_tokens": 5866,
+        "total_tokens": 13422,
+        "reasoning_tokens": 2433
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "The mutation `tid / 33` instead of `tid / 32` is exclusively in `max_reduction_dim2_kernel`, which is only invoked when `reduction_dim == 2`. With block_size=256 and dim2=256, each thread processes exactly 1 element. The mutation causes: (1) tid=0 and tid=32 both write to warp_maxs[0] creating a race, (2) warp_maxs[7] is never written but read during final reduction. However, if the model is initialized with dim=1, the mutated kernel is NEVER executed - only `max_reduction_dim1_kernel` runs.",
+      "survival_reason": "All previous attempts failed because they only varied input tensor VALUES while the mutation exists solely in `max_reduction_dim2_kernel`. Looking at the code, reduction over dimension 1 uses `max_reduction_dim1_kernel` (unmutated), while reduction over dimension 2 uses `max_reduction_dim2_kernel` (mutated). The model's `dim` parameter is set during `__init__` and cannot be controlled through input values. If the testing framework initializes the model with `dim=1` (the common default for reducing a middle dimension), the mutated code path is never exercised regardless of what input values are provided. This explains why 112 dynamic rounds with diverse value patterns (near_zero, boundary, sparse, large_magnitude, all_negative, etc.) all passed - the mutated code was simply unreachable through the chosen execution path.",
+      "killable": false,
+      "kill_strategy": "The mutant cannot be killed through value-level changes alone. The mutation affects only `max_reduction_dim2_kernel`, which is only called when `self.dim == 2`. Killing this mutant requires changing the model's initialization parameter from dim=1 to dim=2. This is a configuration change, not an input value change.",
+      "recommendations": "When mutation testing involves kernels with conditional code paths (like separate kernels for different reduction dimensions), ensure the test harness exercises ALL code paths by varying configuration parameters (like reduction dimension), not just input values. Consider adding a mutation coverage check that verifies mutated lines are actually executed during testing.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 527.06
+}

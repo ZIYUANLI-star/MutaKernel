@@ -1,0 +1,257 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a gemm, swish, divide, clamp, tanh, and clamp operations.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features, bias=bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.gemm(x)
+        x = x * torch.sigmoid(x)  # Swish activation
+        x = x / 2.0
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        x = torch.tanh(x)  # Tanh activation
+        x = torch.clamp(x, min=-1.0, max=1.0)  # Clamp between -1 and 1
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_bias_postprocess.cu ===
+
+#include <cuda_runtime.h>
+
+__global__ void fused_bias_postprocess_kernel(float* output, const float* gemm_out, const float* bias, int batch_size, int features) {
+    int tid = blockIdx.x * 256 + threadIdx.x;
+    int total_elements = batch_size * features;
+
+    if (tid < total_elements) {
+        int row = tid / features;  // batch index
+        int col = tid % features; // feature index
+        
+        float x = gemm_out[tid] + bias[col];
+        
+        // Swish activation: x * sigmoid(x)
+        float sig = 1.0f / (1.0f + exp(-x));
+        float swish_val = x * sig;
+        
+        // Divide by 2.0
+        float div_val = swish_val / 2.0f;
+        
+        // Clamp between -1.0 and 1.0
+        float clamp1_val = fmax(-1.0f, fmin(1.0f, div_val));
+        
+        // Tanh activation
+        float tanh_val = tanh(clamp1_val);
+        
+        // Clamp between -1.0 and 1.0
+        float clamp2_val = fmax(-1.0f, fmin(1.0f, tanh_val));
+        
+        // Write output
+        output[tid] = clamp2_val;
+    }
+}
+
+extern "C" void fused_bias_postprocess_launcher(
+    float* output,
+    const float* gemm_out,
+    const float* bias,
+    int batch_size,
+    int features,
+    cudaStream_t stream
+) {
+    int blocks = (batch_size * features + 255) / 256;
+    fused_bias_postprocess_kernel<<<blocks, 256, 0, stream>>>(output, gemm_out, bias, batch_size, features);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_bias_postprocess_binding.cpp ===
+
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_bias_postprocess_launcher(
+    float* output,
+    const float* gemm_out,
+    const float* bias,
+    int batch_size,
+    int features,
+    cudaStream_t stream
+);
+
+torch::Tensor fused_bias_postprocess_forward(torch::Tensor gemm_out, torch::Tensor bias, int batch_size, int features) {
+    TORCH_CHECK(gemm_out.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(gemm_out.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(gemm_out.dtype() == torch::kFloat32, "Input must be float32");
+
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+
+    auto output = torch::empty_like(gemm_out);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    fused_bias_postprocess_launcher(
+        output.data_ptr<float>(),
+        gemm_out.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        batch_size,
+        features,
+        stream
+    );
+
+    return output;
+}
+
+void register_fused_bias_postprocess(pybind11::module& m) {
+    m.def("fused_bias_postprocess_forward", &fused_bias_postprocess_forward, 
+          "Fused bias + postprocess forward",
+          py::arg("gemm_out"),
+          py::arg("bias"),
+          py::arg("batch_size"),
+          py::arg("features"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_bias_postprocess_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs gemm with TF32 cuBLAS and fused bias + postprocess operations.
+    """
+    def __init__(self, in_features, out_features, bias=True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # Enable TF32 for better performance
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Compute gemm without bias
+        gemm_out = x.matmul(self.weight.transpose(0, 1))
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # Use fused bias + postprocess kernel
+        batch_size = x.shape[0]
+        out_features = self.out_features
+        x = cuda_extension.fused_bias_postprocess_forward(gemm_out, self.bias, batch_size, out_features)
+        
+        return x
+
+    def load_state_dict(self, state_dict):
+        # Remap state dict keys from "gemm.weight" to "weight" and "gemm.bias" to "bias"
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith("gemm."):
+                new_key = key.replace("gemm.", "")
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+        super().load_state_dict(new_state_dict)
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 48
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (24 failures)
+  - [large_magnitude seed=50000] max_diff=2.434687e-01, mean_diff=9.887297e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [large_magnitude seed=50001] max_diff=2.546812e-01, mean_diff=9.979954e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [near_overflow seed=50002] max_diff=7.615942e-01, mean_diff=7.072471e-05, ref_range=[-0.0000e+00,7.6159e-01], orig_range=[-0.0000e+00,7.6159e-01]
+  - [near_overflow seed=50003] max_diff=7.615942e-01, mean_diff=7.263128e-05, ref_range=[-0.0000e+00,7.6159e-01], orig_range=[-0.0000e+00,7.6159e-01]
+  - [all_negative seed=50008] max_diff=2.840026e-02, mean_diff=9.866247e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [all_negative seed=50009] max_diff=2.820224e-02, mean_diff=1.006466e-04, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [all_positive seed=50010] max_diff=2.947065e-02, mean_diff=9.930081e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [all_positive seed=50011] max_diff=3.332068e-02, mean_diff=9.871319e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  ... and 16 more failures
+
+### training_stress (24 failures)
+  - [large_magnitude seed=70000] max_diff=2.596169e-01, mean_diff=9.950614e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [large_magnitude seed=70001] max_diff=2.447751e-01, mean_diff=9.812078e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [near_overflow seed=70002] max_diff=7.615942e-01, mean_diff=7.108787e-05, ref_range=[-0.0000e+00,7.6159e-01], orig_range=[-0.0000e+00,7.6159e-01]
+  - [near_overflow seed=70003] max_diff=7.615942e-01, mean_diff=7.208655e-05, ref_range=[-0.0000e+00,7.6159e-01], orig_range=[-0.0000e+00,7.6159e-01]
+  - [all_negative seed=70008] max_diff=2.753377e-02, mean_diff=9.898417e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [all_negative seed=70009] max_diff=2.774495e-02, mean_diff=9.826885e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [all_positive seed=70010] max_diff=3.410074e-02, mean_diff=9.947819e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  - [all_positive seed=70011] max_diff=3.007931e-02, mean_diff=9.929852e-05, ref_range=[-1.3834e-01,7.6159e-01], orig_range=[-1.3834e-01,7.6159e-01]
+  ... and 16 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

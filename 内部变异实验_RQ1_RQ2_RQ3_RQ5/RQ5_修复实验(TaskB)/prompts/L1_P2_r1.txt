@@ -1,0 +1,316 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B)
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication.
+
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (K, N).
+
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return torch.matmul(A, B)
+
+M = 1024
+K = 4096
+N = 2048
+
+def get_inputs():
+    A = torch.randn(M, K)
+    B = torch.randn(K, N)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for optimized matrix multiplication using shared memory tiling
+matmul_optimized_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+#define BLOCK_SIZE 16
+
+__global__ void matmul_optimized_kernel(
+    const float* __restrict__ A, 
+    const float* __restrict__ B, 
+    float* __restrict__ C, 
+    int M, 
+    int N, 
+    int K
+) {
+    // Shared memory for tiles
+    __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+    
+    // Block row and column
+    int blockRow = blockIdx.y;
+    int blockCol = blockIdx.x;
+    
+    // Thread row and column within block
+    int threadRow = threadIdx.y;
+    int threadCol = threadIdx.x;
+    
+    // Calculate row and column of C element to compute
+    int row = blockRow * BLOCK_SIZE + threadRow;
+    int col = blockCol * BLOCK_SIZE + threadCol;
+    
+    float sum = 0.0f;
+    
+    // Loop over tiles of the input matrices
+    for (int t = 0; t < (K + BLOCK_SIZE - 1) / BLOCK_SIZE; ++t) {
+        // Load A tile
+        int A_row = row;
+        int A_col = t * BLOCK_SIZE + threadCol;
+        if (A_row < M && A_col < K) {
+            As[threadRow][threadCol] = A[A_row * K + A_col];
+        } else {
+            As[threadRow][threadCol] = 0.0f;
+        }
+        
+        // Load B tile
+        int B_row = t * BLOCK_SIZE + threadRow;
+        int B_col = col;
+        if (B_row < K && B_col < N) {
+            Bs[threadRow][threadCol] = B[B_row * N + B_col];
+        } else {
+            Bs[threadRow][threadCol] = 0.0f;
+        }
+        
+        __syncthreads();
+        
+        // Compute partial sum for this tile
+        for (int k = 0; k < BLOCK_SIZE; ++k) {
+            sum += As[threadRow][k] * Bs[k][threadCol];
+        }
+        
+        __syncthreads();
+    }
+    
+    // Write result to C
+    if (row < M && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+torch::Tensor matmul_optimized_cuda(torch::Tensor A, torch::Tensor B) {
+    int M = A.size(0);
+    int K = A.size(1);
+    int N = B.size(1);
+    
+    auto C = torch::zeros({M, N}, A.options());
+    
+    // Configure block and grid dimensions
+    dim3 blockDim(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 gridDim((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    
+    // Launch kernel
+    matmul_optimized_kernel<<<gridDim, blockDim>>>(
+        A.data_ptr<float>(),
+        B.data_ptr<float>(),
+        C.data_ptr<float>(),
+        M, N, K
+    );
+    
+    return C;
+}
+"""
+
+matmul_optimized_cpp_source = "torch::Tensor matmul_optimized_cuda(torch::Tensor A, torch::Tensor B);"
+
+# Compile the inline CUDA code for optimized matrix multiplication
+matmul_optimized = load_inline(
+    name="matmul_optimized",
+    cpp_sources=matmul_optimized_cpp_source,
+    cuda_sources=matmul_optimized_source,
+    functions=["matmul_optimized_cuda"],
+    verbose=False,
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix multiplication using custom CUDA kernel
+    with shared memory tiling for better performance
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs optimized matrix multiplication using custom CUDA kernel.
+        
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (K, N).
+            
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        # Ensure tensors are on CUDA and contiguous
+        A = A.contiguous().cuda()
+        B = B.contiguous().cuda()
+        
+        return matmul_optimized.matmul_optimized_cuda(A, B)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 44)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=sparse_extreme, seed=49, mode=eval_value:
+      max_diff=6.400000e+01, mean_diff=1.007042e-01, ref_range=[-1.4247e+09,1.1688e+09], orig_range=[-1.4247e+09,1.1688e+09]
+[2] policy=large_magnitude, seed=51, mode=eval_value:
+      max_diff=8.480000e+02, mean_diff=5.430933e+01, ref_range=[-3.0793e+08,3.1024e+08], orig_range=[-3.0793e+08,3.1024e+08]
+[3] policy=large_magnitude, seed=52, mode=eval_value:
+      max_diff=9.120000e+02, mean_diff=5.439060e+01, ref_range=[-3.2059e+08,3.1900e+08], orig_range=[-3.2059e+08,3.1900e+08]
+[4] policy=large_magnitude, seed=53, mode=eval_value:
+      max_diff=8.960000e+02, mean_diff=5.440067e+01, ref_range=[-3.0409e+08,3.3088e+08], orig_range=[-3.0409e+08,3.3088e+08]
+[5] policy=mixed_extremes, seed=69, mode=eval_value:
+      max_diff=2.867200e+04, mean_diff=1.361061e+03, ref_range=[-1.5840e+10,1.4963e+10], orig_range=[-1.5840e+10,1.4963e+10]
+[6] policy=mixed_extremes, seed=70, mode=eval_value:
+      max_diff=2.150400e+04, mean_diff=1.361583e+03, ref_range=[-1.5076e+10,1.5728e+10], orig_range=[-1.5076e+10,1.5728e+10]
+[7] policy=mixed_extremes, seed=71, mode=eval_value:
+      max_diff=2.457600e+04, mean_diff=1.363890e+03, ref_range=[-1.5203e+10,1.5228e+10], orig_range=[-1.5203e+10,1.5228e+10]
+[8] policy=alternating_sign, seed=72, mode=eval_value:
+      max_diff=6.500000e+00, mean_diff=4.180845e-01, ref_range=[-2.6036e+06,2.6036e+06], orig_range=[-2.6036e+06,2.6036e+06]
+[9] policy=alternating_sign, seed=73, mode=eval_value:
+      max_diff=7.750000e+00, mean_diff=4.180516e-01, ref_range=[-2.4505e+06,2.2864e+06], orig_range=[-2.4505e+06,2.2864e+06]
+[10] policy=alternating_sign, seed=74, mode=eval_value:
+      max_diff=7.375000e+00, mean_diff=4.122612e-01, ref_range=[-2.4462e+06,2.5120e+06], orig_range=[-2.4462e+06,2.5120e+06]
+[11] policy=sparse, seed=75, mode=eval_value:
+      max_diff=1.093750e-01, mean_diff=5.724892e-03, ref_range=[-3.4600e+05,4.5194e+05], orig_range=[-3.4600e+05,4.5194e+05]
+[12] policy=head_heavy, seed=81, mode=eval_value:
+      max_diff=2.662400e+04, mean_diff=5.809328e+02, ref_range=[-1.5989e+10,1.4639e+10], orig_range=[-1.5989e+10,1.4639e+10]
+[13] policy=head_heavy, seed=82, mode=eval_value:
+      max_diff=2.560000e+04, mean_diff=5.818532e+02, ref_range=[-1.4248e+10,1.5423e+10], orig_range=[-1.4248e+10,1.5423e+10]
+[14] policy=head_heavy, seed=83, mode=eval_value:
+      max_diff=2.560000e+04, mean_diff=5.811171e+02, ref_range=[-1.6026e+10,1.4859e+10], orig_range=[-1.6026e+10,1.4859e+10]
+[15] policy=tail_heavy, seed=84, mode=eval_value:
+      max_diff=2.457600e+04, mean_diff=3.131709e+02, ref_range=[-1.6462e+10,1.4489e+10], orig_range=[-1.6462e+10,1.4489e+10]
+[16] policy=tail_heavy, seed=85, mode=eval_value:
+      max_diff=1.945600e+04, mean_diff=3.143468e+02, ref_range=[-1.5772e+10,1.4904e+10], orig_range=[-1.5772e+10,1.4904e+10]
+[17] policy=tail_heavy, seed=86, mode=eval_value:
+      max_diff=2.355200e+04, mean_diff=3.137491e+02, ref_range=[-1.5072e+10,1.4058e+10], orig_range=[-1.5072e+10,1.4058e+10]
+[18] policy=extreme_magnitude, seed=90, mode=eval_value:
+      max_diff=9.395241e+08, mean_diff=5.445262e+07, ref_range=[-3.2536e+14,3.1138e+14], orig_range=[-3.2536e+14,3.1138e+14]
+[19] policy=extreme_magnitude, seed=91, mode=eval_value:
+      max_diff=8.556380e+08, mean_diff=5.443270e+07, ref_range=[-3.2265e+14,3.2950e+14], orig_range=[-3.2265e+14,3.2950e+14]
+[20] policy=extreme_magnitude, seed=92, mode=eval_value:
+      max_diff=1.107296e+09, mean_diff=5.440105e+07, ref_range=[-3.1153e+14,3.4060e+14], orig_range=[-3.1153e+14,3.4060e+14]
+[21] policy=reduction_adversarial, seed=96, mode=eval_value:
+      max_diff=3.475049e+01, mean_diff=6.384506e+00, ref_range=[-3.9286e+04,4.6192e+04], orig_range=[-3.9290e+04,4.6183e+04]
+[22] policy=reduction_adversarial, seed=97, mode=eval_value:
+      max_diff=3.607861e+01, mean_diff=6.377526e+00, ref_range=[-4.0929e+04,4.3368e+04], orig_range=[-4.0919e+04,4.3358e+04]
+[23] policy=reduction_adversarial, seed=98, mode=eval_value:
+      max_diff=3.614062e+01, mean_diff=6.384197e+00, ref_range=[-3.8850e+04,3.9473e+04], orig_range=[-3.8861e+04,3.9460e+04]
+[24] policy=mixed_extremes, seed=67, mode=eval_value:
+      max_diff=2.355200e+04, mean_diff=1.364177e+03, ref_range=[-1.6040e+10,1.6190e+10], orig_range=[-1.6040e+10,1.6190e+10]
+[25] policy=mixed_extremes, seed=68, mode=eval_value:
+      max_diff=2.764800e+04, mean_diff=1.363620e+03, ref_range=[-1.6021e+10,1.5413e+10], orig_range=[-1.6021e+10,1.5413e+10]
+[26] policy=alternating_sign, seed=75, mode=eval_value:
+      max_diff=7.000000e+00, mean_diff=4.165137e-01, ref_range=[-2.4858e+06,2.3748e+06], orig_range=[-2.4858e+06,2.3748e+06]
+[27] policy=alternating_sign, seed=76, mode=eval_value:
+      max_diff=7.500000e+00, mean_diff=4.201328e-01, ref_range=[-2.5417e+06,2.3952e+06], orig_range=[-2.5417e+06,2.3952e+06]
+[28] policy=head_heavy, seed=84, mode=eval_value:
+      max_diff=2.764800e+04, mean_diff=5.810155e+02, ref_range=[-1.4240e+10,1.6883e+10], orig_range=[-1.4240e+10,1.6883e+10]
+[29] policy=head_heavy, seed=85, mode=eval_value:
+      max_diff=2.969600e+04, mean_diff=5.799102e+02, ref_range=[-1.4042e+10,1.6331e+10], orig_range=[-1.4042e+10,1.6331e+10]
+[30] policy=head_heavy, seed=86, mode=eval_value:
+      max_diff=2.560000e+04, mean_diff=5.807734e+02, ref_range=[-1.7831e+10,1.5793e+10], orig_range=[-1.7831e+10,1.5793e+10]
+[31] policy=tail_heavy, seed=87, mode=eval_value:
+      max_diff=3.174400e+04, mean_diff=3.134294e+02, ref_range=[-1.5724e+10,1.5194e+10], orig_range=[-1.5724e+10,1.5194e+10]
+[32] policy=tail_heavy, seed=88, mode=eval_value:
+      max_diff=2.201600e+04, mean_diff=3.124225e+02, ref_range=[-1.5434e+10,1.4947e+10], orig_range=[-1.5434e+10,1.4947e+10]
+[33] policy=tail_heavy, seed=89, mode=eval_value:
+      max_diff=2.048000e+04, mean_diff=3.137432e+02, ref_range=[-1.6290e+10,1.7045e+10], orig_range=[-1.6290e+10,1.7045e+10]
+[34] policy=tail_heavy, seed=90, mode=eval_value:
+      max_diff=2.662400e+04, mean_diff=3.126230e+02, ref_range=[-1.4103e+10,1.4220e+10], orig_range=[-1.4103e+10,1.4220e+10]
+[35] policy=tail_heavy, seed=91, mode=eval_value:
+      max_diff=2.355200e+04, mean_diff=3.128896e+02, ref_range=[-1.4716e+10,1.6902e+10], orig_range=[-1.4716e+10,1.6902e+10]
+[36] policy=extreme_magnitude, seed=93, mode=eval_value:
+      max_diff=1.006633e+09, mean_diff=5.441295e+07, ref_range=[-3.3035e+14,3.1098e+14], orig_range=[-3.3035e+14,3.1098e+14]
+[37] policy=extreme_magnitude, seed=94, mode=eval_value:
+      max_diff=9.059697e+08, mean_diff=5.444444e+07, ref_range=[-3.0779e+14,3.1072e+14], orig_range=[-3.0779e+14,3.1072e+14]
+[38] policy=extreme_magnitude, seed=95, mode=eval_value:
+      max_diff=8.556380e+08, mean_diff=5.443798e+07, ref_range=[-3.1111e+14,3.5732e+14], orig_range=[-3.1111e+14,3.5732e+14]
+[39] policy=extreme_magnitude, seed=96, mode=eval_value:
+      max_diff=9.479127e+08, mean_diff=5.442462e+07, ref_range=[-3.2460e+14,3.1956e+14], orig_range=[-3.2460e+14,3.1956e+14]
+[40] policy=reduction_adversarial, seed=102, mode=eval_value:
+      max_diff=3.475000e+01, mean_diff=6.379292e+00, ref_range=[-4.3825e+04,4.1970e+04], orig_range=[-4.3833e+04,4.1963e+04]
+[41] policy=reduction_adversarial, seed=103, mode=eval_value:
+      max_diff=3.999890e+01, mean_diff=6.386144e+00, ref_range=[-4.1173e+04,4.3171e+04], orig_range=[-4.1159e+04,4.3158e+04]
+[42] policy=reduction_adversarial, seed=104, mode=eval_value:
+      max_diff=3.596875e+01, mean_diff=6.386748e+00, ref_range=[-4.5624e+04,4.3707e+04], orig_range=[-4.5626e+04,4.3718e+04]
+[43] policy=reduction_adversarial, seed=105, mode=eval_value:
+      max_diff=3.575000e+01, mean_diff=6.384249e+00, ref_range=[-4.0959e+04,3.9977e+04], orig_range=[-4.0948e+04,3.9981e+04]
+[44] policy=reduction_adversarial, seed=106, mode=eval_value:
+      max_diff=3.585938e+01, mean_diff=6.382380e+00, ref_range=[-3.9685e+04,4.1666e+04], orig_range=[-3.9688e+04,4.1660e+04]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

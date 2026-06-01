@@ -1,0 +1,295 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, LogSumExp, HardSwish, subtraction, clamp operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(1, 1, 1, 1)) 
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = x * torch.sigmoid(x + 3) / 6
+        x = x - self.bias
+        x = torch.clamp(x, min=-1, max=1)
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+bias_shape = (1, 1, 1, 1)  
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, bias_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_all_kernel.cu ===
+#include <cuda_runtime.h>
+#include <cmath>
+
+
+__global__ void fused_all_kernel(const float* input, const float* weight, const float* conv_bias, const float* bias, float* output) {
+    int idx = blockIdx.x * 128 + threadIdx.x;
+    int total_elems = 128 * 1 * 31 * 63 * 63;
+
+    // Calculate the number of elements per sample and spatial location
+    int per_sample_spatial = 31 * 63 * 63;
+
+    while (idx < total_elems) {
+        // Get the current sample and spatial location
+        int sample = idx / per_sample_spatial;
+        int spatial = idx % per_sample_spatial;
+        
+        // Spatial is (d, h, w) = (31, 63, 63)
+        int d = (spatial / (63 * 63)) % 31;
+        int h = (spatial / 63) % 63;
+        int w = spatial % 63;
+
+        float max_val = -INFINITY;
+        float sum = 0.0f;
+
+        // Step 1: Calculate transposed convolution for each channel (16 channels)
+        for (int c = 0; c < 16; c++) {
+            float conv_val = 0.0f;
+
+            // Convolution kernel size is 3x3x3, stride 2, padding 1
+            for (int kd = 0; kd < 3; kd++) {
+                int in_d = (d + 1 - kd) / 2;
+                if ((d + 1 - kd) % 2 != 0 || in_d < 0 || in_d >= 16) continue;
+
+                for (int kh = 0; kh < 3; kh++) {
+                    int in_h = (h + 1 - kh) / 2;
+                    if ((h + 1 - kh) % 2 != 0 || in_h < 0 || in_h >= 32) continue;
+
+                    for (int kw = 0; kw < 3; kw++) {
+                        int in_w = (w + 1 - kw) / 2;
+                        if ((w + 1 - kw) % 2 != 0 || in_w < 0 || in_w >= 32) continue;
+
+                        for (int ic = 0; ic < 3; ic++) {
+                            // Input index: (sample, in_channel, in_depth, in_height, in_width)
+                            int input_idx = sample * 3 * 16 * 32 * 32 + ic * 16 * 32 * 32 + in_d * 32 * 32 + in_h * 32 + in_w;
+                            // Weight index: (in_channel, out_channel, kernel_depth, kernel_height, kernel_width)
+                            int weight_idx = ic * 16 * 3 * 3 * 3 + c * 3 * 3 * 3 + kd * 3 * 3 + kh * 3 + kw;
+
+                            conv_val += input[input_idx] * weight[weight_idx];
+                        }
+                    }
+                }
+            }
+
+            // Add bias
+            conv_val += conv_bias[c];
+
+            // Update max_val for LogSumExp
+            max_val = max(max_val, conv_val);
+        }
+
+        // Step 2: LogSumExp
+        for (int c = 0; c < 16; c++) {
+            float conv_val = 0.0f;
+
+            // Convolution kernel size is 3x3x3, stride 2, padding 1
+            for (int kd = 0; kd < 3; kd++) {
+                int in_d = (d + 1 - kd) / 2;
+                if ((d + 1 - kd) % 2 != 0 || in_d < 0 || in_d >= 16) continue;
+
+                for (int kh = 0; kh < 3; kh++) {
+                    int in_h = (h + 1 - kh) / 2;
+                    if ((h + 1 - kh) % 2 != 0 || in_h < 0 || in_h >= 32) continue;
+
+                    for (int kw = 0; kw < 3; kw++) {
+                        int in_w = (w + 1 - kw) / 2;
+                        if ((w + 1 - kw) % 2 != 0 || in_w < 0 || in_w >= 32) continue;
+
+                        for (int ic = 0; ic < 3; ic++) {
+                            // Input index: (sample, in_channel, in_depth, in_height, in_width)
+                            int input_idx = sample * 3 * 16 * 32 * 32 + ic * 16 * 32 * 32 + in_d * 32 * 32 + in_h * 32 + in_w;
+                            // Weight index: (in_channel, out_channel, kernel_depth, kernel_height, kernel_width)
+                            int weight_idx = ic * 16 * 3 * 3 * 3 + c * 3 * 3 * 3 + kd * 3 * 3 + kh * 3 + kw;
+
+                            conv_val += input[input_idx] * weight[weight_idx];
+                        }
+                    }
+                }
+            }
+
+            // Add bias
+            conv_val += conv_bias[c];
+
+            // Accumulate sum
+            sum += exp(conv_val - max_val);
+        }
+
+        float logsum = max_val + log(sum);
+
+        // Step 3: HardSwish
+        float hardswish_val = logsum * (1.0f / (1.0f + exp(-logsum - 3.0f))) / 6.0f;
+
+        // Step 4: Subtract bias and clamp
+        float out_val = hardswish_val - bias[0];
+        out_val = out_val > 1.0f ? 1.0f : (out_val < -1.0f ? -1.0f : out_val);
+
+        output[idx] = out_val;
+        idx += 128 * gridDim.x;
+    }
+}
+
+
+extern "C" void fused_all_launcher(const float* input, const float* weight, const float* conv_bias, const float* bias, float* output, cudaStream_t stream) {
+    int total_elems = 128 * 1 * 31 * 63 * 63;
+    int blocks = (total_elems + 128 - 1) / 128;
+    fused_all_kernel<<<blocks, 128, 0, stream>>>(input, weight, conv_bias, bias, output);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_all_kernel_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_all_launcher(const float* input, const float* weight, const float* conv_bias, const float* bias, float* output, cudaStream_t stream);
+
+
+torch::Tensor fused_all_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor conv_bias, torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(input.sizes() == torch::IntArrayRef({128, 3, 16, 32, 32}), "Input must have shape (128, 3, 16, 32, 32)");
+
+    TORCH_CHECK(weight.is_cuda(), "Weight must be a CUDA tensor");
+    TORCH_CHECK(weight.is_contiguous(), "Weight must be contiguous");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Weight must be float32");
+    TORCH_CHECK(weight.sizes() == torch::IntArrayRef({3, 16, 3, 3, 3}), "Weight must have shape (3, 16, 3, 3, 3)");
+
+    TORCH_CHECK(conv_bias.is_cuda(), "Conv bias must be a CUDA tensor");
+    TORCH_CHECK(conv_bias.is_contiguous(), "Conv bias must be contiguous");
+    TORCH_CHECK(conv_bias.dtype() == torch::kFloat32, "Conv bias must be float32");
+    TORCH_CHECK(conv_bias.sizes() == torch::IntArrayRef({16}), "Conv bias must have shape (16)");
+
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    TORCH_CHECK(bias.sizes() == torch::IntArrayRef({1, 1, 1, 1}), "Bias must have shape (1, 1, 1, 1)");
+
+    // Output shape: (128, 1, 31, 63, 63)
+    auto output = torch::empty({128, 1, 31, 63, 63}, input.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    fused_all_launcher(input.data_ptr<float>(), weight.data_ptr<float>(), conv_bias.data_ptr<float>(), bias.data_ptr<float>(), output.data_ptr<float>(), stream);
+
+    return output;
+}
+
+
+void register_fused_all_kernel(pybind11::module& m) {
+    m.def("fused_all_forward", &fused_all_forward,
+          "Fused Transposed Convolution, Bias, LogSumExp, HardSwish, Subtraction, and Clamping forward",
+          py::arg("input"), py::arg("weight"), py::arg("conv_bias"), py::arg("bias"));
+}
+
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_all_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using a fully fused kernel for Transposed Convolution + Bias + LogSumExp + HardSwish + Subtraction + Clamping.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        # Initialize parameters to preserve state_dict compatibility
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(1, 1, 1, 1)) 
+
+    def forward(self, x):
+        # Fully fused operation
+        x = cuda_extension.fused_all_forward(
+            x,
+            self.conv_transpose.weight,
+            self.conv_transpose.bias,
+            self.bias
+        )
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 15
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (5 failures)
+  - [large_magnitude seed=50001] max_diff=1.844370e-02, mean_diff=9.445871e-07, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.0000e+00,1.0000e+00]
+  - [mixed_extremes seed=50012] max_diff=5.436070e-02, mean_diff=6.178442e-08, ref_range=[-7.1134e-02,1.0000e+00], orig_range=[-7.6337e-02,1.0000e+00]
+  - [mixed_extremes seed=50013] max_diff=1.054741e-01, mean_diff=3.636194e-07, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.0000e+00,1.0000e+00]
+  - [head_heavy seed=50024] max_diff=2.051055e-02, mean_diff=1.671970e-09, ref_range=[7.1261e-01,1.0000e+00], orig_range=[6.9210e-01,1.0000e+00]
+  - [tail_heavy seed=50027] max_diff=6.918406e-02, mean_diff=4.913637e-09, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.0000e+00,1.0000e+00]
+
+### training_stress (10 failures)
+  - [large_magnitude seed=70000] max_diff=1.492035e-02, mean_diff=1.490651e-07, ref_range=[-8.4130e-01,1.0000e+00], orig_range=[-8.4126e-01,1.0000e+00]
+  - [large_magnitude seed=70001] max_diff=1.776356e-02, mean_diff=1.779275e-07, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.0000e+00,1.0000e+00]
+  - [mixed_extremes seed=70012] max_diff=5.735040e-02, mean_diff=2.755997e-08, ref_range=[7.1700e-02,1.0000e+00], orig_range=[7.6981e-02,1.0000e+00]
+  - [mixed_extremes seed=70013] max_diff=1.066055e-01, mean_diff=8.673434e-08, ref_range=[-1.9569e-01,1.0000e+00], orig_range=[-2.0828e-01,1.0000e+00]
+  - [head_heavy seed=70024] max_diff=1.815534e-02, mean_diff=1.972829e-08, ref_range=[-9.1750e-01,1.0000e+00], orig_range=[-8.9947e-01,1.0000e+00]
+  - [head_heavy seed=70025] max_diff=7.965776e-02, mean_diff=4.314357e-08, ref_range=[-1.4238e-01,1.0000e+00], orig_range=[-1.4257e-01,1.0000e+00]
+  - [tail_heavy seed=70026] max_diff=6.916943e-02, mean_diff=2.447227e-08, ref_range=[-5.5377e-01,1.0000e+00], orig_range=[-5.5724e-01,1.0000e+00]
+  - [tail_heavy seed=70027] max_diff=4.991627e-02, mean_diff=2.573345e-08, ref_range=[-4.4149e-02,1.0000e+00], orig_range=[5.7677e-03,1.0000e+00]
+  ... and 2 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

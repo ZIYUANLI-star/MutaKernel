@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P94__relop_replace__7",
+  "operator_name": "relop_replace",
+  "kernel_name": "L1_P94",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4083,
+        "completion_tokens": 3338,
+        "total_tokens": 7421,
+        "reasoning_tokens": 1195
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "With batch_size=128 and 256 threads, thread tid=128 evaluates: original(128<128)=false vs mutated(128<=128)=true. The mutant executes an out-of-bounds read at batch_means[128], adding garbage to the reduction sum.",
+      "survival_reason": "The mutation changes the loop bound from strict less-than to less-than-or-equal. With batch_size=128, thread 128 will access batch_means[128] which is beyond the valid array bounds (0-127). This out-of-bounds read returns an uninitialized/garbage value that gets added to the reduction sum. The garbage value propagates through the parallel reduction in shared memory and affects the final computed mean. Since torch::empty doesn't initialize memory, the garbage value is unpredictable but typically non-zero, causing a detectable difference in the final MSE result.",
+      "killable": true,
+      "kill_strategy": "Use predictions equal to targets so expected MSE is exactly 0. Any garbage value from the out-of-bounds read will produce a non-zero result, detectable with atol/rtol=1e-2.",
+      "recommendations": "Always validate loop bounds against array sizes, especially when thread indices can equal the array size. Use assertions or bounds checking during development to catch off-by-one errors in reduction kernels.",
+      "suggested_code": "def generate_inputs(device):\n    # Identical predictions and targets yield MSE = 0\n    # Mutant adds garbage from out-of-bounds batch_means[128] to the sum\n    predictions = torch.ones(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.ones(128, 4096, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3932,
+        "completion_tokens": 4248,
+        "total_tokens": 8180,
+        "reasoning_tokens": 2007
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation causes an out-of-bounds read at batch_means[128] in thread 128 of final_mean_kernel. The garbage value is divided by batch_size (128), so |garbage/128| must exceed atol + rtol*|ref| = 0.01 + 0.01*|ref|. For ref≈0, need |garbage| > 1.28. Previous test produced ref=0 but garbage was likely near-zero due to CUDA allocator behavior or memory padding.",
+      "survival_reason": "The previous attempt used identical tensors (all ones) yielding MSE=0, hoping any garbage would be detectable. However, the garbage at batch_means[128] was likely zero or near-zero due to: (1) CUDA memory allocators often return zeroed memory blocks, (2) memory padding beyond tensor boundaries is typically zeroed, (3) torch::empty followed by torch::zeros might have adjacent zeroed memory. The infection occurred (garbage was read) but didn't propagate sufficiently because garbage/128 < 0.01. A new strategy uses large negative values to potentially prime adjacent memory regions differently through the squared-difference calculations, and creates a very small but non-zero expected MSE to catch asymmetric rounding effects.",
+      "killable": true,
+      "kill_strategy": "Use large-magnitude values with small differences such that per-batch MSE calculations write large intermediate values to batch_means, potentially influencing adjacent memory. Then use predictions=targets for final computation to get expected MSE=0, maximizing sensitivity to any non-zero garbage.",
+      "recommendations": "Mutation testing for CUDA out-of-bounds reads should include deterministic memory poisoning (pre-filling memory with sentinel values like 0xDEADBEEF) before kernel execution to ensure garbage reads are detectable. Consider using CUDA compute-sanitizer to catch such undefined behavior.",
+      "suggested_code": "def generate_inputs(device):\n    # Use very large magnitude values with identical predictions/targets\n    # The large values (1e6) during squared-difference computation create\n    # large intermediate values that might leave non-zero memory footprints\n    # near the batch_means buffer. Expected MSE = 0.\n    # The large magnitude also exercises different memory/register patterns.\n    val = 1e4\n    predictions = torch.full((128, 4096), val, dtype=torch.float32, device=device)\n    targets = torch.full((128, 4096), val, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4195,
+        "completion_tokens": 5535,
+        "total_tokens": 9730,
+        "reasoning_tokens": 2577
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation causes thread 128 (tid=128) to read batch_means[128] (out-of-bounds). The extra value is divided by 128 batch samples. EMD Layer 2 detected bitwise divergence (seed=10000) but the absolute difference |garbage/128| is below the 1e-2 tolerance threshold. To kill: |garbage/128| > 0.01, requiring |garbage| > 1.28. The uninitialized memory value is likely small.",
+      "survival_reason": "Previous attempts used predictions=targets yielding expected MSE=0, relying on garbage being large enough to exceed atol=1e-2 threshold. The out-of-bounds memory at batch_means[128] from torch::empty is likely near-zero (common for fresh CUDA allocations or memory pools). With garbage/128 < 0.01, the mutation survives. Large constant values don't help since they don't affect the uninitialized memory. A fundamentally different approach is to use special IEEE 754 values (NaN, subnormals) or create memory patterns through prior kernel execution that might leave non-trivial values in adjacent memory.",
+      "killable": true,
+      "kill_strategy": "Use subnormal (denormalized) floating-point values that may cause different memory representations and allocation patterns. Specifically, use values extremely close to zero that result in subnormal intermediate results, as CUDA handles subnormals differently and this might expose different garbage patterns in uninitialized memory. Alternatively, use large random values with a specific seed to exercise different memory allocator paths.",
+      "recommendations": "Add boundary checking assertions or use safer memory access patterns in CUDA kernels. The out-of-bounds read is undefined behavior and could cause crashes or security issues on different hardware. Consider using cudaMemset to initialize temporary buffers or explicitly check array bounds.",
+      "suggested_code": "def generate_inputs(device):\n    # Try seed 42 - different memory state might have larger garbage\n    # Also use torch operations that force memory allocations before our tensors\n    # to potentially leave non-zero values in nearby memory\n    torch.manual_seed(42)\n    \n    # Allocate and free some tensors to pollute memory pool\n    for _ in range(5):\n        temp = torch.randn(128, dtype=torch.float32, device=device) * 1000\n        del temp\n    \n    # Force synchronization to ensure memory ops complete\n    if device.type == 'cuda':\n        torch.cuda.synchronize(device)\n    \n    # Now create our test tensors - using zeros for expected MSE = 0\n    # Any garbage read should directly appear as the error\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "llm_generate: 'str' object has no attribute 'type'"
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4596,
+        "completion_tokens": 4692,
+        "total_tokens": 9288,
+        "reasoning_tokens": 2057
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation causes thread 128 to read batch_means[128] (out-of-bounds). This garbage value gets divided by batch_size=128. For detection: garbage/128 > 0.01 requires garbage > 1.28. Previous attempts failed because CUDA memory allocator often returns zeroed or small residual values at out-of-bounds locations.",
+      "survival_reason": "Round 1-2 failed because identical predictions/targets produce MSE=0, but the out-of-bounds read at batch_means[128] returned values too small (<1.28) to exceed the 0.01 tolerance after dividing by 128. Round 3 had a code error (device.type on string). The fundamental issue is that torch::empty doesn't initialize memory, but CUDA's allocator frequently returns near-zero memory, making the garbage value undetectable. To kill this mutant, we must prime the memory pool with large values before the kernel allocates batch_means, hoping the out-of-bounds location contains a large residual.",
+      "killable": true,
+      "kill_strategy": "Prime the CUDA memory allocator by allocating/deallocating tensors of size 128-129 filled with very large values (1e8). This may leave large residual values at memory locations that batch_means[128] could access. Combined with predictions==targets (MSE=0), any significant garbage becomes detectable.",
+      "recommendations": "Kernels with out-of-bounds reads should be tested with memory sanitizers (compute-sanitizer --tool memcheck) to detect undefined behavior regardless of actual garbage values. Value-level testing alone cannot reliably kill mutations involving undefined memory access.",
+      "suggested_code": "def generate_inputs(device):\n    # Prime memory allocator with large values at sizes near 128\n    # The CUDA allocator may reuse this memory for batch_means allocation\n    for size in [128, 129, 130, 127]:\n        for _ in range(25):\n            temp = torch.full((size,), 1e8, dtype=torch.float32, device=device)\n            temp2 = torch.full((size,), -1e8, dtype=torch.float32, device=device)\n            del temp, temp2\n    \n    # Also prime with the exact allocation pattern the kernel uses\n    for _ in range(25):\n        temp_means = torch.empty(128, dtype=torch.float32, device=device)\n        temp_means.fill_(1e8)\n        temp_out = torch.zeros((), dtype=torch.float32, device=device)\n        del temp_means, temp_out\n    \n    # Create test inputs with expected MSE = 0\n    # Any garbage at batch_means[128] will appear as the mutant's output\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5032,
+        "completion_tokens": 4201,
+        "total_tokens": 9233,
+        "reasoning_tokens": 2149
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutant reads batch_means[128] (out-of-bounds) when batch_size=128. Thread 128 reads garbage and adds to shared_sum[128], which folds into final sum during reduction. Error = garbage/128. For detection: |garbage/128| > 0.01 + 0.01*|ref|. With ref≈0 and typical PyTorch CUDA allocator zeroing/reusing clean memory, garbage≈0, so error≈0.",
+      "survival_reason": "All previous attempts tried to prime memory with large values or use identical predictions/targets for MSE=0. The fundamental issue is that PyTorch's CUDA caching allocator typically returns zeroed or clean memory. The torch::empty({128}) followed by torch::zeros({}) likely places batch_means in a region where index 128 reads from either: (1) zeroed allocator memory, (2) the adjacent final_output scalar (initialized to 0), or (3) padding bytes that are zero. Memory priming attempts failed because the allocator doesn't guarantee temporal locality of freed allocations. The infection (reading garbage) doesn't propagate to detectable error because garbage≈0 consistently.",
+      "killable": true,
+      "kill_strategy": "Force CUDA allocator to place non-zero values at batch_means[128] by creating intermediate tensors of exact size 129 floats with large values, synchronizing, then deleting them immediately before the kernel allocates batch_means. Use torch.cuda.empty_cache() to force fresh allocation patterns.",
+      "recommendations": "Out-of-bounds memory access bugs are notoriously difficult to test deterministically because they depend on allocator state. Consider adding CUDA memory sanitizer (compute-sanitizer --tool memcheck) to CI pipelines to detect such accesses regardless of the garbage value read.",
+      "suggested_code": "def generate_inputs(device):\n    import gc\n    # Flush all cached allocations\n    gc.collect()\n    torch.cuda.empty_cache()\n    torch.cuda.synchronize()\n    \n    # Allocate tensors of size 129 (exactly batch_means size + 1)\n    # Fill with large values to leave footprint\n    for _ in range(50):\n        # Size 129 matches potential allocation that includes index 128\n        poison = torch.full((129,), 1e6, dtype=torch.float32, device=device)\n        poison[128] = 1e8  # Specifically poison index 128\n        del poison\n    \n    # Also try size 128 with adjacent allocation\n    for _ in range(50):\n        p1 = torch.full((128,), 5e5, dtype=torch.float32, device=device)\n        p2 = torch.full((1,), 1e8, dtype=torch.float32, device=device)  # Adjacent\n        del p1, p2\n    \n    torch.cuda.synchronize()\n    \n    # Create test tensors - identical for expected MSE=0\n    # Any non-zero garbage at batch_means[128] will cause mutant to diverge\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 471.68
+}

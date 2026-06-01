@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P33__epsilon_modify__1",
+  "operator_name": "epsilon_modify",
+  "kernel_name": "L1_P33",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8188,
+        "completion_tokens": 2887,
+        "total_tokens": 11075,
+        "reasoning_tokens": 913
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "When all values in a channel are constant k, variance=0. Original: inv_std=rsqrt(1e-5)≈316.23, output finite. Mutant: inv_std=rsqrt(0)=inf, output=k*inf+(-k*inf)=NaN. The atol/rtol test fails since NaN≠finite.",
+      "survival_reason": "The mutation changes epsilon from 1e-5 to 0 in the numerical stability guard. In training mode with normal inputs having non-zero variance, both versions produce nearly identical results because var >> eps. However, when input variance is exactly zero (constant values per channel), the original gracefully handles this with eps=1e-5 producing bounded inv_std, while the mutant computes rsqrt(0)=inf leading to NaN outputs through inf-inf operations.",
+      "killable": true,
+      "kill_strategy": "Create an input tensor where all spatial/batch values within each channel are identical, resulting in zero variance per channel. In training mode, this causes the mutant to compute rsqrt(0)=inf and produce NaN outputs, while the original produces finite normalized values.",
+      "recommendations": "Mutation testing for numerical stability parameters like epsilon should include edge cases with zero or near-zero variance inputs. Tests should verify behavior when the denominator in normalization approaches zero.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256] - constant values per channel = zero variance\n    x = torch.ones(16, 64, 256, 256, device=device, dtype=torch.float32)\n    # Each channel gets a unique constant value (non-zero to trigger inf-inf=NaN)\n    channel_values = torch.arange(1.0, 65.0, dtype=torch.float32, device=device).view(1, 64, 1, 1)\n    x = x * channel_values\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8088,
+        "completion_tokens": 4651,
+        "total_tokens": 12739,
+        "reasoning_tokens": 1835
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With variance ≈ 1e-10 from small perturbations: Original inv_std = rsqrt(1e-10 + 1e-5) ≈ 316, Mutant inv_std = rsqrt(1e-10) ≈ 1e5. Scale difference is ~316x. Output difference ≈ perturbation * (1e5 - 316) ≈ 1e-5 * 1e5 = 1.0, which exceeds atol=1e-2.",
+      "survival_reason": "Previous attempt used constant-per-channel values expecting zero variance. This failed because (1) if running in eval mode, running_var=1.0 makes eps difference negligible (~5e-6), and (2) if in training mode with zero variance, the normalized value (x-mean)=0 gives output=beta=0 in both cases after the shift calculation. The new approach uses tiny non-zero perturbations creating small variance where eps=1e-5 dominates for original but not mutant, causing ~316x difference in scaling factors.",
+      "killable": true,
+      "kill_strategy": "Use inputs with tiny perturbations around a constant base to create very small variance (~1e-10). This makes eps=1e-5 dominant in original (inv_std≈316) while mutant uses raw small variance (inv_std≈1e5), producing ~316x different output scaling.",
+      "recommendations": "BatchNorm implementations should be tested with near-constant inputs that produce tiny variances (1e-8 to 1e-12) to verify epsilon provides proper numerical stability. The epsilon parameter is critical for preventing division-by-near-zero, and mutations to it should be caught by variance-edge-case testing.",
+      "suggested_code": "def generate_inputs(device):\n    # Base value with tiny perturbations to create very small variance\n    base = torch.ones(16, 64, 256, 256, device=device, dtype=torch.float32)\n    # Small perturbations create variance ~ (1e-5)^2 = 1e-10\n    torch.manual_seed(42)  # Reproducibility\n    perturbation = torch.randn(16, 64, 256, 256, device=device, dtype=torch.float32) * 1e-5\n    x = base + perturbation\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8353,
+        "completion_tokens": 4979,
+        "total_tokens": 13332,
+        "reasoning_tokens": 1856
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With variance = eps = 1e-5: Original inv_std = rsqrt(2e-5) ≈ 223.6, Mutant inv_std = rsqrt(1e-5) ≈ 316.2. For deviation δ=√(1e-5)≈0.00316 from mean: Original output ≈ 0.707, Mutant output ≈ 1.0. Difference 0.293 >> tolerance 0.017.",
+      "survival_reason": "Round 1 failed because zero variance produced inf/NaN in the mutant, but NaN-aware comparison may treat NaN==NaN as equivalent, or inf-inf=NaN cancellation occurred since (x-mean)=0 for constant input. Round 2 failed because random tiny perturbations (randn*1e-5) created variance ~1e-10, far smaller than eps=1e-5, making both kernels compute nearly identical inv_std (both dominated by eps or near-eps). The key insight is targeting variance EXACTLY equal to eps (1e-5) maximizes the relative difference: original uses sqrt(2)*eps while mutant uses sqrt(1)*eps, yielding a sqrt(2) ratio in inv_std that produces ~41% difference in output values, well exceeding tolerance.",
+      "killable": true,
+      "kill_strategy": "Create input with variance = 1e-5 (equal to original eps) using deterministic 50-50 split of values at mean ± sqrt(eps). This maximizes the multiplicative effect: original computes inv_std=1/sqrt(2*eps), mutant computes inv_std=1/sqrt(eps), differing by factor sqrt(2)≈1.414.",
+      "recommendations": "Epsilon mutations require testing with inputs that produce variance in the same order of magnitude as eps. Standard random inputs typically have variance ~1, making eps negligible. Mutation testing for numerical stability parameters should include dedicated variance-controlled test cases.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256]\n    x = torch.empty(16, 64, 256, 256, device=device, dtype=torch.float32)\n    \n    # Target variance = 1e-5 (matching original eps)\n    # variance = delta^2, so delta = sqrt(1e-5)\n    delta = 1e-5 ** 0.5  # ~0.00316227766\n    base = 1.0\n    \n    # 50-50 split: first 128 columns = base-delta, last 128 = base+delta\n    # This creates variance = delta^2 = 1e-5 exactly\n    x[:, :, :, :128] = base - delta\n    x[:, :, :, 128:] = base + delta\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8706,
+        "completion_tokens": 5968,
+        "total_tokens": 14674,
+        "reasoning_tokens": 2458
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "var=1e-10: orig inv_std=rsqrt(1e-10+1e-5)≈316, mut inv_std=rsqrt(1e-10)=1e5. For (x-mean)~1e-5, outputs: orig≈0.003, mut≈1.0. Diff=0.997 > atol+rtol*|ref|=0.02",
+      "survival_reason": "Previous attempts failed because testing likely ran in eval mode where running_var=1.0 dominates eps. The ~5e-6 relative difference from rsqrt(1.00001) vs rsqrt(1.0) passes tolerance. For training mode, small perturbations work but require deterministic patterns ensuring consistent variance. The new approach uses a checkerboard pattern with alternating ±delta values ensuring exact variance control and testing explicitly in training context.",
+      "killable": true,
+      "kill_strategy": "Create checkerboard pattern with alternating ±1e-5 deviations from mean, yielding variance=1e-10. In training mode, this produces 100x scale difference between original and mutant outputs.",
+      "recommendations": "Mutation tests for numerical stability parameters (eps) should explicitly test both training and eval modes, and use variance values spanning orders of magnitude from 0 to >>eps to catch epsilon-dependent behaviors.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256]\n    x = torch.zeros(16, 64, 256, 256, device=device, dtype=torch.float32)\n    \n    # Target: variance = 1e-10, so std = 1e-5\n    # Using checkerboard: half values at +delta, half at -delta\n    # variance = delta^2, so delta = 1e-5\n    delta = 1e-5\n    base = 10.0  # Non-zero base so normalized output is meaningful\n    \n    # Create checkerboard: even indices get +delta, odd get -delta\n    # This ensures exact 50-50 split and mean = base\n    indices = torch.arange(256, device=device)\n    row_idx = indices.view(256, 1)\n    col_idx = indices.view(1, 256)\n    checkerboard = ((row_idx + col_idx) % 2).float()  # 0 or 1\n    \n    # Map 0->-delta, 1->+delta centered at base\n    pattern = base + (2 * checkerboard - 1) * delta  # base ± delta\n    \n    # Apply to all batch and channel dimensions\n    x = pattern.unsqueeze(0).unsqueeze(0).expand(16, 64, 256, 256).clone()\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9154,
+        "completion_tokens": 7303,
+        "total_tokens": 16457,
+        "reasoning_tokens": 3100
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With mean=0 and variance=delta^2=1e-10: Original scale=rsqrt(1e-10+1e-5)≈316.23, Mutant scale=rsqrt(1e-10)=1e5. For input=±delta=±1e-5: original output=±0.00316, mutant output=±1.0. Difference |0.997|>atol(0.01)+rtol*ref(0.00003)=0.01003",
+      "survival_reason": "Previous attempts all used non-zero mean values, which caused the shift term (beta - mean*scale) to become very large or infinite. When both scale and shift become infinite with opposite signs, the inf-inf cancellation produces unpredictable but sometimes equivalent results. By using zero mean, we eliminate the shift term entirely (shift=0), making output purely input*scale. This avoids any cancellation and directly exposes the ~316x scale factor difference between original (eps=1e-5 dominates variance) and mutant (no eps protection).",
+      "killable": true,
+      "kill_strategy": "Create input with exactly zero mean (symmetric positive/negative values) and tiny variance (1e-10). This makes shift=0 and output=input*scale, directly exposing the ~316x scale difference without inf-inf cancellation.",
+      "recommendations": "When testing numerical stability mutations (eps changes), always test with zero-mean inputs to isolate the scale computation from shift-related cancellation artifacts. Zero mean ensures shift=0 and makes the output directly proportional to the computed scale factor.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256]\n    # Zero mean: half positive delta, half negative delta\n    # Variance = delta^2 = 1e-10, mean = 0\n    delta = 1e-5\n    x = torch.zeros(16, 64, 256, 256, device=device, dtype=torch.float32)\n    # Split along last spatial dimension for exact 50-50\n    x[:, :, :, :128] = delta\n    x[:, :, :, 128:] = -delta\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 473.69
+}

@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P98__relop_replace__4",
+  "operator_name": "relop_replace",
+  "kernel_name": "L1_P98",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4559,
+        "completion_tokens": 4480,
+        "total_tokens": 9039,
+        "reasoning_tokens": 1554
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "seq_len=4096, threads=256. Thread 0 iterates idx=0,256,...,3840,4096. Mutation causes idx=4096 to be included (4096<=4096 is true), accessing pred_batch[4096] and target_batch[4096] which are out-of-bounds. For batches 0-126, this reads the first element of the next batch, adding spurious KL terms.",
+      "survival_reason": "The mutation changes the loop bound from strict inequality to inclusive inequality. With seq_len=4096 and thread 0 reaching idx=4096 on the final iteration, the mutated code accesses memory at index 4096 which is beyond the valid range [0,4095]. This reads data from the next batch's first element (for batches 0-126) or truly out-of-bounds memory (batch 127), adding extra terms to the KL divergence calculation.",
+      "killable": true,
+      "kill_strategy": "Create inputs where the first element of each row has extreme values after normalization. Make targets[:,0] dominant (high probability mass) and predictions[:,0] minimal. This maximizes the spurious contribution t*(log(t)-log(p)) from the out-of-bounds read.",
+      "recommendations": "Always use explicit bounds checking assertions or static analysis to verify loop bounds match array dimensions. The pattern `idx < size` is the canonical safe form for 0-indexed arrays; any mutation to `<=` should be caught by bounds checking tools.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [128, 4096]\n    # Predictions: first element tiny, rest uniform\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    predictions[:, 0] = 1e-10  # Will be clamped to 1e-12, making p[0] tiny after norm\n    \n    # Targets: first element dominant, rest tiny\n    targets = torch.full((128, 4096), 1e-10, device=device, dtype=torch.float32)\n    targets[:, 0] = 1000.0  # Dominates -> t[0] ≈ 1.0 after normalization\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.989772e+04, mean_diff=2.989772e+04, ref_range=[2.9934e+04,2.9934e+04], mut_range=[3.5887e+01,3.5887e+01]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4572,
+        "completion_tokens": 4663,
+        "total_tokens": 9235,
+        "reasoning_tokens": 2017
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes 'idx < seq_len' to 'idx <= seq_len', causing out-of-bounds read at index 4096 for each batch. For batch i (i<127), this reads from batch i+1's position 0. With targets[:,0] having ~71% probability mass and predictions[:,0] having ~0.002% mass after normalization, each spurious read contributes ~7.3 to KL. With 127 such reads averaged over 128 batches, the total difference is ~7.2, far exceeding tolerance (atol=0.01, rtol=0.01 → threshold ~0.08).",
+      "survival_reason": "The previous attempt failed because both original and mutant returned 'not ok' - likely due to extreme values (1e-10) causing numerical instability or matching issues with the test harness reference. The inputs created tiny normalized values (1e-14 range) that may have triggered edge cases. The new strategy uses moderate values that remain numerically stable after clamping and normalization, while still creating maximum contrast at position 0 (high target probability, low prediction probability). This ensures the spurious out-of-bounds read contribution is both large and numerically well-behaved.",
+      "killable": true,
+      "kill_strategy": "Design inputs where position 0 of each batch has high target probability (~0.7) and low prediction probability (~0.00002). The mutant's spurious read of adjacent batch's position 0 adds ~7.3 KL divergence contribution per batch, totaling ~7.2 difference in final mean - far exceeding the 0.08 tolerance threshold.",
+      "recommendations": "Always verify boundary loop conditions with explicit bounds checking tests. Use inputs that specifically target the boundary elements (first/last) of each dimension, combined with values that maximize the contribution of any spurious reads.",
+      "suggested_code": "def generate_inputs(device):\n    # Predictions: first element small, rest moderate\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32) * 0.01\n    predictions[:, 0] = 0.0001  # Will be tiny after normalization\n    \n    # Targets: first element large, rest small\n    targets = torch.ones(128, 4096, device=device, dtype=torch.float32) * 0.001\n    targets[:, 0] = 100.0  # Will dominate after normalization (~0.96 probability)\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.347594e+03, mean_diff=1.347594e+03, ref_range=[1.3721e+03,1.3721e+03], mut_range=[2.4528e+01,2.4528e+01]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4929,
+        "completion_tokens": 6525,
+        "total_tokens": 11454,
+        "reasoning_tokens": 2831
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes `idx < seq_len` to `idx <= seq_len`, causing thread 0 in each block to read one extra element at index 4096 (out of bounds). For batch i, this reads predictions[i+1][0] and targets[i+1][0]. Previous attempts used extreme values that caused both original and mutant to fail due to numerical instability. Using moderate values: predictions uniform (1/4096 each after norm), targets with position 0 = 2.0 (rest 1.0) gives t[0] ≈ 2/4097 ≈ 0.000488 and p[0] = 1/4096 ≈ 0.000244. The spurious KL contribution is t[0]*log(t[0]/p[0]) ≈ 0.000488*log(2) ≈ 0.000338 per batch. With 127 extra contributions, mutant adds ~0.043 to total, giving ~0.000920 vs ~0.000582 mean per batch - difference of 0.000338 still below 0.01 tolerance. Need larger disparity: set targets[:,0] = 100.0, rest = 1.0. After norm: t[0] = 100/4195 ≈ 0.0238, p[0] = 1/4096 ≈ 0.000244. Spurious contribution: 0.0238 * log(0.0238/0.000244) = 0.0238 * 4.58 ≈ 0.109 per batch. Mutant adds 127 * 0.109 / 128 ≈ 0.108 to mean. Total expected difference ~0.108, threshold ~0.01 + 0.01*ref ≈ 0.02, so killed.",
+      "survival_reason": "Previous attempts used extreme values (1e-10, 1000, etc.) which caused numerical instability in BOTH original and mutant (both original_ok=False and mutant_ok=False). The clamping and normalization with such extreme inputs created edge cases where the computation diverged from reference. The new strategy uses moderate values that don't trigger overflow/underflow: predictions uniform, targets with moderately elevated position 0 (100x rather than 1000000x). This ensures stable numerical computation while still creating significant spurious KL contribution at the out-of-bounds read position.",
+      "killable": true,
+      "kill_strategy": "Use moderate non-extreme values: uniform predictions and targets with position 0 elevated by factor of 100 (not 1000000). This creates stable normalized probabilities while ensuring the spurious read at index 4096 (which reads next batch's position 0) adds ~0.1 KL contribution per batch - enough to exceed the tolerance threshold.",
+      "recommendations": "When testing out-of-bounds read mutations, use moderate (not extreme) value disparities to avoid triggering numerical instability in floating-point operations. Extreme values that cause very small probabilities after normalization can lead to log() producing extreme negative values or inf/nan results that mask the actual mutation effect.",
+      "suggested_code": "def generate_inputs(device):\n    # Predictions: uniform values\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    \n    # Targets: position 0 elevated by 100x, rest uniform\n    # After normalization: t[0] = 100/(100+4095) = 0.0238, t[i>0] = 1/4195\n    # Spurious read will access next batch's position 0 = 0.0238\n    # p[0] = 1/4096 = 0.000244\n    # Spurious contribution: 0.0238 * log(0.0238/0.000244) ~ 0.109 per batch\n    targets = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    targets[:, 0] = 100.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=4.615159e+02, mean_diff=4.615159e+02, ref_range=[4.6052e+02,4.6052e+02], mut_range=[-9.9886e-01,-9.9886e-01]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5353,
+        "completion_tokens": 5459,
+        "total_tokens": 10812,
+        "reasoning_tokens": 2385
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes `idx < seq_len` to `idx <= seq_len`, causing thread 0 to read index 4096 (out of bounds). For batches 0-126, this reads next batch's element 0. For batch 127, it reads memory beyond tensor bounds. Previous attempts used extreme values causing both kernels to fail validation. Need moderate values where spurious contribution is detectable but doesn't cause numerical instability.",
+      "survival_reason": "Previous attempts used extreme values (1e-10, 1000, etc.) that caused numerical instability in BOTH original and mutant kernels, making original_ok=False for all attempts. The test framework likely doesn't count as 'killed' when both implementations fail validation. The mutant produces vastly different outputs (Round 3: ref=460 vs mut=-1) but since both fail against some reference check, the kill isn't registered. I need moderate values that keep both kernels numerically stable while still exposing the mutation's effect.",
+      "killable": true,
+      "kill_strategy": "Use moderate values that keep computations stable: predictions with position 0 slightly reduced (0.5) and targets with position 0 slightly elevated (5.0). This creates a modest probability ratio at position 0 that the spurious read will accumulate across 127 batches, producing a detectable difference (~0.05) without causing numerical instability in either kernel.",
+      "recommendations": "When testing boundary mutations in loop conditions, use moderate input values that keep both original and mutant numerically stable. Test with values where the spurious computation (from reading adjacent memory) produces a bounded, predictable contribution rather than extreme values that can cause both implementations to fail.",
+      "suggested_code": "def generate_inputs(device):\n    # Moderate values to avoid numerical instability\n    # predictions: position 0 slightly smaller\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    predictions[:, 0] = 0.5  # After norm: ~0.5/4095.5 ≈ 0.000122\n    \n    # targets: position 0 moderately larger\n    targets = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    targets[:, 0] = 5.0  # After norm: ~5/4100 ≈ 0.00122\n    \n    # Spurious contribution per batch (for batches 0-126):\n    # t_spurious ≈ 0.00122, p_spurious ≈ 0.000122\n    # contribution = 0.00122 * log(0.00122/0.000122) = 0.00122 * 2.3 ≈ 0.0028\n    # Total extra for 127 batches: 127 * 0.0028 = 0.36\n    # Batchmean extra: 0.36/128 ≈ 0.0028 (marginal)\n    \n    # Use slightly more aggressive values\n    predictions[:, 0] = 0.2  # After norm: ~0.0000488\n    targets[:, 0] = 20.0  # After norm: ~0.00486\n    \n    # New spurious contribution: 0.00486 * log(0.00486/0.0000488) = 0.00486 * 4.6 ≈ 0.022\n    # Total: 127 * 0.022 / 128 ≈ 0.022\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=9.230228e+01, mean_diff=9.230228e+01, ref_range=[9.2103e+01,9.2103e+01], mut_range=[-1.9888e-01,-1.9888e-01]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6018,
+        "completion_tokens": 4552,
+        "total_tokens": 10570,
+        "reasoning_tokens": 2110
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Previous attempts used extreme values (very large/small ratios at position 0) causing both original and mutant kernels to fail validation due to numerical instability or garbage memory reads. The mutation idx<=seq_len causes an out-of-bounds read at index 4096, reading next batch's position 0 (batches 0-126) or garbage (batch 127). With moderate random values, position 0 after normalization has typical probability ~1/4096 ± variance. Spurious contribution per batch ≈ p[i+1,0] * |log(p[i+1,0]/t[i+1,0])| accumulates across 127 batches. With random data, asymmetry at position 0 creates measurable ~0.01-0.1 extra contribution.",
+      "survival_reason": "All previous attempts failed because they created extreme value ratios that caused both original and mutant to produce results that didn't match the reference (original_ok=False). The extreme concentrations at position 0 (ratios of 1000x, 100x) caused numerical instability. Additionally, the garbage memory read for batch 127 with extreme values likely produced NaN or overflow. Using moderate random values with a floor (+0.1) avoids near-zero values, keeps all probabilities in a numerically stable range, and ensures the spurious contribution from the out-of-bounds read is small but detectable while not causing catastrophic numerical issues.",
+      "killable": true,
+      "kill_strategy": "Use uniformly random values in [0.1, 1.1] range for both tensors. This ensures: (1) no extreme probability ratios after normalization, (2) stable logarithm computations, (3) the spurious out-of-bounds read adds detectable but bounded contribution. The random variation ensures position 0 has different values than interior positions, creating measurable KL divergence difference.",
+      "recommendations": "When testing GPU kernels with normalization, avoid extreme input values that can cause numerical instability in both reference and mutant paths. Use moderate random values with a minimum floor to ensure stable floating-point computations while still exercising boundary conditions.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(12345)\n    # Random values in [0.1, 1.1] - moderate, stable range\n    predictions = torch.rand(128, 4096, device=device, dtype=torch.float32) * 1.0 + 0.1\n    targets = torch.rand(128, 4096, device=device, dtype=torch.float32) * 1.0 + 0.1\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=6.892797e+02, mean_diff=6.892797e+02, ref_range=[6.8956e+02,6.8956e+02], mut_range=[2.7972e-01,2.7972e-01]",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 556.03
+}

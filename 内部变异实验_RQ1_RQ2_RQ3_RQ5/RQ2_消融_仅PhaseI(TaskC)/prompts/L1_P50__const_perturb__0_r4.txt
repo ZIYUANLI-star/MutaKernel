@@ -1,0 +1,598 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for product reduction
+prod_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__device__ __forceinline__ scalar_t warp_reduce_product(scalar_t val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val *= __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+template<typename scalar_t>
+__global__ void prod_reduction_kernel_optimized(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t reduction_size,
+    const int64_t inner_size
+) {
+    extern __shared__ char shared_memory[];
+    scalar_t* shared = reinterpret_cast<scalar_t*>(shared_memory);
+    
+    const int64_t outer_idx = blockIdx.x;
+    const int64_t inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (inner_idx >= inner_size) return;
+    
+    const int64_t input_offset = outer_idx * reduction_size * inner_size + inner_idx;
+    const int64_t output_offset = outer_idx * inner_size + inner_idx;
+    
+    scalar_t thread_product = scalar_t(1.0);
+    
+    // Optimized memory access pattern
+    const int64_t elements_per_thread = 32;
+    const int64_t thread_id = threadIdx.x;
+    const int64_t block_dim = blockDim.x;
+    
+    // Process elements with better memory coalescing
+    for (int64_t base = 0; base < reduction_size; base += elements_per_thread * block_dim) {
+        int64_t idx = base + thread_id;
+        
+        #pragma unroll
+        for (int64_t j = 0; j < elements_per_thread; ++j) {
+            if (idx < reduction_size) {
+                thread_product *= input[input_offset + idx * inner_size];
+            }
+            idx += block_dim;
+        }
+    }
+    
+    // Warp-level reduction
+    scalar_t warp_product = warp_reduce_product(thread_product);
+    
+    // Write warp result to shared memory
+    if (threadIdx.x % 32 == 0) {
+        shared[threadIdx.x / 32] = warp_product;
+    }
+    __syncthreads();
+    
+    // Final reduction across warps
+    if (threadIdx.x < 32) {
+        scalar_t val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[threadIdx.x] : scalar_t(1.0);
+        scalar_t block_product = warp_reduce_product(val);
+        
+        if (threadIdx.x == 0) {
+            output[output_offset] = block_product;
+        }
+    }
+}
+
+template<typename scalar_t>
+__global__ void prod_reduction_kernel_small(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t reduction_size,
+    const int64_t inner_size
+) {
+    const int64_t outer_idx = blockIdx.x;
+    const int64_t inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (inner_idx >= inner_size) return;
+    
+    const int64_t input_offset = outer_idx * reduction_size * inner_size + inner_idx;
+    const int64_t output_offset = outer_idx * inner_size + inner_idx;
+    
+    scalar_t product = scalar_t(1.0);
+    
+    // Simple reduction for small sizes
+    for (int64_t i = 0; i < reduction_size; ++i) {
+        product *= input[input_offset + i * inner_size];
+    }
+    
+    if (threadIdx.x == 0) {
+        output[output_offset] = product;
+    }
+}
+
+torch::Tensor prod_reduction_cuda(torch::Tensor input, int64_t dim) {
+    auto sizes = input.sizes();
+    
+    // Handle negative dimension
+    if (dim < 0) {
+        dim = input.dim() + dim;
+    }
+    
+    // Calculate output shape
+    std::vector<int64_t> output_shape;
+    for (int64_t i = 0; i < input.dim(); ++i) {
+        if (i != dim) {
+            output_shape.push_back(sizes[i]);
+        }
+    }
+    auto output = torch::empty(output_shape, input.options());
+    
+    // Calculate dimensions for kernel launch
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= sizes[i];
+    }
+    
+    int64_t reduction_size = sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); ++i) {
+        inner_size *= sizes[i];
+    }
+    
+    // Choose kernel based on reduction size
+    const int64_t block_size = 256;
+    const int64_t grid_x = outer_size;
+    const int64_t grid_y = (inner_size + block_size - 1) / block_size;
+    
+    dim3 grid(grid_x, grid_y);
+    dim3 block(block_size);
+    
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "prod_reduction_cuda", [&] {
+        if (reduction_size <= 32) {
+            // Use simple kernel for small reductions
+            prod_reduction_kernel_small<scalar_t><<<grid, block>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                outer_size,
+                reduction_size,
+                inner_size
+            );
+        } else {
+            // Use optimized kernel with warp reduction for larger reductions
+            size_t shared_mem_size = ((block_size + 31) / 32) * sizeof(scalar_t);
+            prod_reduction_kernel_optimized<scalar_t><<<grid, block, shared_mem_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                outer_size,
+                reduction_size,
+                inner_size
+            );
+        }
+    });
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    return output;
+}
+"""
+
+prod_reduction_cpp_source = """
+torch::Tensor prod_reduction_cuda(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+prod_reduction_module = load_inline(
+    name="prod_reduction",
+    cpp_sources=prod_reduction_cpp_source,
+    cuda_sources=prod_reduction_source,
+    functions=["prod_reduction_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs product reduction over a dimension using custom CUDA kernels.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): Dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.prod_reduction = prod_reduction_module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs product reduction over the specified dimension using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with product reduction applied.
+        """
+        if x.is_cuda:
+            return self.prod_reduction.prod_reduction_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return torch.prod(x, dim=self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for product reduction
+prod_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__device__ __forceinline__ scalar_t warp_reduce_product(scalar_t val) {
+    #pragma unroll
+    for (int offset = 17; offset > 0; offset >>= 1) {
+        val *= __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+template<typename scalar_t>
+__global__ void prod_reduction_kernel_optimized(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t reduction_size,
+    const int64_t inner_size
+) {
+    extern __shared__ char shared_memory[];
+    scalar_t* shared = reinterpret_cast<scalar_t*>(shared_memory);
+    
+    const int64_t outer_idx = blockIdx.x;
+    const int64_t inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (inner_idx >= inner_size) return;
+    
+    const int64_t input_offset = outer_idx * reduction_size * inner_size + inner_idx;
+    const int64_t output_offset = outer_idx * inner_size + inner_idx;
+    
+    scalar_t thread_product = scalar_t(1.0);
+    
+    // Optimized memory access pattern
+    const int64_t elements_per_thread = 32;
+    const int64_t thread_id = threadIdx.x;
+    const int64_t block_dim = blockDim.x;
+    
+    // Process elements with better memory coalescing
+    for (int64_t base = 0; base < reduction_size; base += elements_per_thread * block_dim) {
+        int64_t idx = base + thread_id;
+        
+        #pragma unroll
+        for (int64_t j = 0; j < elements_per_thread; ++j) {
+            if (idx < reduction_size) {
+                thread_product *= input[input_offset + idx * inner_size];
+            }
+            idx += block_dim;
+        }
+    }
+    
+    // Warp-level reduction
+    scalar_t warp_product = warp_reduce_product(thread_product);
+    
+    // Write warp result to shared memory
+    if (threadIdx.x % 32 == 0) {
+        shared[threadIdx.x / 32] = warp_product;
+    }
+    __syncthreads();
+    
+    // Final reduction across warps
+    if (threadIdx.x < 32) {
+        scalar_t val = (threadIdx.x < (blockDim.x + 31) / 32) ? shared[threadIdx.x] : scalar_t(1.0);
+        scalar_t block_product = warp_reduce_product(val);
+        
+        if (threadIdx.x == 0) {
+            output[output_offset] = block_product;
+        }
+    }
+}
+
+template<typename scalar_t>
+__global__ void prod_reduction_kernel_small(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t reduction_size,
+    const int64_t inner_size
+) {
+    const int64_t outer_idx = blockIdx.x;
+    const int64_t inner_idx = blockIdx.y * blockDim.x + threadIdx.x;
+    
+    if (inner_idx >= inner_size) return;
+    
+    const int64_t input_offset = outer_idx * reduction_size * inner_size + inner_idx;
+    const int64_t output_offset = outer_idx * inner_size + inner_idx;
+    
+    scalar_t product = scalar_t(1.0);
+    
+    // Simple reduction for small sizes
+    for (int64_t i = 0; i < reduction_size; ++i) {
+        product *= input[input_offset + i * inner_size];
+    }
+    
+    if (threadIdx.x == 0) {
+        output[output_offset] = product;
+    }
+}
+
+torch::Tensor prod_reduction_cuda(torch::Tensor input, int64_t dim) {
+    auto sizes = input.sizes();
+    
+    // Handle negative dimension
+    if (dim < 0) {
+        dim = input.dim() + dim;
+    }
+    
+    // Calculate output shape
+    std::vector<int64_t> output_shape;
+    for (int64_t i = 0; i < input.dim(); ++i) {
+        if (i != dim) {
+            output_shape.push_back(sizes[i]);
+        }
+    }
+    auto output = torch::empty(output_shape, input.options());
+    
+    // Calculate dimensions for kernel launch
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= sizes[i];
+    }
+    
+    int64_t reduction_size = sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); ++i) {
+        inner_size *= sizes[i];
+    }
+    
+    // Choose kernel based on reduction size
+    const int64_t block_size = 256;
+    const int64_t grid_x = outer_size;
+    const int64_t grid_y = (inner_size + block_size - 1) / block_size;
+    
+    dim3 grid(grid_x, grid_y);
+    dim3 block(block_size);
+    
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "prod_reduction_cuda", [&] {
+        if (reduction_size <= 32) {
+            // Use simple kernel for small reductions
+            prod_reduction_kernel_small<scalar_t><<<grid, block>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                outer_size,
+                reduction_size,
+                inner_size
+            );
+        } else {
+            // Use optimized kernel with warp reduction for larger reductions
+            size_t shared_mem_size = ((block_size + 31) / 32) * sizeof(scalar_t);
+            prod_reduction_kernel_optimized<scalar_t><<<grid, block, shared_mem_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                outer_size,
+                reduction_size,
+                inner_size
+            );
+        }
+    });
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    return output;
+}
+"""
+
+prod_reduction_cpp_source = """
+torch::Tensor prod_reduction_cuda(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+prod_reduction_module = load_inline(
+    name="prod_reduction",
+    cpp_sources=prod_reduction_cpp_source,
+    cuda_sources=prod_reduction_source,
+    functions=["prod_reduction_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs product reduction over a dimension using custom CUDA kernels.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): Dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.prod_reduction = prod_reduction_module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs product reduction over the specified dimension using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor with product reduction applied.
+        """
+        if x.is_cuda:
+            return self.prod_reduction.prod_reduction_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return torch.prod(x, dim=self.dim)
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 13
+- Original fragment: `16`
+- node_type: const:int+1
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 13
+- Original fragment: `16`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - near_zero: passed
+  - near_zero: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+  - sparse: passed
+  - sparse: passed
+- Divergence found: round_type=stress, seed=10100, policy=large_magnitude
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Use constant values slightly greater than 1.0 (like 1.5) across the reduction dimension. This ensures each thread computes a substantial product, and the incorrect warp reduction (missing lane 16, duplicating some lanes) produces a clearly different final value that exceeds the tolerance threshold.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Fill with 1.5 to create substantial products
+    # Product of 256 values of 1.5 is huge, but warp reduction
+    # operates on thread_products after the main loop
+    # The shuffle offset difference (16 vs 17) will cause
+    # different thread products to be combined
+    x = torch.full((16, 256, 256), 1.5, dtype=torch.float32, device=device)
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+- Error: ref NaN/Inf and original also invalid on LLM input
+
+### Round 2
+- Strategy: Set all values to 1.0 except: input[:, :, 16] = 10.0 and input[:, :, 17] = 0.1. Thread 16 computes product of column 16 (across reduction dim) and thread 17 computes product of column 17. Due to indexing, the products will differ by factor of 100. Original combines lane 0 with lane 16's value (10.0); mutant combines lane 0 with lane 17's value (0.1). The 100x difference propagates through to final output.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)
+    # Set column 16 and 17 to different values
+    # Thread 16 will have product involving column 16's values
+    # Thread 17 will have product involving column 17's values
+    # Original shuffles lane 0 with lane 16, mutant with lane 17
+    x[:, :, 16] = 10.0  # Makes thread 16's product = 10^256 is too large
+    # Use a single element modification instead to avoid overflow
+    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)
+    x[:, 0, 16] = 100.0   # Thread 16's product = 100.0 * 1^255 = 100.0
+    x[:, 0, 17] = 0.01    # Thread 17's product = 0.01 * 1^255 = 0.01
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 3
+- Strategy: Set input such that thread 16's product differs from thread 17's product. Thread 0 reads thread 16's value in original (shuffle offset 16) but thread 17's value in mutant (shuffle offset 17). Use moderate values to avoid overflow: x[:, 0, 16] = 5.0, x[:, 0, 17] = 7.0, rest 1.0. This creates 5.0 vs 7.0 initial difference that propagates through the reduction.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)
+    # Thread i computes product of column i across reduction dim
+    # Thread 0 shuffles with lane 16 (original) or lane 17 (mutant)
+    # Set values so thread 16 product = 5.0, thread 17 product = 7.0
+    x[:, 0, 16] = 5.0  # Thread 16's product will be 5.0
+    x[:, 0, 17] = 7.0  # Thread 17's product will be 7.0
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

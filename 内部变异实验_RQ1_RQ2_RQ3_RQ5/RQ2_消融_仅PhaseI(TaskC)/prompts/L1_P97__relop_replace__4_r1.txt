@@ -1,0 +1,438 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+
+A mutation testing tool applied a mutation to a GPU kernel. The 4-layer
+Equivalence-Mutant Detection (EMD) pipeline ran on this mutant:
+- Layer 0 — source-code normalization
+- Layer 1 — static equivalence rules
+- Layer 2 — multi-seed differential testing (0 total rounds, including baseline)
+- Layer 3 — LLM-based equivalence reasoning (if executed)
+
+EMD concluded this mutant is **possibly killable** (or has not been definitively
+declared equivalent). **NO downstream deterministic stress testing has been
+applied.** Your task is to either:
+1. Confirm the mutant is unkillable under the fixed-shape contract, OR
+2. Construct a value-level test input that exposes its behavioral difference.
+
+## Testing Contract (fixed-shape, variable-value)
+
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`** (NaN-aware: if
+   reference produces NaN/Inf, mutant must produce matching NaN/Inf at the
+   same positions). To kill the mutant, your input must produce a result
+   whose **maximum absolute element-wise difference vs reference exceeds
+   `atol + rtol * |ref|`** (with `atol=rtol=1e-2`). Differences below this
+   threshold will NOT count as a kill — design inputs with clear, large
+   divergences, not minimal ones.
+4. **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fully fused cosine similarity loss with vectorized memory access
+cosine_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<int THREADS_PER_BLOCK, int ELEMENTS_PER_THREAD>
+__global__ void cosine_loss_fused_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ output,
+    int batch_size,
+    int feature_size
+) {
+    __shared__ float shared_dot[THREADS_PER_BLOCK];
+    __shared__ float shared_pred_norm[THREADS_PER_BLOCK];
+    __shared__ float shared_target_norm[THREADS_PER_BLOCK];
+    
+    int tid = threadIdx.x;
+    int batch_idx = blockIdx.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const float* pred_ptr = predictions + batch_idx * feature_size;
+    const float* target_ptr = targets + batch_idx * feature_size;
+    
+    // Initialize accumulators
+    float dot_product = 0.0f;
+    float norm_pred = 0.0f;
+    float norm_target = 0.0f;
+    
+    // Vectorized processing for better memory bandwidth utilization
+    for (int base = 0; base < feature_size; base += THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) {
+        int idx = base + tid * ELEMENTS_PER_THREAD;
+        
+        #pragma unroll
+        for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+            int element_idx = idx + i;
+            if (element_idx < feature_size) {
+                float pred_val = pred_ptr[element_idx];
+                float target_val = target_ptr[element_idx];
+                dot_product += pred_val * target_val;
+                norm_pred += pred_val * pred_val;
+                norm_target += target_val * target_val;
+            }
+        }
+    }
+    
+    // Store thread results in shared memory
+    shared_dot[tid] = dot_product;
+    shared_pred_norm[tid] = norm_pred;
+    shared_target_norm[tid] = norm_target;
+    __syncthreads();
+    
+    // Parallel reduction using warp shuffles for better efficiency
+    for (int stride = THREADS_PER_BLOCK / 2; stride >= 32; stride >>= 1) {
+        if (tid < stride) {
+            shared_dot[tid] += shared_dot[tid + stride];
+            shared_pred_norm[tid] += shared_pred_norm[tid + stride];
+            shared_target_norm[tid] += shared_target_norm[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Warp-level reduction
+    if (tid < 32) {
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 16);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 16);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 16);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 8);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 8);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 8);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 4);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 4);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 4);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 2);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 2);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 2);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 1);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 1);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 1);
+    }
+    __syncthreads();
+    
+    // First thread computes final loss for this batch
+    if (tid == 0) {
+        const float epsilon = 1e-8f;
+        float norm_product = sqrtf(shared_pred_norm[0] + epsilon) * sqrtf(shared_target_norm[0] + epsilon);
+        float cosine_sim = shared_dot[0] / (norm_product + epsilon);
+        float loss = 1.0f - cosine_sim;
+        
+        // Atomic add to accumulate mean
+        atomicAdd(output, loss / batch_size);
+    }
+}
+
+torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto batch_size = predictions.size(0);
+    auto feature_size = predictions.size(1);
+    
+    // Allocate output tensor (single value)
+    auto options = torch::TensorOptions()
+        .dtype(predictions.dtype())
+        .device(predictions.device());
+    auto output = torch::zeros({1}, options);
+    
+    // Choose optimal configuration based on feature size
+    const int THREADS = 256;
+    const int ELEMENTS_PER_THREAD = 4;  // Process 4 elements per thread for better memory coalescing
+    
+    dim3 grid_size(batch_size, 1, 1);
+    dim3 block_size(THREADS, 1, 1);
+    
+    // Launch fused kernel - one block per batch element
+    cosine_loss_fused_kernel<THREADS, ELEMENTS_PER_THREAD><<<grid_size, block_size>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        feature_size
+    );
+    
+    return output.squeeze();
+}
+"""
+
+cosine_loss_cpp_source = "torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets);"
+
+# Compile the inline CUDA code - fixed compiler flags
+cosine_loss = load_inline(
+    name="cosine_loss",
+    cpp_sources=cosine_loss_cpp_source,
+    cuda_sources=cosine_loss_source,
+    functions=["cosine_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fully fused custom CUDA kernel for cosine similarity loss.
+    Features vectorized memory access and warp-level reductions.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cosine_loss = cosine_loss
+
+    def forward(self, predictions, targets):
+        # Use custom CUDA kernel for fully fused cosine similarity loss computation
+        return self.cosine_loss.cosine_loss_cuda(predictions, targets)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fully fused cosine similarity loss with vectorized memory access
+cosine_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<int THREADS_PER_BLOCK, int ELEMENTS_PER_THREAD>
+__global__ void cosine_loss_fused_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ output,
+    int batch_size,
+    int feature_size
+) {
+    __shared__ float shared_dot[THREADS_PER_BLOCK];
+    __shared__ float shared_pred_norm[THREADS_PER_BLOCK];
+    __shared__ float shared_target_norm[THREADS_PER_BLOCK];
+    
+    int tid = threadIdx.x;
+    int batch_idx = blockIdx.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const float* pred_ptr = predictions + batch_idx * feature_size;
+    const float* target_ptr = targets + batch_idx * feature_size;
+    
+    // Initialize accumulators
+    float dot_product = 0.0f;
+    float norm_pred = 0.0f;
+    float norm_target = 0.0f;
+    
+    // Vectorized processing for better memory bandwidth utilization
+    for (int base = 0; base < feature_size; base += THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) {
+        int idx = base + tid * ELEMENTS_PER_THREAD;
+        
+        #pragma unroll
+        for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+            int element_idx = idx + i;
+            if (element_idx <= feature_size) {
+                float pred_val = pred_ptr[element_idx];
+                float target_val = target_ptr[element_idx];
+                dot_product += pred_val * target_val;
+                norm_pred += pred_val * pred_val;
+                norm_target += target_val * target_val;
+            }
+        }
+    }
+    
+    // Store thread results in shared memory
+    shared_dot[tid] = dot_product;
+    shared_pred_norm[tid] = norm_pred;
+    shared_target_norm[tid] = norm_target;
+    __syncthreads();
+    
+    // Parallel reduction using warp shuffles for better efficiency
+    for (int stride = THREADS_PER_BLOCK / 2; stride >= 32; stride >>= 1) {
+        if (tid < stride) {
+            shared_dot[tid] += shared_dot[tid + stride];
+            shared_pred_norm[tid] += shared_pred_norm[tid + stride];
+            shared_target_norm[tid] += shared_target_norm[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Warp-level reduction
+    if (tid < 32) {
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 16);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 16);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 16);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 8);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 8);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 8);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 4);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 4);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 4);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 2);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 2);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 2);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 1);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 1);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 1);
+    }
+    __syncthreads();
+    
+    // First thread computes final loss for this batch
+    if (tid == 0) {
+        const float epsilon = 1e-8f;
+        float norm_product = sqrtf(shared_pred_norm[0] + epsilon) * sqrtf(shared_target_norm[0] + epsilon);
+        float cosine_sim = shared_dot[0] / (norm_product + epsilon);
+        float loss = 1.0f - cosine_sim;
+        
+        // Atomic add to accumulate mean
+        atomicAdd(output, loss / batch_size);
+    }
+}
+
+torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto batch_size = predictions.size(0);
+    auto feature_size = predictions.size(1);
+    
+    // Allocate output tensor (single value)
+    auto options = torch::TensorOptions()
+        .dtype(predictions.dtype())
+        .device(predictions.device());
+    auto output = torch::zeros({1}, options);
+    
+    // Choose optimal configuration based on feature size
+    const int THREADS = 256;
+    const int ELEMENTS_PER_THREAD = 4;  // Process 4 elements per thread for better memory coalescing
+    
+    dim3 grid_size(batch_size, 1, 1);
+    dim3 block_size(THREADS, 1, 1);
+    
+    // Launch fused kernel - one block per batch element
+    cosine_loss_fused_kernel<THREADS, ELEMENTS_PER_THREAD><<<grid_size, block_size>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        feature_size
+    );
+    
+    return output.squeeze();
+}
+"""
+
+cosine_loss_cpp_source = "torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets);"
+
+# Compile the inline CUDA code - fixed compiler flags
+cosine_loss = load_inline(
+    name="cosine_loss",
+    cpp_sources=cosine_loss_cpp_source,
+    cuda_sources=cosine_loss_source,
+    functions=["cosine_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fully fused custom CUDA kernel for cosine similarity loss.
+    Features vectorized memory access and warp-level reductions.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cosine_loss = cosine_loss
+
+    def forward(self, predictions, targets):
+        # Use custom CUDA kernel for fully fused cosine similarity loss computation
+        return self.cosine_loss.cosine_loss_cuda(predictions, targets)
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 43
+- Original fragment: `<`
+- node_type: cuda_Lt
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[128, 4096], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 4096], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain mathematical
+errors. Reason independently from the source code — do not blindly trust
+prior reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 43
+- Original fragment: `<`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Tested seeds: [10000]
+- Divergence found: round_type=random, seed=10000, policy=None
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Value-pattern construction**: If a difference IS reachable,
+construct one concrete numerical pattern (e.g., one specific tensor value
+distribution) that triggers the divergence within the fixed shapes.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

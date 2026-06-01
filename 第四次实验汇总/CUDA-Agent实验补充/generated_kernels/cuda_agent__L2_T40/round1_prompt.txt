@@ -1,0 +1,145 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, followed by a sum, layer normalization, average pooling, and GELU activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, sum_weight, norm_shape, pool_kernel_size):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.sum_weight = nn.Parameter(torch.tensor(sum_weight))
+        self.norm = nn.LayerNorm(norm_shape)
+        self.avg_pool = nn.AvgPool3d(kernel_size=pool_kernel_size)
+        self.gelu = nn.GELU()
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x + self.sum_weight
+        x = self.norm(x)
+        x = self.avg_pool(x)
+        x = self.gelu(x)
+        return x
+
+batch_size = 32
+in_channels = 32
+out_channels = 64
+depth, height, width = 16, 32, 32
+kernel_size = (3, 3, 3)
+stride = (2, 2, 2)
+padding = (1, 1, 1)
+output_padding = (1, 1, 1)
+sum_weight = 1.0
+norm_shape = (out_channels,)
+pool_kernel_size = (2, 2, 2)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, sum_weight, norm_shape, pool_kernel_size]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using PyTorch's efficient operations and TF32, compiled.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, sum_weight, norm_shape, pool_kernel_size):
+        super().__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.sum_weight = nn.Parameter(torch.tensor(sum_weight))
+        self.norm = nn.LayerNorm(norm_shape)  # Keep the same name for state_dict
+        self.avg_pool = nn.AvgPool3d(kernel_size=pool_kernel_size)
+        self.gelu = nn.GELU()
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def forward(self, x):
+        # Enable TF32 for faster ConvTranspose
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Step 1: ConvTranspose3D
+        x = torch.conv_transpose3d(
+            x,
+            self.conv_transpose.weight,
+            self.conv_transpose.bias,
+            self.conv_transpose.stride,
+            self.conv_transpose.padding,
+            self.conv_transpose.output_padding,
+            self.conv_transpose.groups
+        )
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        # Step 2: Sum with sum_weight
+        x = x + self.sum_weight
+        
+        # Step 3: LayerNorm
+        batch_size, channels, depth, height, width = x.shape
+        
+        mean = x.mean(dim=-1, keepdim=True)
+        var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
+        inv_std = torch.rsqrt(var + 1e-05)
+        
+        gamma = self.norm.weight.view(1, channels, 1, 1, 1)
+        beta = self.norm.bias.view(1, channels, 1, 1, 1)
+        
+        x = gamma * (x - mean) * inv_std + beta
+        
+        # Step 4: Average pooling
+        x = x.unfold(2, 2, 2).unfold(3, 2, 2).unfold(4, 2, 2)
+        x = x.mean(dim=(-1, -2, -3))
+        
+        # Step 5: GELU
+        cdf = 0.5 * (1.0 + torch.erf(x / 1.41421356237309504880))
+        x = x * cdf
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 4
+Failing dimensions: dtype_stress, repeated_run
+Tolerance used: atol=0.01, rtol=0.01
+
+### dtype_stress (2 failures)
+  - [? seed=60000] 
+  - [? seed=60001] 
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

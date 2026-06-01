@@ -1,0 +1,219 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd".
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(input_size, hidden_size)
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
+        """
+        x = self.gemm(x)
+        original_x = x
+        x = torch.sigmoid(x)
+        x = x * self.scaling_factor
+        x = x + original_x
+        return x
+
+batch_size = 1024
+input_size = 8192
+hidden_size = 8192
+scaling_factor = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, scaling_factor]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_bias_sigmoid_scaling_residual.cu ===
+#include <cuda_runtime.h>
+
+__global__ void fused_bias_sigmoid_scaling_residual_kernel(float* output, const float* x, const float* bias) {
+    int tid = blockIdx.x * 256 + threadIdx.x;
+    int total_elements = 1024 * 8192;
+
+    if (tid < total_elements) {
+        float val = x[tid] + bias[tid % 8192];
+        float sig = 1.0f / (1.0f + exp(-val));
+        output[tid] = val + 2.0f * sig;
+    }
+}
+
+extern "C" void fused_bias_sigmoid_scaling_residual_launcher(
+    float* output,
+    const float* x,  // This is the matmul result without bias
+    const float* bias,
+    cudaStream_t stream
+) {
+    int blocks = (1024 * 8192 + 256 - 1) / 256;
+    fused_bias_sigmoid_scaling_residual_kernel<<<blocks, 256, 0, stream>>>(output, x, bias);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_bias_sigmoid_scaling_residual_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_bias_sigmoid_scaling_residual_launcher(
+    float* output,
+    const float* x,
+    const float* bias,
+    cudaStream_t stream
+);
+
+torch::Tensor fused_bias_sigmoid_scaling_residual_forward(torch::Tensor x, torch::Tensor bias) {
+    TORCH_CHECK(x.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(x.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(x.size(0) == 1024 && x.size(1) == 8192, "Input shape must be (1024, 8192)");
+    
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    TORCH_CHECK(bias.size(0) == 8192, "Bias shape must be (8192)");
+    
+    auto output = torch::empty_like(x);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    fused_bias_sigmoid_scaling_residual_launcher(output.data_ptr<float>(), x.data_ptr<float>(), bias.data_ptr<float>(), stream);
+    
+    return output;
+}
+
+void register_fused_bias_sigmoid_scaling_residual(pybind11::module& m) {
+    m.def("fused_bias_sigmoid_scaling_residual_forward", &fused_bias_sigmoid_scaling_residual_forward,
+          "Fused bias addition, sigmoid, scaling, and residual addition");
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_bias_sigmoid_scaling_residual_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Model implementing the pattern "Gemm_Sigmoid_Scaling_ResidualAdd" with fused post-processing.
+    """
+    def __init__(self, input_size, hidden_size, scaling_factor):
+        super().__init__()
+        self.gemm = nn.Linear(input_size, hidden_size)  # Keep the same name as in the original model
+        self.scaling_factor = scaling_factor
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, hidden_size).
+        """
+        # Enable TF32 for better performance
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Use the same weight and bias as the original model
+        weight = self.gemm.weight
+        bias = self.gemm.bias
+        
+        # Compute matmul without bias
+        x = x.matmul(weight.transpose(0, 1))
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        # Use fused kernel for bias + sigmoid + scaling + residual
+        x = cuda_extension.fused_bias_sigmoid_scaling_residual_forward(x, bias)
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 56
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.011578e+00, mean_diff=1.387139e-01, ref_range=[-2.9043e+03,3.1146e+03], orig_range=[-2.9043e+03,3.1145e+03]
+  - [large_magnitude seed=50001] max_diff=1.013883e+00, mean_diff=1.388074e-01, ref_range=[-3.4643e+03,3.1937e+03], orig_range=[-3.4640e+03,3.1937e+03]
+  - [near_overflow seed=50002] max_diff=9.486423e+26, mean_diff=1.383594e+26, ref_range=[-3.0531e+30,3.0890e+30], orig_range=[-3.0530e+30,3.0890e+30]
+  - [near_overflow seed=50003] max_diff=9.054854e+26, mean_diff=1.382322e+26, ref_range=[-3.0229e+30,3.0624e+30], orig_range=[-3.0230e+30,3.0624e+30]
+  - [all_negative seed=50008] max_diff=1.094251e-01, mean_diff=1.399452e-02, ref_range=[-3.0182e+02,2.9060e+02], orig_range=[-3.0181e+02,2.9056e+02]
+  - [all_negative seed=50009] max_diff=1.170707e-01, mean_diff=1.410396e-02, ref_range=[-3.0017e+02,2.7018e+02], orig_range=[-3.0016e+02,2.7020e+02]
+  - [all_positive seed=50010] max_diff=1.137065e-01, mean_diff=1.402653e-02, ref_range=[-2.8011e+02,2.9221e+02], orig_range=[-2.8012e+02,2.9221e+02]
+  - [all_positive seed=50011] max_diff=1.215134e-01, mean_diff=1.392455e-02, ref_range=[-2.7317e+02,2.9943e+02], orig_range=[-2.7318e+02,2.9942e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.074300e+00, mean_diff=1.387267e-01, ref_range=[-2.9604e+03,3.3066e+03], orig_range=[-2.9604e+03,3.3063e+03]
+  - [large_magnitude seed=70001] max_diff=1.026323e+00, mean_diff=1.387661e-01, ref_range=[-3.2903e+03,3.2861e+03], orig_range=[-3.2904e+03,3.2863e+03]
+  - [near_overflow seed=70002] max_diff=9.493846e+26, mean_diff=1.382447e+26, ref_range=[-3.0536e+30,3.1567e+30], orig_range=[-3.0535e+30,3.1567e+30]
+  - [near_overflow seed=70003] max_diff=8.790402e+26, mean_diff=1.382908e+26, ref_range=[-3.0318e+30,3.0498e+30], orig_range=[-3.0316e+30,3.0500e+30]
+  - [all_negative seed=70008] max_diff=1.235514e-01, mean_diff=1.403103e-02, ref_range=[-3.0563e+02,2.8051e+02], orig_range=[-3.0563e+02,2.8048e+02]
+  - [all_negative seed=70009] max_diff=1.164110e-01, mean_diff=1.393223e-02, ref_range=[-2.9413e+02,3.2472e+02], orig_range=[-2.9414e+02,3.2472e+02]
+  - [all_positive seed=70010] max_diff=1.158037e-01, mean_diff=1.405581e-02, ref_range=[-2.8322e+02,2.7454e+02], orig_range=[-2.8321e+02,2.7454e+02]
+  - [all_positive seed=70011] max_diff=1.242860e-01, mean_diff=1.402571e-02, ref_range=[-2.8882e+02,2.9628e+02], orig_range=[-2.8881e+02,2.9625e+02]
+  ... and 20 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

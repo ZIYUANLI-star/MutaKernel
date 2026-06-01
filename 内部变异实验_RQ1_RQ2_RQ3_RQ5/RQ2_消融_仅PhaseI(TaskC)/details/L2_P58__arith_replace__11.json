@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P58__arith_replace__11",
+  "operator_name": "arith_replace",
+  "kernel_name": "L2_P58",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6003,
+        "completion_tokens": 4885,
+        "total_tokens": 10888,
+        "reasoning_tokens": 1917
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Original: base_input_idx = (batch_idx * 3) * 16384 + spatial_idx. Mutated: base_input_idx = (batch_idx * 3) / 16384 + spatial_idx = 0 + spatial_idx (since 127*3/16384=0 in integer division). For batch_idx>0, original reads from offset batch_idx*3*16384, mutated always reads from offset 0 (batch 0 data). Difference is reachable for all batch_idx > 0.",
+      "survival_reason": "The mutation survived 112 tests likely because random inputs produced similar distributions across batches, and after hardswish/6 - bias operations with clamp to [-1,1], outputs saturated to clamp boundaries. With random values and the max-reduction, most outputs hit ±1 regardless of which batch's data was read. Additionally, the shared memory race condition in the kernel (256 threads writing to 3 shared memory slots) introduces non-determinism that may have masked the bug.",
+      "killable": true,
+      "kill_strategy": "Create input where batch 0 is zeros and other batches have values that produce non-saturating outputs (between -1 and 1). After conv_transpose, batch 0 will produce a bias-dominated output while other batches produce different values. The mutant will incorrectly use batch 0's data for all batches.",
+      "recommendations": "When testing kernels with index calculations involving batch dimensions, systematically vary values BETWEEN batches (not just across spatial positions) to catch indexing bugs that cause cross-batch data leakage. Also, the shared memory usage pattern in this kernel has a race condition that should be fixed.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 3, 16, 32, 32, device=device, dtype=torch.float32)\n    # Batch 0 stays zero\n    # Other batches get distinct non-zero values that won't saturate after processing\n    x[1:, :, :, :, :] = 0.5  # Moderate value to avoid clamp saturation\n    # Add some variation to ensure conv_transpose produces different features\n    x[64:, :, :, :, :] = -0.5\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5916,
+        "completion_tokens": 5934,
+        "total_tokens": 11850,
+        "reasoning_tokens": 2746
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes base_input_idx from (batch_idx * channels) * spatial_size to (batch_idx * channels) / spatial_size. For batch_idx > 0 with small channels (e.g., 16) and large spatial_size (e.g., 16384), the division yields 0, causing mutant to read batch 0's data for all batches. Previous test used zeros for batch 0 + uniform 0.5/-0.5 values which, after conv_transpose with random weights, produced outputs in similar ranges that got clamped to [-1,1] similarly.",
+      "survival_reason": "The previous attempt failed because: (1) Uniform values (0.5, -0.5) don't create enough variation after conv_transpose with random weights—the weighted sums tend toward similar ranges; (2) Setting batch 0 to zeros doesn't guarantee distinct conv_transpose output since the convolution bias dominates small inputs; (3) The clamp to [-1,1] saturates outputs, hiding differences. The new strategy uses per-batch linearly varying values that scale with batch index, creating systematic differences that survive conv_transpose (each batch has distinct magnitude) and produce outputs spanning different regions of the hardswish/clamp curve.",
+      "killable": true,
+      "kill_strategy": "Create input where each batch has a distinct, linearly-scaled value pattern. Batch 0 gets large positive values (causing hardswish→+1 after clamp), while batch 127 gets large negative values (causing hardswish→-1 or 0). The systematic scaling ensures that even with random conv_transpose weights, the per-batch statistics differ enough to produce distinguishable outputs when the mutant incorrectly reads batch 0's data for all batches.",
+      "recommendations": "When testing index computation mutations involving division vs multiplication, use per-batch (or per-indexed-dimension) linearly varying values rather than constant or binary patterns. This ensures that incorrect indexing produces systematically wrong values that cannot accidentally align with correct outputs.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 3, 16, 32, 32, device=device, dtype=torch.float32)\n    # Create per-batch gradient: batch 0 = -10, batch 64 = 0, batch 127 ≈ +10\n    for i in range(128):\n        x[i, :, :, :, :] = (i - 64) / 6.4  # Range: [-10, +9.84]\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6200,
+        "completion_tokens": 5064,
+        "total_tokens": 11264,
+        "reasoning_tokens": 2466
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation changes base_input_idx from (batch_idx*channels)*spatial_size to (batch_idx*channels)/spatial_size. For batch>0 with spatial_size≈16384 and channels≈16, the division truncates to 0, making all batches read batch 0's data. Previous tests failed because uniform/gradient patterns across batches produced similar post-clamp values. Need extreme batch-0-specific pattern.",
+      "survival_reason": "Previous attempts used patterns (zeros/uniform/gradients) that, after conv_transpose with random weights, produced values that clamped to similar ranges across batches. The clamp[-1,1] operation masked differences because: (1) Round 1's zeros+0.5 pattern still produced similar hardswish→clamp outputs across batches, (2) Round 2's linear gradient spread values too evenly, causing saturation at both ends. The key insight is that shared memory race conditions cause undefined behavior, but if batch 0's data happens to produce clamped values similar to other batches, the mutation survives. Need batch 0 to produce distinctly different clamped values than other batches.",
+      "killable": true,
+      "kill_strategy": "Create input where batch 0 produces conv_transpose output near zero (causing hardswish output near 0), while other batches produce extreme positive conv_transpose output (causing hardswish→clamp saturation to +1). Use batch 0 = zeros and other batches = alternating extreme positive/negative spike patterns that survive conv_transpose averaging to produce high magnitude outputs.",
+      "recommendations": "Mutation testing for CUDA kernels with shared memory race conditions should include tests that specifically verify per-batch data isolation by using drastically different per-batch value distributions (e.g., zeros vs extreme values) rather than smooth gradients.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 3, 16, 32, 32, device=device, dtype=torch.float32)\n    # Batch 0 stays zero - will produce minimal conv_transpose output\n    # Other batches get checkerboard extreme pattern to ensure large magnitude output\n    for b in range(1, 128):\n        # Create 3D checkerboard pattern with extreme values\n        for c in range(3):\n            for d in range(16):\n                for h in range(32):\n                    for w in range(32):\n                        sign = 1 if (d + h + w) % 2 == 0 else -1\n                        x[b, c, d, h, w] = sign * 100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "timeout/crash"
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6533,
+        "completion_tokens": 6015,
+        "total_tokens": 12548,
+        "reasoning_tokens": 3506
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With spatial_size >> batch_idx*channels, (batch_idx*channels)/spatial_size = 0 for all batches. Mutant reads batch 0's memory for all batches. Previous tests failed because shared memory race corrupted values - multiple threads wrote different spatial data to same channel_vals. With spatially-constant-per-batch inputs, all threads write identical values → no race → mutation exposed.",
+      "survival_reason": "The kernel has a shared memory race condition where 256 threads all write to the same channel_vals[c] array. With random/varied spatial inputs, this race produces arbitrary results in both original and mutant, masking the indexing bug. Previous attempts used spatially-varying patterns that triggered the race. By making all spatial positions identical within each batch (but different across batches), we eliminate the race condition's randomizing effect, allowing the systematic batch-indexing difference to manifest.",
+      "killable": true,
+      "kill_strategy": "Use spatially-constant-per-batch input: batch 0 has value A everywhere, other batches have value B≠A everywhere. This eliminates shared memory race (all threads write same value). Original kernel sees batch-specific constants; mutant sees batch 0's value for all batches.",
+      "recommendations": "The original kernel has a fundamental bug: shared memory channel_vals is shared across 256 threads but each thread writes its own spatial position's data. This race condition should be fixed by either giving each thread its own shared memory region or using a different reduction strategy. Mutation testing should include spatially-constant inputs to expose indexing bugs without race interference.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((128, 3, 16, 32, 32), -2.0, device=device, dtype=torch.float32)\n    x[0, :, :, :, :] = 2.0  # Batch 0 distinctly different\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6730,
+        "completion_tokens": 5070,
+        "total_tokens": 11800,
+        "reasoning_tokens": 2297
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original: base_input_idx = batch_idx*3*16384 + spatial_idx (correct batch-specific offset). Mutant: base_input_idx = (batch_idx*3)/16384 + spatial_idx = 0 + spatial_idx for all batch_idx<5462 (integer division truncates). The mutant reads batch 0's data for ALL batches. However, due to shared memory race condition (256 threads all write to same 3-element channel_vals array), the winning thread's spatial position determines the read value. Previous tests used spatially uniform values within batches, so the race produced consistent results. Need spatially-varying values to expose the different batch-origin reads.",
+      "survival_reason": "Previous attempts failed because they used spatially-uniform values (constant per batch). In this kernel, 256 threads race to write to 3 shared memory slots - all threads write to the same channel_vals[c]. With spatially-uniform input, the race winner's value equals all other threads' values for that batch, masking the mutation. Round 1-4 all used spatially constant patterns (zeros/constants per batch). The mutation affects WHICH batch's data is read, but if all spatial positions within a batch have identical values, the race outcome is the same. We need input where different spatial positions have different values, so the batch-origin difference (original reads batch b, mutant reads batch 0) produces observably different channel_vals after the race.",
+      "killable": true,
+      "kill_strategy": "Create input where values vary spatially AND vary systematically between batches. Use a gradient pattern: input[b,c,d,h,w] = (b - 64) * 0.05 + (d*h*w % 256) * 0.001. This ensures: (1) batch 0 ≠ batch 127 by ~6.4 baseline difference, (2) spatial variation breaks race-equivalence, (3) values stay in [-3.5, 3.5] range to avoid clamp saturation.",
+      "recommendations": "When testing mutations affecting batch indexing in kernels with shared memory races, always use spatially-varying input patterns. Uniform-per-batch inputs mask the race outcome's dependency on which thread wins, hiding mutations that affect which data source is read.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 3, 16, 32, 32, device=device, dtype=torch.float32)\n    # Create batch-varying baseline with spatial jitter\n    for b in range(128):\n        baseline = (b - 64) * 0.05  # Range: [-3.2, 3.15]\n        # Add deterministic spatial pattern to break race-uniformity\n        spatial_pattern = torch.arange(16*32*32, device=device, dtype=torch.float32).reshape(16, 32, 32)\n        spatial_pattern = (spatial_pattern % 256) * 0.002 - 0.256  # Range: [-0.256, 0.254]\n        for c in range(3):\n            x[b, c, :, :, :] = baseline + spatial_pattern + c * 0.01\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 1029.07
+}

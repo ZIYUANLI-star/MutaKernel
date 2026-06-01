@@ -1,0 +1,125 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B)
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication.
+
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (K, N).
+
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return torch.matmul(A.T, B)
+
+M = 1024 * 2
+K = 4096 * 2
+N = 2048 * 2
+
+def get_inputs():
+    A = torch.rand(K, M)
+    B = torch.rand(K, N)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that uses PyTorch's efficient matrix multiplication with TF32
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication using PyTorch's optimized implementation with TF32.
+
+        Args:
+            A: Input tensor of shape (K, M).
+            B: Input tensor of shape (K, N).
+
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        # Enable TF32 for this matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Use PyTorch's efficient matrix multiplication
+        output = torch.matmul(A.transpose(0, 1), B)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return output
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 32
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (16 failures)
+  - [large_magnitude seed=50000] max_diff=1.436320e+05, mean_diff=2.124965e+04, ref_range=[-4.9247e+08,4.9211e+08], orig_range=[-4.9248e+08,4.9211e+08]
+  - [large_magnitude seed=50001] max_diff=1.416400e+05, mean_diff=2.124696e+04, ref_range=[-4.8738e+08,4.6419e+08], orig_range=[-4.8734e+08,4.6420e+08]
+  - [mixed_extremes seed=50012] max_diff=7.315712e+06, mean_diff=1.060608e+06, ref_range=[-2.5247e+10,2.5592e+10], orig_range=[-2.5248e+10,2.5593e+10]
+  - [mixed_extremes seed=50013] max_diff=7.690272e+06, mean_diff=1.060477e+06, ref_range=[-2.6411e+10,2.6002e+10], orig_range=[-2.6414e+10,2.6001e+10]
+  - [sparse seed=50016] max_diff=1.907969e+02, mean_diff=2.087376e+01, ref_range=[-5.3308e+05,5.1764e+05], orig_range=[-5.3308e+05,5.1763e+05]
+  - [sparse seed=50017] max_diff=1.689688e+02, mean_diff=2.086468e+01, ref_range=[-5.5687e+05,5.6104e+05], orig_range=[-5.5688e+05,5.6106e+05]
+  - [boundary_last_element seed=50022] max_diff=9.789062e+00, mean_diff=2.228491e-02, ref_range=[-3.3548e+04,1.0000e+08], orig_range=[-3.3555e+04,1.0000e+08]
+  - [boundary_last_element seed=50023] max_diff=9.701172e+00, mean_diff=2.223910e-02, ref_range=[-3.6430e+04,1.0000e+08], orig_range=[-3.6425e+04,1.0000e+08]
+  ... and 8 more failures
+
+### training_stress (16 failures)
+  - [large_magnitude seed=70000] max_diff=1.468720e+05, mean_diff=2.125372e+04, ref_range=[-4.9514e+08,4.7382e+08], orig_range=[-4.9515e+08,4.7379e+08]
+  - [large_magnitude seed=70001] max_diff=1.372960e+05, mean_diff=2.124910e+04, ref_range=[-4.8617e+08,4.7739e+08], orig_range=[-4.8612e+08,4.7742e+08]
+  - [mixed_extremes seed=70012] max_diff=6.966272e+06, mean_diff=1.060573e+06, ref_range=[-2.3401e+10,2.3994e+10], orig_range=[-2.3400e+10,2.3994e+10]
+  - [mixed_extremes seed=70013] max_diff=7.603712e+06, mean_diff=1.061553e+06, ref_range=[-2.4367e+10,2.2944e+10], orig_range=[-2.4367e+10,2.2945e+10]
+  - [sparse seed=70016] max_diff=1.637969e+02, mean_diff=2.088170e+01, ref_range=[-4.9852e+05,5.1619e+05], orig_range=[-4.9850e+05,5.1619e+05]
+  - [sparse seed=70017] max_diff=1.689375e+02, mean_diff=2.089782e+01, ref_range=[-5.0481e+05,5.7302e+05], orig_range=[-5.0484e+05,5.7305e+05]
+  - [boundary_last_element seed=70022] max_diff=1.712891e+01, mean_diff=2.226033e-02, ref_range=[-4.0916e+04,1.0000e+08], orig_range=[-4.0899e+04,1.0000e+08]
+  - [boundary_last_element seed=70023] max_diff=9.714844e+00, mean_diff=2.227464e-02, ref_range=[-3.8993e+04,1.0000e+08], orig_range=[-3.8998e+04,1.0000e+08]
+  ... and 8 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

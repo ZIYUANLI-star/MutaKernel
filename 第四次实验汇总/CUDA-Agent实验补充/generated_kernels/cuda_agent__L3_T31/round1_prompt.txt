@@ -1,0 +1,294 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, num_classes=1000, input_channels=3, alpha=1.0):
+        """
+        MobileNetV1 architecture implementation.
+
+        :param num_classes: The number of output classes (default: 1000)
+        :param input_channels: The number of input channels (default: 3 for RGB images)
+        :param alpha: Width multiplier (default: 1.0)
+        """
+        super(Model, self).__init__()
+        
+        def conv_bn(inp, oup, stride):
+            return nn.Sequential(
+                nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+                nn.BatchNorm2d(oup),
+                nn.ReLU(inplace=True)
+            )
+        
+        def conv_dw(inp, oup, stride):
+            return nn.Sequential(
+                nn.Conv2d(inp, inp, 3, stride, 1, groups=inp, bias=False),
+                nn.BatchNorm2d(inp),
+                nn.ReLU(inplace=True),
+                
+                nn.Conv2d(inp, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+                nn.ReLU(inplace=True),
+            )
+        
+        self.model = nn.Sequential(
+            conv_bn(input_channels, int(32 * alpha), 2),
+            conv_dw(int(32 * alpha), int(64 * alpha), 1),
+            conv_dw(int(64 * alpha), int(128 * alpha), 2),
+            conv_dw(int(128 * alpha), int(128 * alpha), 1),
+            conv_dw(int(128 * alpha), int(256 * alpha), 2),
+            conv_dw(int(256 * alpha), int(256 * alpha), 1),
+            conv_dw(int(256 * alpha), int(512 * alpha), 2),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(512 * alpha), 1),
+            conv_dw(int(512 * alpha), int(1024 * alpha), 2),
+            conv_dw(int(1024 * alpha), int(1024 * alpha), 1),
+            nn.AvgPool2d(7),
+        )
+        self.fc = nn.Linear(int(1024 * alpha), num_classes)
+    
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_channels, height, width)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        x = self.model(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        return x
+
+# Test code
+batch_size = 10
+input_channels = 3
+height = 224
+width = 224
+num_classes = 1000
+alpha = 1.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_channels, height, width)]
+
+def get_init_inputs():
+    return [num_classes, input_channels, alpha]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, input_channels=3, alpha=1.0):
+        super().__init__()
+        self.num_classes = num_classes
+        self.input_channels = input_channels
+        self.alpha = alpha
+        
+        # Store all weights as a dictionary to make it easier to map
+        self.weights = nn.Module()
+        
+        # Initial conv
+        self.weights.conv1_weight = nn.Parameter(torch.empty(int(32 * alpha), input_channels, 3, 3))
+        
+        # Batch norm for initial conv
+        self.weights.conv1_bn_weight = nn.Parameter(torch.empty(int(32 * alpha)))
+        self.weights.conv1_bn_bias = nn.Parameter(torch.empty(int(32 * alpha)))
+        self.weights.conv1_bn_running_mean = nn.Parameter(torch.empty(int(32 * alpha)), requires_grad=False)
+        self.weights.conv1_bn_running_var = nn.Parameter(torch.empty(int(32 * alpha)), requires_grad=False)
+        
+        # Depth-wise and point-wise convolutions for each block
+        self._initialize_dw_pw_weights()
+        
+        # Linear layer
+        self.weights.fc_weight = nn.Parameter(torch.empty(num_classes, int(1024 * alpha)))
+        self.weights.fc_bias = nn.Parameter(torch.empty(num_classes))
+        
+        # Initialize weights
+        self._initialize_weights()
+        
+        # Compile the model
+        self.forward = torch.compile(self.forward, backend='inductor', 
+                                    options={'max_autotune': False, 'triton.unique_kernel_names': True})
+
+    def _initialize_dw_pw_weights(self):
+        # Create weights for all conv_dw blocks (13 blocks)
+        depths = [32, 64, 128, 128, 256, 256, 512, 512, 512, 512, 512, 512, 1024]
+        depths = [int(d * self.alpha) for d in depths]
+        
+        for i in range(1, 14):  # 13 conv_dw blocks
+            in_channels = depths[i-1]
+            out_channels = depths[i] if i < 13 else 1024
+            
+            # Depth-wise
+            setattr(self.weights, f'dw_conv{i}_weight', nn.Parameter(torch.empty(in_channels, 1, 3, 3)))
+            setattr(self.weights, f'dw_conv{i}_bn_weight', nn.Parameter(torch.empty(in_channels)))
+            setattr(self.weights, f'dw_conv{i}_bn_bias', nn.Parameter(torch.empty(in_channels)))
+            setattr(self.weights, f'dw_conv{i}_bn_running_mean', nn.Parameter(torch.empty(in_channels), requires_grad=False))
+            setattr(self.weights, f'dw_conv{i}_bn_running_var', nn.Parameter(torch.empty(in_channels), requires_grad=False))
+            
+            # Point-wise
+            setattr(self.weights, f'pw_conv{i}_weight', nn.Parameter(torch.empty(out_channels, in_channels, 1, 1)))
+            setattr(self.weights, f'pw_conv{i}_bn_weight', nn.Parameter(torch.empty(out_channels)))
+            setattr(self.weights, f'pw_conv{i}_bn_bias', nn.Parameter(torch.empty(out_channels)))
+            setattr(self.weights, f'pw_conv{i}_bn_running_mean', nn.Parameter(torch.empty(out_channels), requires_grad=False))
+            setattr(self.weights, f'pw_conv{i}_bn_running_var', nn.Parameter(torch.empty(out_channels), requires_grad=False))
+
+    def _initialize_weights(self):
+        # Initialize all weights
+        for name, param in self.weights.named_parameters():
+            if 'weight' in name and param.dim() == 4 and param.size(2) == 3 and param.size(3) == 3:
+                # Depth-wise or regular 3x3 conv
+                nn.init.xavier_uniform_(param)
+            elif 'weight' in name and param.dim() == 4 and param.size(2) == 1 and param.size(3) == 1:
+                # Point-wise conv
+                nn.init.xavier_uniform_(param)
+            elif 'weight' in name and param.dim() == 2:
+                # Linear weight
+                nn.init.xavier_uniform_(param)
+            elif 'bias' in name:
+                nn.init.zeros_(param)
+            elif 'running_mean' in name:
+                nn.init.zeros_(param)
+            elif 'running_var' in name:
+                nn.init.ones_(param)
+
+    def load_state_dict(self, state_dict):
+        # Custom state dict mapping
+        new_state_dict = {}
+        
+        # Initial conv
+        new_state_dict['weights.conv1_weight'] = state_dict['model.0.0.weight']
+        
+        # Batch norm for initial conv
+        new_state_dict['weights.conv1_bn_weight'] = state_dict['model.0.1.weight']
+        new_state_dict['weights.conv1_bn_bias'] = state_dict['model.0.1.bias']
+        new_state_dict['weights.conv1_bn_running_mean'] = state_dict['model.0.1.running_mean']
+        new_state_dict['weights.conv1_bn_running_var'] = state_dict['model.0.1.running_var']
+        
+        # Conv_dw blocks - these are layers 1 to 13 in model.model
+        for i in range(1, 14):
+            block_idx = i
+            # Depth-wise
+            new_state_dict[f'weights.dw_conv{i}_weight'] = state_dict[f'model.{block_idx}.0.weight']
+            new_state_dict[f'weights.dw_conv{i}_bn_weight'] = state_dict[f'model.{block_idx}.1.weight']
+            new_state_dict[f'weights.dw_conv{i}_bn_bias'] = state_dict[f'model.{block_idx}.1.bias']
+            new_state_dict[f'weights.dw_conv{i}_bn_running_mean'] = state_dict[f'model.{block_idx}.1.running_mean']
+            new_state_dict[f'weights.dw_conv{i}_bn_running_var'] = state_dict[f'model.{block_idx}.1.running_var']
+            
+            # Point-wise
+            new_state_dict[f'weights.pw_conv{i}_weight'] = state_dict[f'model.{block_idx}.3.weight']
+            new_state_dict[f'weights.pw_conv{i}_bn_weight'] = state_dict[f'model.{block_idx}.4.weight']
+            new_state_dict[f'weights.pw_conv{i}_bn_bias'] = state_dict[f'model.{block_idx}.4.bias']
+            new_state_dict[f'weights.pw_conv{i}_bn_running_mean'] = state_dict[f'model.{block_idx}.4.running_mean']
+            new_state_dict[f'weights.pw_conv{i}_bn_running_var'] = state_dict[f'model.{block_idx}.4.running_var']
+        
+        # Linear layer
+        new_state_dict['weights.fc_weight'] = state_dict['fc.weight']
+        new_state_dict['weights.fc_bias'] = state_dict['fc.bias']
+        
+        super().load_state_dict(new_state_dict)
+
+    def forward(self, x):
+        # Enable TF32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Initial conv
+        x = torch.conv2d(x, self.weights.conv1_weight, None, [2, 2], [1, 1], [1, 1])
+        
+        # Batch norm + relu
+        inv_std = (self.weights.conv1_bn_running_var + 1e-05).rsqrt()
+        gamma_inv_std = self.weights.conv1_bn_weight * inv_std
+        beta_minus_mean_inv_std = self.weights.conv1_bn_bias - self.weights.conv1_bn_running_mean * inv_std
+        x = x * gamma_inv_std[:, None, None] + beta_minus_mean_inv_std[:, None, None]
+        x = x.clamp_min(0.0)
+        
+        # Conv_dw blocks
+        conv_dw_strides = [1, 2, 1, 2, 1, 2, 1, 1, 1, 1, 1, 1, 2]
+        
+        for i in range(1, 14):
+            # Depth-wise conv
+            x = torch.conv2d(x, getattr(self.weights, f'dw_conv{i}_weight'), None, 
+                            [conv_dw_strides[i-1], conv_dw_strides[i-1]], 
+                            [1, 1], [1, 1], getattr(self.weights, f'dw_conv{i}_weight').size(0))
+            
+            # Batch norm + relu
+            dw_inv_std = (getattr(self.weights, f'dw_conv{i}_bn_running_var') + 1e-05).rsqrt()
+            dw_gamma_inv_std = getattr(self.weights, f'dw_conv{i}_bn_weight') * dw_inv_std
+            dw_beta_minus_mean_inv_std = getattr(self.weights, f'dw_conv{i}_bn_bias') - getattr(self.weights, f'dw_conv{i}_bn_running_mean') * dw_inv_std
+            x = x * dw_gamma_inv_std[:, None, None] + dw_beta_minus_mean_inv_std[:, None, None]
+            x = x.clamp_min(0.0)
+            
+            # Point-wise conv
+            x = torch.conv2d(x, getattr(self.weights, f'pw_conv{i}_weight'), None, [1, 1], [0, 0], [1, 1])
+            
+            # Batch norm + relu
+            pw_inv_std = (getattr(self.weights, f'pw_conv{i}_bn_running_var') + 1e-05).rsqrt()
+            pw_gamma_inv_std = getattr(self.weights, f'pw_conv{i}_bn_weight') * pw_inv_std
+            pw_beta_minus_mean_inv_std = getattr(self.weights, f'pw_conv{i}_bn_bias') - getattr(self.weights, f'pw_conv{i}_bn_running_mean') * pw_inv_std
+            x = x * pw_gamma_inv_std[:, None, None] + pw_beta_minus_mean_inv_std[:, None, None]
+            x = x.clamp_min(0.0)
+        
+        # AvgPool2d
+        x = x.mean(dim=(2, 3), keepdim=True)
+        
+        # Linear layer
+        x = x.reshape(x.size(0), -1)
+        x = torch.addmm(self.weights.fc_bias, x, self.weights.fc_weight.t())
+        
+        # Disable TF32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 42
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (2 failures)
+  - [near_overflow seed=50002] max_diff=1.586304e+18, mean_diff=3.364539e+17, ref_range=[-9.9588e+18,1.2402e+19], orig_range=[-1.0503e+19,1.2985e+19]
+  - [near_overflow seed=50003] max_diff=3.919447e+18, mean_diff=8.557289e+17, ref_range=[-2.3786e+19,2.3538e+19], orig_range=[-2.6130e+19,2.5341e+19]
+
+### training_stress (40 failures)
+  - [large_magnitude seed=70000] max_diff=9.854997e-01, mean_diff=1.805919e-01, ref_range=[-7.6862e-01,1.0165e+00], orig_range=[-5.0031e-02,4.9592e-02]
+  - [large_magnitude seed=70001] max_diff=8.524181e-01, mean_diff=1.866434e-01, ref_range=[-7.0954e-01,8.7605e-01], orig_range=[-4.4119e-02,5.2001e-02]
+  - [near_zero seed=70004] max_diff=1.027549e+00, mean_diff=1.820563e-01, ref_range=[-7.9005e-01,1.0166e+00], orig_range=[-4.6964e-02,4.9320e-02]
+  - [near_zero seed=70005] max_diff=1.089545e+00, mean_diff=1.799057e-01, ref_range=[-1.1217e+00,8.0358e-01], orig_range=[-4.8630e-02,4.9846e-02]
+  - [denormals seed=70006] max_diff=9.224586e-01, mean_diff=1.844538e-01, ref_range=[-9.4323e-01,8.9364e-01], orig_range=[-5.4128e-02,4.6353e-02]
+  - [denormals seed=70007] max_diff=7.987329e-01, mean_diff=1.895103e-01, ref_range=[-7.8854e-01,8.3234e-01], orig_range=[-5.2562e-02,4.6618e-02]
+  - [all_negative seed=70008] max_diff=8.566735e-01, mean_diff=1.805520e-01, ref_range=[-8.2178e-01,8.7837e-01], orig_range=[-4.6617e-02,4.4528e-02]
+  - [all_negative seed=70009] max_diff=8.359869e-01, mean_diff=1.840258e-01, ref_range=[-8.5531e-01,8.8426e-01], orig_range=[-6.0745e-02,4.8712e-02]
+  ... and 32 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

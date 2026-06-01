@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L2_P41__index_replace__19",
+  "operator_name": "index_replace",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8435,
+        "completion_tokens": 4616,
+        "total_tokens": 13051,
+        "reasoning_tokens": 1781
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "threadIdx.z is always 0 in a 2D block (32,32,1). When the else branch executes, original code writes 0.0 to tile_a[threadIdx.y][threadIdx.x] (unique locations), while mutated code writes 0.0 to tile_a[threadIdx.y][0] (race condition, overwriting column 0). EMD Layer 2 confirmed divergence at seed 10000.",
+      "survival_reason": "The mutation replaces threadIdx.x with threadIdx.z in the padding code path. Since threadIdx.z is always 0 in this 2D thread block, all threads that take the else branch will write to tile_a[row][0] instead of their respective column positions. This either causes data races or overwrites valid loaded data with zeros. While my initial analysis suggested the else branch might never execute for M=128, K=512 (both exact multiples of 32), the EMD system detected actual divergence, indicating the branch IS taken in some scenarios or there are subtle execution differences.",
+      "killable": true,
+      "kill_strategy": "Use non-zero random input values. Any computation through the GEMM will be affected if tile_a padding is corrupted. The mutant was already found divergent with random seed 10000, so standard random values should trigger the difference.",
+      "recommendations": "When writing padding code in tiled CUDA kernels, always verify that index expressions use the correct thread dimension. A mutation-resistant practice is to use named constants or helper functions for thread indices in critical shared memory operations.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10000)  # Same seed that EMD found divergence with\n    x = torch.randn(128, 512, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8246,
+        "completion_tokens": 2311,
+        "total_tokens": 10557,
+        "reasoning_tokens": 711
+      },
+      "reason_category": "predicate_unreachable",
+      "proof_sketch": "The mutation is in the else branch of the tile_a loading code: `if (row < M && (tiled_k + threadIdx.x) < K) {...} else {tile_a[threadIdx.y][threadIdx.z]=0.0}`. For this else branch to execute: row >= M OR (tiled_k + threadIdx.x) >= K. With M=128 and K=512, both divisible by TILE_SIZE=32: (1) grid_y = 4 blocks, max row = 3*32+31 = 127 < 128, (2) 16 complete K-tiles, max (tiled_k + threadIdx.x) = 15*32+31 = 511 < 512. The padding branch is NEVER executed.",
+      "survival_reason": "The previous attempt with random values failed because the mutation resides in dead code for the fixed input dimensions. The mutation changes `tile_a[threadIdx.y][threadIdx.x] = 0.0` to `tile_a[threadIdx.y][threadIdx.z] = 0.0` in the else (padding) branch. This branch handles out-of-bounds cases when loading tiles. However, with M=128 (batch) and K=512 (in_features), both dimensions are exact multiples of TILE_SIZE=32, meaning all threads always fall within bounds and the padding branch is never taken. The EMD system may have reported divergence due to uninitialized memory or other non-determinism, but the actual mutated code path is unreachable regardless of input values.",
+      "killable": false,
+      "kill_strategy": "The mutant is unkillable through value changes alone. The mutated code is in a padding branch that only executes when input dimensions are not divisible by TILE_SIZE=32. With fixed shapes [128, 512] where 128%32=0 and 512%32=0, this branch is never reached. Killing would require changing input shapes to have M or K not divisible by 32, which violates the fixed-shape constraint.",
+      "recommendations": "When testing tiled GPU kernels with boundary-handling logic, ensure test shapes include cases where dimensions are NOT multiples of the tile size (e.g., 127x513 instead of 128x512) to exercise padding code paths. Mutation testing frameworks should flag mutations in shape-dependent dead code and suggest appropriate dimension configurations.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 360.35
+}

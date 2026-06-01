@@ -1,0 +1,383 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj):
+        """
+        :param in_channels: Number of input channels
+        :param out_1x1: Number of output channels for the 1x1 convolution
+        :param reduce_3x3: Number of output channels for the 1x1 reduction before 3x3 convolution
+        :param out_3x3: Number of output channels for the 3x3 convolution
+        :param reduce_5x5: Number of output channels for the 1x1 reduction before 5x5 convolution
+        :param out_5x5: Number of output channels for the 5x5 convolution
+        :param pool_proj: Number of output channels for the pooling projection
+        """
+        super(Model, self).__init__()
+        
+        # 1x1 convolution branch
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+        
+        # 3x3 convolution branch
+        self.branch3x3 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_3x3, kernel_size=1),
+            nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1)
+        )
+        
+        # 5x5 convolution branch
+        self.branch5x5 = nn.Sequential(
+            nn.Conv2d(in_channels, reduce_5x5, kernel_size=1),
+            nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2)
+        )
+        
+        # Max pooling branch
+        self.branch_pool = nn.Sequential(
+            nn.MaxPool2d(kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(in_channels, pool_proj, kernel_size=1)
+        )
+    
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        branch1x1 = self.branch1x1(x)
+        branch3x3 = self.branch3x3(x)
+        branch5x5 = self.branch5x5(x)
+        branch_pool = self.branch_pool(x)
+        
+        outputs = [branch1x1, branch3x3, branch5x5, branch_pool]
+        return torch.cat(outputs, 1)
+
+# Test code
+in_channels = 480
+out_1x1 = 192
+reduce_3x3 = 96
+out_3x3 = 208
+reduce_5x5 = 16
+out_5x5 = 48
+pool_proj = 64
+batch_size = 10
+height = 224
+width = 224
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj):
+        super().__init__()
+        # Initialize parameters with the same names as the original model
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+        
+        # Branch3x3 has two Conv2d layers
+        self.branch3x3_0 = nn.Conv2d(in_channels, reduce_3x3, kernel_size=1)
+        self.branch3x3_1 = nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1)
+        
+        # Branch5x5 has two Conv2d layers
+        self.branch5x5_0 = nn.Conv2d(in_channels, reduce_5x5, kernel_size=1)
+        self.branch5x5_1 = nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2)
+        
+        # BranchPool has a Conv2d layer at index 1
+        self.branch_pool_1 = nn.Conv2d(in_channels, pool_proj, kernel_size=1)
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Remap state dict keys from original model to this model
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k == 'branch3x3.0.weight':
+                new_state_dict['branch3x3_0.weight'] = v
+            elif k == 'branch3x3.0.bias':
+                new_state_dict['branch3x3_0.bias'] = v
+            elif k == 'branch3x3.1.weight':
+                new_state_dict['branch3x3_1.weight'] = v
+            elif k == 'branch3x3.1.bias':
+                new_state_dict['branch3x3_1.bias'] = v
+            elif k == 'branch5x5.0.weight':
+                new_state_dict['branch5x5_0.weight'] = v
+            elif k == 'branch5x5.0.bias':
+                new_state_dict['branch5x5_0.bias'] = v
+            elif k == 'branch5x5.1.weight':
+                new_state_dict['branch5x5_1.weight'] = v
+            elif k == 'branch5x5.1.bias':
+                new_state_dict['branch5x5_1.bias'] = v
+            elif k == 'branch_pool.1.weight':
+                new_state_dict['branch_pool_1.weight'] = v
+            elif k == 'branch_pool.1.bias':
+                new_state_dict['branch_pool_1.bias'] = v
+            else:
+                new_state_dict[k] = v
+        return super().load_state_dict(new_state_dict, strict)
+
+    def state_dict(self, *args, **kwargs):
+        # Remap state dict keys from this model to match original model
+        state_dict = super().state_dict(*args, **kwargs)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k == 'branch3x3_0.weight':
+                new_state_dict['branch3x3.0.weight'] = v
+            elif k == 'branch3x3_0.bias':
+                new_state_dict['branch3x3.0.bias'] = v
+            elif k == 'branch3x3_1.weight':
+                new_state_dict['branch3x3.1.weight'] = v
+            elif k == 'branch3x3_1.bias':
+                new_state_dict['branch3x3.1.bias'] = v
+            elif k == 'branch5x5_0.weight':
+                new_state_dict['branch5x5.0.weight'] = v
+            elif k == 'branch5x5_0.bias':
+                new_state_dict['branch5x5.0.bias'] = v
+            elif k == 'branch5x5_1.weight':
+                new_state_dict['branch5x5.1.weight'] = v
+            elif k == 'branch5x5_1.bias':
+                new_state_dict['branch5x5.1.bias'] = v
+            elif k == 'branch_pool_1.weight':
+                new_state_dict['branch_pool.1.weight'] = v
+            elif k == 'branch_pool_1.bias':
+                new_state_dict['branch_pool.1.bias'] = v
+            else:
+                new_state_dict[k] = v
+        return new_state_dict
+
+    def forward(self, x):
+        # Disable TF32 for numerical stability
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        # Set deterministic algorithms for reproducibility
+        old_cudnn_deterministic = torch.backends.cudnn.deterministic
+        torch.backends.cudnn.deterministic = True
+        
+        try:
+            # Branch 1x1
+            branch1x1 = self.branch1x1(x)
+
+            # Branch 3x3
+            reduce3x3 = self.branch3x3_0(x)
+            branch3x3 = self.branch3x3_1(reduce3x3)
+
+            # Branch 5x5
+            reduce5x5 = self.branch5x5_0(x)
+            branch5x5 = self.branch5x5_1(reduce5x5)
+
+            # Branch max pooling + conv
+            branch_pool = torch.nn.functional.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+            branch_pool = self.branch_pool_1(branch_pool)
+
+            # Concatenate all branches
+            outputs = [branch1x1, branch3x3, branch5x5, branch_pool]
+            result = torch.cat(outputs, 1)
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+            torch.backends.cudnn.deterministic = old_cudnn_deterministic
+        
+        return result
+```
+
+## Test Failures (Round 2 input)
+Total discrepancies: 60
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (30 failures)
+  - [large_magnitude seed=50000] max_diff=1.791565e+00, mean_diff=1.337491e-01, ref_range=[-4.1891e+03,3.8422e+03], orig_range=[-4.1895e+03,3.8417e+03]
+  - [large_magnitude seed=50001] max_diff=1.356445e+00, mean_diff=1.331063e-01, ref_range=[-3.9145e+03,3.6927e+03], orig_range=[-3.9146e+03,3.6932e+03]
+  - [near_overflow seed=50002] max_diff=1.536318e+27, mean_diff=1.348307e+26, ref_range=[-4.0217e+30,4.1490e+30], orig_range=[-4.0217e+30,4.1488e+30]
+  - [near_overflow seed=50003] max_diff=1.439377e+27, mean_diff=1.350358e+26, ref_range=[-3.6758e+30,4.3879e+30], orig_range=[-3.6760e+30,4.3876e+30]
+  - [all_negative seed=50008] max_diff=1.012650e-01, mean_diff=1.118096e-02, ref_range=[-3.4836e+02,2.8798e+02], orig_range=[-3.4837e+02,2.8796e+02]
+  - [all_negative seed=50009] max_diff=1.006165e-01, mean_diff=1.107840e-02, ref_range=[-2.9901e+02,2.9223e+02], orig_range=[-2.9900e+02,2.9225e+02]
+  - [all_positive seed=50010] max_diff=1.698265e-01, mean_diff=1.431490e-02, ref_range=[-3.8226e+02,3.4533e+02], orig_range=[-3.8225e+02,3.4537e+02]
+  - [all_positive seed=50011] max_diff=1.946411e-01, mean_diff=1.378322e-02, ref_range=[-3.8348e+02,3.6739e+02], orig_range=[-3.8337e+02,3.6743e+02]
+  ... and 22 more failures
+
+### training_stress (30 failures)
+  - [large_magnitude seed=70000] max_diff=1.562805e+00, mean_diff=1.362474e-01, ref_range=[-3.7039e+03,3.6141e+03], orig_range=[-3.7037e+03,3.6145e+03]
+  - [large_magnitude seed=70001] max_diff=1.486877e+00, mean_diff=1.343292e-01, ref_range=[-3.4474e+03,3.7212e+03], orig_range=[-3.4476e+03,3.7214e+03]
+  - [near_overflow seed=70002] max_diff=1.453280e+27, mean_diff=1.345098e+26, ref_range=[-3.2499e+30,3.5914e+30], orig_range=[-3.2501e+30,3.5917e+30]
+  - [near_overflow seed=70003] max_diff=1.542589e+27, mean_diff=1.347361e+26, ref_range=[-3.7343e+30,3.3100e+30], orig_range=[-3.7343e+30,3.3102e+30]
+  - [all_negative seed=70008] max_diff=1.009884e-01, mean_diff=1.075705e-02, ref_range=[-3.0117e+02,3.2848e+02], orig_range=[-3.0118e+02,3.2849e+02]
+  - [all_negative seed=70009] max_diff=1.004562e-01, mean_diff=1.105196e-02, ref_range=[-3.3807e+02,3.1480e+02], orig_range=[-3.3808e+02,3.1479e+02]
+  - [all_positive seed=70010] max_diff=1.577072e-01, mean_diff=1.355480e-02, ref_range=[-4.4608e+02,3.6157e+02], orig_range=[-4.4611e+02,3.6155e+02]
+  - [all_positive seed=70011] max_diff=1.689110e-01, mean_diff=1.367499e-02, ref_range=[-3.8630e+02,4.5733e+02], orig_range=[-3.8633e+02,4.5734e+02]
+  ... and 22 more failures
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 60 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_1x1, reduce_3x3, out_3x3, reduce_5x5, out_5x5, pool_proj):
+        super().__init__()
+        # Initialize parameters with the same names as the original model
+        self.branch1x1 = nn.Conv2d(in_channels, out_1x1, kernel_size=1)
+        
+        # Branch3x3 has two Conv2d layers
+        self.branch3x3_0 = nn.Conv2d(in_channels, reduce_3x3, kernel_size=1)
+        self.branch3x3_1 = nn.Conv2d(reduce_3x3, out_3x3, kernel_size=3, padding=1)
+        
+        # Branch5x5 has two Conv2d layers
+        self.branch5x5_0 = nn.Conv2d(in_channels, reduce_5x5, kernel_size=1)
+        self.branch5x5_1 = nn.Conv2d(reduce_5x5, out_5x5, kernel_size=5, padding=2)
+        
+        # BranchPool has a Conv2d layer at index 1
+        self.branch_pool_1 = nn.Conv2d(in_channels, pool_proj, kernel_size=1)
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Remap state dict keys from original model to this model
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k == 'branch3x3.0.weight':
+                new_state_dict['branch3x3_0.weight'] = v
+            elif k == 'branch3x3.0.bias':
+                new_state_dict['branch3x3_0.bias'] = v
+            elif k == 'branch3x3.1.weight':
+                new_state_dict['branch3x3_1.weight'] = v
+            elif k == 'branch3x3.1.bias':
+                new_state_dict['branch3x3_1.bias'] = v
+            elif k == 'branch5x5.0.weight':
+                new_state_dict['branch5x5_0.weight'] = v
+            elif k == 'branch5x5.0.bias':
+                new_state_dict['branch5x5_0.bias'] = v
+            elif k == 'branch5x5.1.weight':
+                new_state_dict['branch5x5_1.weight'] = v
+            elif k == 'branch5x5.1.bias':
+                new_state_dict['branch5x5_1.bias'] = v
+            elif k == 'branch_pool.1.weight':
+                new_state_dict['branch_pool_1.weight'] = v
+            elif k == 'branch_pool.1.bias':
+                new_state_dict['branch_pool_1.bias'] = v
+            else:
+                new_state_dict[k] = v
+        return super().load_state_dict(new_state_dict, strict)
+
+    def state_dict(self, *args, **kwargs):
+        # Remap state dict keys from this model to match original model
+        state_dict = super().state_dict(*args, **kwargs)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            if k == 'branch3x3_0.weight':
+                new_state_dict['branch3x3.0.weight'] = v
+            elif k == 'branch3x3_0.bias':
+                new_state_dict['branch3x3.0.bias'] = v
+            elif k == 'branch3x3_1.weight':
+                new_state_dict['branch3x3.1.weight'] = v
+            elif k == 'branch3x3_1.bias':
+                new_state_dict['branch3x3.1.bias'] = v
+            elif k == 'branch5x5_0.weight':
+                new_state_dict['branch5x5.0.weight'] = v
+            elif k == 'branch5x5_0.bias':
+                new_state_dict['branch5x5.0.bias'] = v
+            elif k == 'branch5x5_1.weight':
+                new_state_dict['branch5x5.1.weight'] = v
+            elif k == 'branch5x5_1.bias':
+                new_state_dict['branch5x5.1.bias'] = v
+            elif k == 'branch_pool_1.weight':
+                new_state_dict['branch_pool.1.weight'] = v
+            elif k == 'branch_pool_1.bias':
+                new_state_dict['branch_pool.1.bias'] = v
+            else:
+                new_state_dict[k] = v
+        return new_state_dict
+
+    def forward(self, x):
+        # Disable TF32 for numerical stability
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        # Set deterministic algorithms for reproducibility
+        old_cudnn_deterministic = torch.backends.cudnn.deterministic
+        torch.backends.cudnn.deterministic = True
+        
+        try:
+            # Branch 1x1
+            branch1x1 = self.branch1x1(x)
+
+            # Branch 3x3
+            reduce3x3 = self.branch3x3_0(x)
+            branch3x3 = self.branch3x3_1(reduce3x3)
+
+            # Branch 5x5
+            reduce5x5 = self.branch5x5_0(x)
+            branch5x5 = self.branch5x5_1(reduce5x5)
+
+            # Branch max pooling + conv
+            branch_pool = torch.nn.functional.max_pool2d(x, kernel_size=3, stride=1, padding=1)
+            branch_pool = self.branch_pool_1(branch_pool)
+
+            # Concatenate all branches
+            outputs = [branch1x1, branch3x3, branch5x5, branch_pool]
+            result = torch.cat(outputs, 1)
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+            torch.backends.cudnn.deterministic = old_cudnn_deterministic
+        
+        return result
+```
+
+### What still failed after Round 1
+
+### value_stress (30 failures)
+  - [large_magnitude seed=50000] max_diff=1.791565e+00, mean_diff=1.337491e-01, ref_range=[-4.1891e+03,3.8422e+03], orig_range=[-4.1895e+03,3.8417e+03]
+  - [large_magnitude seed=50001] max_diff=1.356445e+00, mean_diff=1.331063e-01, ref_range=[-3.9145e+03,3.6927e+03], orig_range=[-3.9146e+03,3.6932e+03]
+  - [near_overflow seed=50002] max_diff=1.536318e+27, mean_diff=1.348307e+26, ref_range=[-4.0217e+30,4.1490e+30], orig_range=[-4.0217e+30,4.1488e+30]
+  - [near_overflow seed=50003] max_diff=1.439377e+27, mean_diff=1.350358e+26, ref_range=[-3.6758e+30,4.3879e+30], orig_range=[-3.6760e+30,4.3876e+30]
+  - [all_negative seed=50008] max_diff=1.012650e-01, mean_diff=1.118096e-02, ref_range=[-3.4836e+02,2.8798e+02], orig_range=[-3.4837e+02,2.8796e+02]
+  - [all_negative seed=50009] max_diff=1.006165e-01, mean_diff=1.107840e-02, ref_range=[-2.9901e+02,2.9223e+02], orig_range=[-2.9900e+02,2.9225e+02]
+  - [all_positive seed=50010] max_diff=1.698265e-01, mean_diff=1.431490e-02, ref_range=[-3.8226e+02,3.4533e+02], orig_range=[-3.8225e+02,3.4537e+02]
+  - [all_positive seed=50011] max_diff=1.946411e-01, mean_diff=1.378322e-02, ref_range=[-3.8348e+02,3.6739e+02], orig_range=[-3.8337e+02,3.6743e+02]
+  ... and 22 more failures
+
+### training_stress (30 failures)
+  - [large_magnitude seed=70000] max_diff=1.562805e+00, mean_diff=1.362474e-01, ref_range=[-3.7039e+03,3.6141e+03], orig_range=[-3.7037e+03,3.6145e+03]
+  - [large_magnitude seed=70001] max_diff=1.486877e+00, mean_diff=1.343292e-01, ref_range=[-3.4474e+03,3.7212e+03], orig_range=[-3.4476e+03,3.7214e+03]
+  - [near_overflow seed=70002] max_diff=1.453280e+27, mean_diff=1.345098e+26, ref_range=[-3.2499e+30,3.5914e+30], orig_range=[-3.2501e+30,3.5917e+30]
+  - [near_overflow seed=70003] max_diff=1.542589e+27, mean_diff=1.347361e+26, ref_range=[-3.7343e+30,3.3100e+30], orig_range=[-3.7343e+30,3.3102e+30]
+  - [all_negative seed=70008] max_diff=1.009884e-01, mean_diff=1.075705e-02, ref_range=[-3.0117e+02,3.2848e+02], orig_range=[-3.0118e+02,3.2849e+02]
+  - [all_negative seed=70009] max_diff=1.004562e-01, mean_diff=1.105196e-02, ref_range=[-3.3807e+02,3.1480e+02], orig_range=[-3.3808e+02,3.1479e+02]
+  - [all_positive seed=70010] max_diff=1.577072e-01, mean_diff=1.355480e-02, ref_range=[-4.4608e+02,3.6157e+02], orig_range=[-4.4611e+02,3.6155e+02]
+  - [all_positive seed=70011] max_diff=1.689110e-01, mean_diff=1.367499e-02, ref_range=[-3.8630e+02,4.5733e+02], orig_range=[-3.8633e+02,4.5734e+02]
+  ... and 22 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

@@ -1,0 +1,69 @@
+{
+  "mutant_id": "L1_P38__relop_replace__13",
+  "operator_name": "relop_replace",
+  "kernel_name": "L1_P38",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5161,
+        "completion_tokens": 6166,
+        "total_tokens": 11327,
+        "reasoning_tokens": 2321
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With dim=16384 and blockDim.x=256, thread tid=0 iterates i=0,256,...,16384. Original stops at 16128; mutant includes 16384, causing pos=batch_idx*16384+16384 which accesses next batch's memory or OOB for last batch.",
+      "survival_reason": "The mutation causes the kernel to execute one extra iteration when tid=0, writing to position (batch_idx+1)*dim. For batches 0-14, this contaminates the first element of the next batch with the wrong normalization factor. For batch 15, this causes an out-of-bounds memory access at index 262144. Due to CUDA's non-deterministic block scheduling, the cross-contamination may or may not be visible depending on execution order, but the semantic difference is definite.",
+      "killable": true,
+      "kill_strategy": "Create input where different batches have drastically different L1 norms. When cross-batch contamination occurs, the first element of each batch will be normalized by the wrong batch's L1 sum, causing large deviations. Making batch k's norm proportional to k*10000 ensures contaminated values differ by orders of magnitude from correct values.",
+      "recommendations": "Loop bounds that process array dimensions should be carefully tested with values where the loop variable can exactly equal the dimension size. Adding explicit bounds checks or using a sentinel pattern can prevent off-by-one OOB errors.",
+      "suggested_code": "",
+      "execution_result": {
+        "killed": false,
+        "error": "violates_fixed_shape"
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4934,
+        "completion_tokens": 4772,
+        "total_tokens": 9706,
+        "reasoning_tokens": 1855
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes `i < dim` to `i <= dim` in the 'Handle remaining elements' loop (line 92). When i=dim=16384, pos = batch_idx * dim + dim = (batch_idx+1) * dim, which is the first element of the NEXT batch. This causes batch k's thread to write batch (k+1)'s first element using batch k's L1 sum instead of batch (k+1)'s sum. If batch k has L1 sum S_k and batch k+1 has sum S_{k+1} with S_k << S_{k+1}, the contaminated value = v/S_k vs correct v/S_{k+1} creates a large detectable difference.",
+      "survival_reason": "Round 1 failed with 'violates_fixed_shape' error - the previous attempt tried to change tensor dimensions rather than just values. The mutation creates cross-batch contamination at position (batch_idx+1)*dim for each batch. To expose this, we need adjacent batches to have drastically different L1 sums. With alternating batches having values 0.001 vs 1000.0, the L1 sums differ by factor of 1,000,000. When batch k (small sum ~16.384) writes to batch k+1's (large sum ~16,384,000) first element, the value 1000/16.384 ≈ 61 vs correct 1000/16384000 ≈ 6e-5 differs by 6 orders of magnitude, far exceeding the tolerance threshold.",
+      "killable": true,
+      "kill_strategy": "Create alternating batches with vastly different L1 norms (factor of 10^6). Even batches have all 0.001 (L1≈16.384), odd batches have all 1000.0 (L1≈16,384,000). The cross-batch contamination at each odd batch's first element will show 1000/16.384≈61 vs 1000/16384000≈6e-5, a difference of ~61 which vastly exceeds the tolerance.",
+      "recommendations": "When testing boundary conditions in CUDA kernels with grid-stride loops, craft inputs where adjacent blocks/batches have dramatically different computed values (e.g., normalization factors). This exposes off-by-one errors that cause cross-block contamination through writes to out-of-bounds indices that land in adjacent data regions.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    x = torch.empty(batch_size, dim, dtype=torch.float32, device=device)\n    \n    # Alternating batches with vastly different L1 norms\n    # Even batches: L1 sum ≈ 16.384\n    # Odd batches: L1 sum ≈ 16,384,000\n    for b in range(batch_size):\n        if b % 2 == 0:\n            x[b, :] = 0.001\n        else:\n            x[b, :] = 1000.0\n    \n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=6.103509e+01, mean_diff=1.862645e-03, ref_range=[6.1035e-05,6.1035e-05], mut_range=[6.1035e-11,6.1035e+01]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Create alternating batches with vastly different L1 norms (factor of 10^6). Even batches have all 0.001 (L1≈16.384), odd batches have all 1000.0 (L1≈16,384,000). The cross-batch contamination at each odd batch's first element will show 1000/16.384≈61 vs 1000/16384000≈6e-5, a difference of ~61 which vastly exceeds the tolerance.",
+    "suggested_code": "def generate_inputs(device):\n    batch_size = 16\n    dim = 16384\n    x = torch.empty(batch_size, dim, dtype=torch.float32, device=device)\n    \n    # Alternating batches with vastly different L1 norms\n    # Even batches: L1 sum ≈ 16.384\n    # Odd batches: L1 sum ≈ 16,384,000\n    for b in range(batch_size):\n        if b % 2 == 0:\n            x[b, :] = 0.001\n        else:\n            x[b, :] = 1000.0\n    \n    return [x]"
+  },
+  "elapsed_sec": 210.88
+}

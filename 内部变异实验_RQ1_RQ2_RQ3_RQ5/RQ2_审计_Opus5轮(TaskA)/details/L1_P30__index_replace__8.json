@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P30__index_replace__8",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P30",
+  "tier": 3,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4815,
+        "completion_tokens": 3754,
+        "total_tokens": 8569,
+        "reasoning_tokens": 1366
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation is on line 23, inside `softsign_kernel<half>` specialization only. For 1D kernel launch <<<num_blocks, 256>>>, blockDim.x=256 and blockDim.y=1. Original: idx=blockIdx.x*256+threadIdx.x covers all 262144 elements. Mutated: idx=blockIdx.x*1+threadIdx.x only covers indices 0 to 1023+255=1278, leaving 260866 elements uninitialized. But the fixed input dtype is float32, which uses the generic template (unmutated). The half specialization is only triggered by float16 dtype.",
+      "survival_reason": "The mutation exclusively affects the `softsign_kernel<half>` template specialization, which is only instantiated when input dtype is torch.float16. The input specification fixes dtype as torch.float32, which dispatches to the generic template that was NOT mutated. Therefore, under the fixed float32 configuration, the mutated code path is never executed. When float16 IS used, the index calculation becomes idx=blockIdx.x*1+threadIdx.x, meaning only indices 0-1278 are processed for 262144 total elements. The remaining 260866 elements (indices 1279-262143) remain uninitialized garbage values.",
+      "killable": true,
+      "kill_strategy": "Use torch.float16 dtype to trigger the mutated half-precision kernel specialization. With blockDim.y=1 instead of blockDim.x=256, the kernel only processes indices 0-1278, leaving 99.5% of output elements uninitialized. This causes massive numerical divergence from the reference implementation.",
+      "recommendations": "Dtype coverage should be explicitly verified when CUDA kernels have type-specialized template instantiations. The mutation survived because dtype stress tests may not have properly triggered the half-precision specialization or comparison was flawed. Always verify that dtype-specific code paths are actually being exercised by checking tensor dtypes during test execution.",
+      "suggested_code": "def generate_inputs(device):\n    # Use float16 to trigger the half-precision kernel with the mutation\n    # The mutation makes idx = blockIdx.x * 1 + threadIdx.x instead of blockIdx.x * 256 + threadIdx.x\n    # This only processes indices 0-1278, leaving indices 1279-262143 uninitialized\n    torch.manual_seed(999)\n    x = torch.randn(16, 16384, dtype=torch.float16, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4391,
+        "completion_tokens": 3751,
+        "total_tokens": 8142,
+        "reasoning_tokens": 1316
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "The mutation is on line 23, ONLY within the `template<> __global__ void softsign_kernel<half>` specialization. The generic template (lines 12-17) for float/double remains unchanged. With input dtype=torch.float32 (as fixed in the contract), AT_DISPATCH_FLOATING_TYPES_AND_HALF dispatches to the generic template with scalar_t=float, completely bypassing the mutated half kernel. The half specialization is ONLY invoked when input.scalar_type() == torch::kHalf (float16).",
+      "survival_reason": "The mutation changes `blockDim.x` to `blockDim.y` exclusively in the half-precision kernel template specialization (line 23). The input specification mandates dtype=torch.float32, which causes AT_DISPATCH_FLOATING_TYPES_AND_HALF to select the generic template (lines 12-17) where the index calculation remains correct as `blockIdx.x * blockDim.x + threadIdx.x`. The mutated half kernel code path is never executed with float32 inputs. Previous float16 attempts in Round 1 were rejected by the fixed-dtype contract. The dtype stress tests likely operated in the auxiliary track which 'does NOT redefine the main contract' per the testing specification.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable within the main testing contract. The mutation exclusively affects the half-precision (float16) kernel specialization on line 23. The contract fixes dtype=torch.float32, making the mutated code path unreachable. To kill this mutant would require changing the input dtype to torch.float16, which violates the fixed input specification. The mutation is a genuine bug (would cause 99.5% of elements to be uninitialized for float16 inputs) but is protected by the dtype constraint.",
+      "recommendations": "Mutation testing should ensure dtype variations are part of the main contract when kernels have dtype-specific template specializations. For this kernel, adding dtype=torch.float16 to the input specification would immediately expose the mutation (indices 1279-262143 would be uninitialized garbage). The kernel's template specialization pattern creates isolated code paths that require explicit dtype coverage to test.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 202.94
+}

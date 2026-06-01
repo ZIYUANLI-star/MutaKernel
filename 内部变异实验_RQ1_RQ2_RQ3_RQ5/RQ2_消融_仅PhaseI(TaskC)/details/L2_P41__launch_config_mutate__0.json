@@ -1,0 +1,75 @@
+{
+  "mutant_id": "L2_P41__launch_config_mutate__0",
+  "operator_name": "launch_config_mutate",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8457,
+        "completion_tokens": 3399,
+        "total_tokens": 11856,
+        "reasoning_tokens": 1308
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "K=512, TILE_SIZE=32 → original loop runs 16 iterations (t=0..15), mutant runs 15 (t=0..14). Mutant misses tile covering K indices 480-511. If input columns 480-511 are non-zero while columns 0-479 are zero, original computes non-zero GEMM output but mutant gets zero (plus bias only).",
+      "survival_reason": "The mutant survives only if all differential testing happened to use inputs where the contribution from columns 480-511 was negligible relative to the tolerance. With random inputs, the contribution from the last 1/16th of the computation might average out or be absorbed by noise. However, with targeted inputs concentrating all signal in the last tile, the difference becomes stark and easily detectable.",
+      "killable": true,
+      "kill_strategy": "Construct input where columns 0-479 are zero and columns 480-511 have large values (e.g., 10.0). This ensures the original GEMM computes meaningful values from the last tile while the mutant completely misses this computation, resulting in dramatically different outputs.",
+      "recommendations": "When mutating loop bounds in tiled GEMM kernels, test with inputs that have non-uniform distributions across tiles - particularly inputs concentrated at tile boundaries to catch off-by-one errors in tile iteration counts.",
+      "suggested_code": "def generate_inputs(device):\n    # Place all signal in columns 480-511 (the last tile that mutant misses)\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    x[:, 480:512] = 10.0  # Large values in the missed tile\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8303,
+        "completion_tokens": 5369,
+        "total_tokens": 13672,
+        "reasoning_tokens": 2678
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With K=512 and TILE_SIZE=32, mutant misses k=480-511. Previous attempt's magnitude (10.0) was insufficient because GroupNorm normalized away differences. With 10000x magnitude: original produces GELU inputs ~N(0, 2500), mutant produces ~bias (~0.04). GELU saturation at |x|>3 creates asymmetric distribution in original. GroupNorm variance differs by factor ~10^6, causing detectably different scaling.",
+      "survival_reason": "The value 10.0 produced contributions ~N(0, 2.5) that GroupNorm normalized to mean 0 within each group, making the final mean across channels approximately 0 for both original and mutant. The tolerance of 1e-2 accepted small residual differences. Using 10000.0 creates contributions ~N(0, 2500) that saturate GELU differently - approximately half the values become large positive (kept) and half become near-zero (clipped by GELU approximation). This asymmetric GELU response combined with dramatically different GroupNorm variance scaling should produce measurably different outputs.",
+      "killable": true,
+      "kill_strategy": "Use extremely large input values (10000.0) in the last 32 columns (k=480-511) to maximize the missed tile's contribution, exploiting GELU saturation asymmetry and GroupNorm variance differences to create outputs that exceed tolerance bounds.",
+      "recommendations": "When testing GEMM tiling mutations, extreme input magnitudes that exploit nonlinear activation saturation (GELU, ReLU) and normalization layer variance sensitivity are more effective than moderate values that get normalized away.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    x[:, 480:512] = 10000.0  # Extreme values in the missed tile\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "error": "Bedrock invoke_model failed in 183498 ms after 4 attempts: Failed to connect to proxy URL: \"http://127.0.0.1:7897\"",
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 642.11
+}

@@ -1,0 +1,428 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for fused KL divergence
+kl_div_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+template<typename scalar_t>
+__global__ void fused_kl_div_kernel(
+    const scalar_t* __restrict__ predictions,
+    const scalar_t* __restrict__ targets,
+    scalar_t* __restrict__ output,
+    int batch_size,
+    int seq_len
+) {
+    // Each block processes one batch element
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+    
+    const scalar_t* pred_batch = predictions + batch_idx * seq_len;
+    const scalar_t* target_batch = targets + batch_idx * seq_len;
+    
+    // Thread block and warp setup
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads in block
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    for (int idx = tid; idx < seq_len; idx += total_threads) {
+        float p = static_cast<float>(pred_batch[idx]);
+        float t = static_cast<float>(target_batch[idx]);
+        
+        // KL divergence: t * log(t / p) = t * (log(t) - log(p))
+        // But we compute directly to match PyTorch's kl_div
+        if (t > 0.0f && p > 0.0f) {
+            thread_sum += t * (__logf(t) - __logf(p));
+        }
+        // Note: PyTorch's kl_div expects log(predictions) as input,
+        // but we're computing the full KL divergence here
+    }
+    
+    // Warp reduction
+    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>());
+    
+    // First thread in warp writes to shared memory
+    __shared__ float block_sums[32];
+    if (warp.thread_rank() == 0) {
+        block_sums[warp.meta_group_rank()] = warp_sum;
+    }
+    block.sync();
+    
+    // First warp reduces all warp sums
+    if (warp.meta_group_rank() == 0) {
+        float block_sum = 0.0f;
+        int num_warps = (total_threads + 31) / 32;
+        if (warp.thread_rank() < num_warps) {
+            block_sum = block_sums[warp.thread_rank()];
+        }
+        
+        float final_sum = cg::reduce(warp, block_sum, cg::plus<float>());
+        
+        if (warp.thread_rank() == 0) {
+            // Store per-batch result
+            output[batch_idx] = static_cast<scalar_t>(final_sum);
+        }
+    }
+}
+
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    // Ensure inputs are on GPU and contiguous
+    predictions = predictions.contiguous();
+    targets = targets.contiguous();
+    
+    auto batch_size = predictions.size(0);
+    auto seq_len = predictions.size(1);
+    
+    // Create output tensor for per-batch results
+    auto output = torch::zeros({batch_size}, predictions.options());
+    
+    // Optimized kernel launch configuration
+    int threads = 256;
+    int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(predictions.scalar_type(), "fused_kl_div_kernel", ([&] {
+        fused_kl_div_kernel<scalar_t><<<blocks, threads>>>(
+            predictions.data_ptr<scalar_t>(),
+            targets.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            seq_len
+        );
+    }));
+    
+    // Return batchmean reduction
+    return output.mean();
+}
+"""
+
+kl_div_cpp_source = """
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+# Compile the inline CUDA code
+fused_kl_div = load_inline(
+    name="fused_kl_div",
+    cpp_sources=kl_div_cpp_source,
+    cuda_sources=kl_div_source,
+    functions=["fused_kl_div_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fused_kl_div = fused_kl_div
+        
+    def forward(self, predictions, targets):
+        # Input validation and preprocessing
+        predictions = predictions.contiguous()
+        targets = targets.contiguous()
+        
+        # Ensure numerical stability (matching PyTorch's behavior)
+        predictions = torch.clamp(predictions, min=1e-12)
+        targets = torch.clamp(targets, min=1e-12)
+        
+        # Normalize to probability distributions
+        predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+        targets = targets / targets.sum(dim=-1, keepdim=True)
+        
+        # Use fused CUDA kernel
+        return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for fused KL divergence
+kl_div_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+template<typename scalar_t>
+__global__ void fused_kl_div_kernel(
+    const scalar_t* __restrict__ predictions,
+    const scalar_t* __restrict__ targets,
+    scalar_t* __restrict__ output,
+    int batch_size,
+    int seq_len
+) {
+    // Each block processes one batch element
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+    
+    const scalar_t* pred_batch = predictions + batch_idx * seq_len;
+    const scalar_t* target_batch = targets + batch_idx * seq_len;
+    
+    // Thread block and warp setup
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads in block
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    for (int idx = tid; idx <= seq_len; idx += total_threads) {
+        float p = static_cast<float>(pred_batch[idx]);
+        float t = static_cast<float>(target_batch[idx]);
+        
+        // KL divergence: t * log(t / p) = t * (log(t) - log(p))
+        // But we compute directly to match PyTorch's kl_div
+        if (t > 0.0f && p > 0.0f) {
+            thread_sum += t * (__logf(t) - __logf(p));
+        }
+        // Note: PyTorch's kl_div expects log(predictions) as input,
+        // but we're computing the full KL divergence here
+    }
+    
+    // Warp reduction
+    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>());
+    
+    // First thread in warp writes to shared memory
+    __shared__ float block_sums[32];
+    if (warp.thread_rank() == 0) {
+        block_sums[warp.meta_group_rank()] = warp_sum;
+    }
+    block.sync();
+    
+    // First warp reduces all warp sums
+    if (warp.meta_group_rank() == 0) {
+        float block_sum = 0.0f;
+        int num_warps = (total_threads + 31) / 32;
+        if (warp.thread_rank() < num_warps) {
+            block_sum = block_sums[warp.thread_rank()];
+        }
+        
+        float final_sum = cg::reduce(warp, block_sum, cg::plus<float>());
+        
+        if (warp.thread_rank() == 0) {
+            // Store per-batch result
+            output[batch_idx] = static_cast<scalar_t>(final_sum);
+        }
+    }
+}
+
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    // Ensure inputs are on GPU and contiguous
+    predictions = predictions.contiguous();
+    targets = targets.contiguous();
+    
+    auto batch_size = predictions.size(0);
+    auto seq_len = predictions.size(1);
+    
+    // Create output tensor for per-batch results
+    auto output = torch::zeros({batch_size}, predictions.options());
+    
+    // Optimized kernel launch configuration
+    int threads = 256;
+    int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(predictions.scalar_type(), "fused_kl_div_kernel", ([&] {
+        fused_kl_div_kernel<scalar_t><<<blocks, threads>>>(
+            predictions.data_ptr<scalar_t>(),
+            targets.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            seq_len
+        );
+    }));
+    
+    // Return batchmean reduction
+    return output.mean();
+}
+"""
+
+kl_div_cpp_source = """
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+# Compile the inline CUDA code
+fused_kl_div = load_inline(
+    name="fused_kl_div",
+    cpp_sources=kl_div_cpp_source,
+    cuda_sources=kl_div_source,
+    functions=["fused_kl_div_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fused_kl_div = fused_kl_div
+        
+    def forward(self, predictions, targets):
+        # Input validation and preprocessing
+        predictions = predictions.contiguous()
+        targets = targets.contiguous()
+        
+        # Ensure numerical stability (matching PyTorch's behavior)
+        predictions = torch.clamp(predictions, min=1e-12)
+        targets = torch.clamp(targets, min=1e-12)
+        
+        # Normalize to probability distributions
+        predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+        targets = targets / targets.sum(dim=-1, keepdim=True)
+        
+        # Use fused CUDA kernel
+        return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 39
+- Original fragment: `<`
+- node_type: cuda_Lt
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[128, 4096], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 4096], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 39
+- Original fragment: `<`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Tested seeds: [10000]
+- Divergence found: round_type=random, seed=10000, policy=None
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Create inputs where the first element of each row has extreme values after normalization. Make targets[:,0] dominant (high probability mass) and predictions[:,0] minimal. This maximizes the spurious contribution t*(log(t)-log(p)) from the out-of-bounds read.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Shape: [128, 4096]
+    # Predictions: first element tiny, rest uniform
+    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)
+    predictions[:, 0] = 1e-10  # Will be clamped to 1e-12, making p[0] tiny after norm
+    
+    # Targets: first element dominant, rest tiny
+    targets = torch.full((128, 4096), 1e-10, device=device, dtype=torch.float32)
+    targets[:, 0] = 1000.0  # Dominates -> t[0] ≈ 1.0 after normalization
+    
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=2.989772e+04, mean_diff=2.989772e+04, ref_range=[2.9934e+04,2.9934e+04], mut_range=[3.5887e+01,3.5887e+01]
+
+### Round 2
+- Strategy: Design inputs where position 0 of each batch has high target probability (~0.7) and low prediction probability (~0.00002). The mutant's spurious read of adjacent batch's position 0 adds ~7.3 KL divergence contribution per batch, totaling ~7.2 difference in final mean - far exceeding the 0.08 tolerance threshold.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Predictions: first element small, rest moderate
+    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32) * 0.01
+    predictions[:, 0] = 0.0001  # Will be tiny after normalization
+    
+    # Targets: first element large, rest small
+    targets = torch.ones(128, 4096, device=device, dtype=torch.float32) * 0.001
+    targets[:, 0] = 100.0  # Will dominate after normalization (~0.96 probability)
+    
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=False, mutant_ok=False
+- Diff summary: max_diff=1.347594e+03, mean_diff=1.347594e+03, ref_range=[1.3721e+03,1.3721e+03], mut_range=[2.4528e+01,2.4528e+01]
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

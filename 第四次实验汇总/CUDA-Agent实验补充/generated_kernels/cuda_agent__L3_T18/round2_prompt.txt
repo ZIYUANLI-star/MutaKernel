@@ -1,0 +1,170 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        """
+        :param num_input_features: The number of input feature maps
+        :param num_output_features: The number of output feature maps
+        """
+        super(Model, self).__init__()
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(num_input_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Downsampled tensor with reduced number of feature maps
+        """
+        return self.transition(x)
+
+batch_size = 128
+num_input_features = 32
+num_output_features = 64
+height, width = 256, 256
+
+def get_inputs():
+    return [torch.rand(batch_size, num_input_features, height, width)]
+
+def get_init_inputs():
+    return [num_input_features, num_output_features]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(ModelNew, self).__init__()
+        # Use proper nn.BatchNorm2d and nn.Conv2d modules
+        self.bn = nn.BatchNorm2d(num_input_features)
+        self.conv = nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False)
+        self.avgpool = nn.AvgPool2d(kernel_size=2, stride=2)
+        
+        # Build the transition sequential to match expected interface
+        self.transition = nn.Sequential(
+            self.bn,
+            nn.ReLU(inplace=True),
+            self.conv,
+            self.avgpool
+        )
+
+    def forward(self, x):
+        # Disable TF32 for numerical stability
+        old_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # Use the standard transition sequential
+            return self.transition(x)
+        finally:
+            # Restore TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+```
+
+## Test Failures (Round 2 input)
+Total discrepancies: 23
+Failing dimensions: value_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (23 failures)
+  - [large_magnitude seed=50000] max_diff=4.911957e-01, mean_diff=5.918011e-02, ref_range=[-1.5227e+03,1.3556e+03], orig_range=[-1.5228e+03,1.3556e+03]
+  - [large_magnitude seed=50001] max_diff=5.484619e-01, mean_diff=5.766561e-02, ref_range=[-1.6021e+03,1.4188e+03], orig_range=[-1.6020e+03,1.4187e+03]
+  - [near_overflow seed=50002] max_diff=5.344208e+26, mean_diff=6.282635e+25, ref_range=[-1.2241e+30,1.3513e+30], orig_range=[-1.2241e+30,1.3514e+30]
+  - [near_overflow seed=50003] max_diff=5.092222e+26, mean_diff=6.112081e+25, ref_range=[-1.4534e+30,1.4839e+30], orig_range=[-1.4531e+30,1.4840e+30]
+  - [all_positive seed=50010] max_diff=9.423828e-02, mean_diff=1.027759e-02, ref_range=[-2.5965e+02,2.7108e+02], orig_range=[-2.5960e+02,2.7110e+02]
+  - [all_positive seed=50011] max_diff=6.838989e-02, mean_diff=9.373433e-03, ref_range=[-1.8565e+02,1.7817e+02], orig_range=[-1.8566e+02,1.7814e+02]
+  - [mixed_extremes seed=50012] max_diff=3.896118e+00, mean_diff=3.987324e-01, ref_range=[-1.0416e+04,1.1852e+04], orig_range=[-1.0416e+04,1.1851e+04]
+  - [mixed_extremes seed=50013] max_diff=3.648682e+00, mean_diff=3.760636e-01, ref_range=[-1.0412e+04,1.0496e+04], orig_range=[-1.0412e+04,1.0496e+04]
+  ... and 15 more failures
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 23 discrepancies in: value_stress
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(ModelNew, self).__init__()
+        # Use proper nn.BatchNorm2d and nn.Conv2d modules
+        self.bn = nn.BatchNorm2d(num_input_features)
+        self.conv = nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False)
+        self.avgpool = nn.AvgPool2d(kernel_size=2, stride=2)
+        
+        # Build the transition sequential to match expected interface
+        self.transition = nn.Sequential(
+            self.bn,
+            nn.ReLU(inplace=True),
+            self.conv,
+            self.avgpool
+        )
+
+    def forward(self, x):
+        # Disable TF32 for numerical stability
+        old_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # Use the standard transition sequential
+            return self.transition(x)
+        finally:
+            # Restore TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = old_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+```
+
+### What still failed after Round 1
+
+### value_stress (23 failures)
+  - [large_magnitude seed=50000] max_diff=4.911957e-01, mean_diff=5.918011e-02, ref_range=[-1.5227e+03,1.3556e+03], orig_range=[-1.5228e+03,1.3556e+03]
+  - [large_magnitude seed=50001] max_diff=5.484619e-01, mean_diff=5.766561e-02, ref_range=[-1.6021e+03,1.4188e+03], orig_range=[-1.6020e+03,1.4187e+03]
+  - [near_overflow seed=50002] max_diff=5.344208e+26, mean_diff=6.282635e+25, ref_range=[-1.2241e+30,1.3513e+30], orig_range=[-1.2241e+30,1.3514e+30]
+  - [near_overflow seed=50003] max_diff=5.092222e+26, mean_diff=6.112081e+25, ref_range=[-1.4534e+30,1.4839e+30], orig_range=[-1.4531e+30,1.4840e+30]
+  - [all_positive seed=50010] max_diff=9.423828e-02, mean_diff=1.027759e-02, ref_range=[-2.5965e+02,2.7108e+02], orig_range=[-2.5960e+02,2.7110e+02]
+  - [all_positive seed=50011] max_diff=6.838989e-02, mean_diff=9.373433e-03, ref_range=[-1.8565e+02,1.7817e+02], orig_range=[-1.8566e+02,1.7814e+02]
+  - [mixed_extremes seed=50012] max_diff=3.896118e+00, mean_diff=3.987324e-01, ref_range=[-1.0416e+04,1.1852e+04], orig_range=[-1.0416e+04,1.1851e+04]
+  - [mixed_extremes seed=50013] max_diff=3.648682e+00, mean_diff=3.760636e-01, ref_range=[-1.0412e+04,1.0496e+04], orig_range=[-1.0412e+04,1.0496e+04]
+  ... and 15 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

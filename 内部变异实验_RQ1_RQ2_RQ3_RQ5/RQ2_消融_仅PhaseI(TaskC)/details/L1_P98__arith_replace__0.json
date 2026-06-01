@@ -1,0 +1,127 @@
+{
+  "mutant_id": "L1_P98__arith_replace__0",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P98",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4557,
+        "completion_tokens": 3331,
+        "total_tokens": 7888,
+        "reasoning_tokens": 1302
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "For batch_idx=k>0: Original reads predictions[k*4096..k*4096+4095], Mutant reads predictions[-k*4096..-k*4096+4095] (out of bounds). With batch_size=128, batches 1-127 all read from invalid memory locations.",
+      "survival_reason": "The mutation changes pointer arithmetic from addition to subtraction when computing batch offsets. For batch_idx=0, both expressions are identical (±0). However, for batch indices 1 through 127, the mutant computes negative offsets, reading memory BEFORE the predictions array. This results in reading garbage values or memory from other allocations, causing completely wrong KL divergence computations for 127 out of 128 batches.",
+      "killable": true,
+      "kill_strategy": "Use any input with distinct values per batch. The original kernel correctly processes each batch while the mutant reads invalid memory for batches 1-127, producing vastly different mean KL divergence values.",
+      "recommendations": "Pointer arithmetic mutations in CUDA kernels should be tested with multi-element batch sizes to catch offset calculation errors. Include explicit bounds checking or assertions for array indexing in debug builds.",
+      "suggested_code": "def generate_inputs(device):\n    # Create inputs where each batch has distinct random values\n    # Original reads correct batch data; mutant reads garbage for batches > 0\n    torch.manual_seed(42)\n    predictions = torch.rand(128, 4096, device=device, dtype=torch.float32) + 0.1\n    targets = torch.rand(128, 4096, device=device, dtype=torch.float32) + 0.1\n    \n    # Make batches clearly distinct to maximize divergence\n    for i in range(128):\n        predictions[i] = predictions[i] * (i + 1) / 64.0\n        targets[i] = targets[i] * (128 - i) / 64.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=3.061998e+03, mean_diff=3.061998e+03, ref_range=[3.0548e+03,3.0548e+03], mut_range=[-7.1823e+00,-7.1823e+00]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4557,
+        "completion_tokens": 4740,
+        "total_tokens": 9297,
+        "reasoning_tokens": 2279
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation changes pred_batch pointer from `predictions + batch_idx * seq_len` to `predictions - batch_idx * seq_len`. For batch 0: identical. For batches 1-127: mutant reads out-of-bounds memory (negative offsets). Previous test failed with original_ok=False because extreme scaling values may have caused numerical issues or the framework rejected both outputs. Need simpler, well-bounded values where both kernels execute successfully but produce different results.",
+      "survival_reason": "The previous test used aggressive scaling (predictions[i] *= (i+1)/64.0) which created values ranging from 0.016x to 2x, potentially causing the original kernel or comparison to fail (original_ok=False). The test framework requires both kernels to execute successfully to compare outputs. The mutant reads from addresses before the predictions array (undefined behavior), but if the original also fails validation, no comparison occurs. We need clean, moderate-valued inputs that let both kernels complete, then compare their outputs.",
+      "killable": true,
+      "kill_strategy": "Use moderate-valued random inputs without extreme scaling. Ensure predictions and targets have values in [0.1, 1.1] range before normalization. This creates well-behaved probability distributions after preprocessing. The mutant will read garbage for batches 1-127 while original reads correct data, producing different mean KL divergence values.",
+      "recommendations": "When testing pointer arithmetic mutations in CUDA kernels, ensure test inputs are numerically stable and moderate-valued to avoid secondary failures (NaN, Inf, or numerical precision issues) that could mask the primary mutation effect. Also consider that out-of-bounds memory access behavior is undefined and may vary across GPU architectures.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(77777)\n    # Moderate random values in [0.1, 1.1] - safe for both kernels\n    predictions = torch.rand(128, 4096, device=device, dtype=torch.float32) + 0.1\n    targets = torch.rand(128, 4096, device=device, dtype=torch.float32) + 0.1\n    \n    # Make each batch row distinctly different to maximize divergence when mutant\n    # reads wrong batch data. Row i has values scaled slightly to create pattern.\n    for i in range(128):\n        predictions[i] = predictions[i] + float(i % 10) * 0.05\n        targets[i] = targets[i] + float((127 - i) % 10) * 0.05\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=6.257952e+02, mean_diff=6.257952e+02, ref_range=[6.1790e+02,6.1790e+02], mut_range=[-7.8905e+00,-7.8905e+00]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4963,
+        "completion_tokens": 4374,
+        "total_tokens": 9337,
+        "reasoning_tokens": 2204
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "For batch_idx=0: both original and mutant read from predictions+0. For batch_idx>0: original reads predictions+batch_idx*seq_len (correct), mutant reads predictions-batch_idx*seq_len (invalid memory before tensor). When all 128 rows are IDENTICAL, original computes same KL value for each batch. Mutant computes correct value only for batch 0, garbage for batches 1-127. The mean will differ since mutant averages 1 correct + 127 garbage values vs original's 128 identical correct values.",
+      "survival_reason": "Previous attempts used distinct batch data which caused both original and mutant kernels to produce outputs that failed validation (original_ok=False). The extreme scaling factors (e.g., multiplying by i/64) likely caused numerical instability. Additionally, with varying batch data, the undefined behavior from reading negative memory offsets may have interacted unpredictably with whatever garbage was in that memory region. Using IDENTICAL rows for all batches ensures: (1) the original kernel has well-defined, consistent behavior across all batches, (2) the mutant's garbage reads for batches 1-127 will clearly differ from the correct batch 0 calculation, and (3) no extreme scaling that could cause numerical issues.",
+      "killable": true,
+      "kill_strategy": "Use identical rows for all 128 batches. Original kernel reads correct data for all batches (all same). Mutant reads correct data only for batch 0, garbage memory for batches 1-127. The averaged result must differ since mutant includes 127 garbage values in its mean.",
+      "recommendations": "When testing pointer arithmetic mutations in batch-processing kernels, always include a test case where all batches contain identical data. This isolates the indexing bug by ensuring the correct result is consistent and predictable, making divergence from garbage memory reads clearly detectable.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(98765)\n    \n    # Create single probability-like rows (values in safe range)\n    row_pred = torch.rand(4096, device=device, dtype=torch.float32) * 0.5 + 0.5  # [0.5, 1.0]\n    row_target = torch.rand(4096, device=device, dtype=torch.float32) * 0.5 + 0.5  # [0.5, 1.0]\n    \n    # All 128 batches have IDENTICAL rows\n    predictions = row_pred.unsqueeze(0).repeat(128, 1).contiguous()\n    targets = row_target.unsqueeze(0).repeat(128, 1).contiguous()\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.327325e+02, mean_diff=1.327325e+02, ref_range=[1.2476e+02,1.2476e+02], mut_range=[-7.9711e+00,-7.9711e+00]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5352,
+        "completion_tokens": 4764,
+        "total_tokens": 10116,
+        "reasoning_tokens": 2124
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutant changes `predictions + batch_idx * seq_len` to `predictions - batch_idx * seq_len`. For batch 0, both are identical. For batches 1-127, mutant reads out-of-bounds memory. Previous attempts created variable per-batch data, but the original kernel may have numerical precision issues with `__logf` and `--use_fast_math` flags causing original_ok=False. Using perfectly uniform distributions where KL=0 exactly provides a numerically stable baseline where original produces exactly 0, while mutant's garbage reads for batches 1-127 must produce non-zero contributions.",
+      "survival_reason": "All previous attempts failed with original_ok=False, indicating the original kernel's output didn't match the reference implementation. This is likely due to numerical precision differences from fast math operations on non-trivial KL divergence computations. The attempts used varied per-batch values creating significant KL divergence values, amplifying numerical differences. By using identical uniform distributions (predictions==targets), the KL divergence is mathematically exactly 0, which is numerically stable regardless of precision. The original kernel will produce 0 for all 128 batches, while the mutant reads pre-array garbage memory for batches 1-127, which cannot all be exactly 0.",
+      "killable": true,
+      "kill_strategy": "Use perfectly uniform inputs (all ones) so that after normalization, predictions==targets==1/4096 everywhere. KL divergence is exactly 0 for all batches. Original outputs 0. Mutant reads garbage for batches 1-127, producing non-zero mean.",
+      "recommendations": "When testing CUDA kernels with fast math flags, design test cases with mathematically exact expected outputs (like 0) to avoid false negatives from numerical precision differences between reference and kernel implementations.",
+      "suggested_code": "def generate_inputs(device):\n    # All-ones input: after normalization becomes 1/4096 everywhere\n    # KL(P||P) = 0 exactly, numerically stable\n    # Original: 128 batches of 0 -> mean = 0\n    # Mutant: batch 0 is 0, batches 1-127 read garbage -> mean != 0\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=8.252783e+00, mean_diff=8.252783e+00, ref_range=[0.0000e+00,0.0000e+00], mut_range=[-8.2528e+00,-8.2528e+00]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 4,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Use perfectly uniform inputs (all ones) so that after normalization, predictions==targets==1/4096 everywhere. KL divergence is exactly 0 for all batches. Original outputs 0. Mutant reads garbage for batches 1-127, producing non-zero mean.",
+    "suggested_code": "def generate_inputs(device):\n    # All-ones input: after normalization becomes 1/4096 everywhere\n    # KL(P||P) = 0 exactly, numerically stable\n    # Original: 128 batches of 0 -> mean = 0\n    # Mutant: batch 0 is 0, batches 1-127 read garbage -> mean != 0\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]"
+  },
+  "elapsed_sec": 332.63
+}

@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P41__index_replace__11",
+  "operator_name": "index_replace",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8435,
+        "completion_tokens": 2625,
+        "total_tokens": 11060,
+        "reasoning_tokens": 913
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The kernel uses dim3 block(TILE_SIZE, TILE_SIZE) = dim3(32, 32), which means threadIdx.z is ALWAYS 0 (z-dimension defaults to 1 when not specified). The mutation changes tile_a[threadIdx.y][threadIdx.x] to tile_a[threadIdx.z][threadIdx.x] = tile_a[0][threadIdx.x]. This means ALL 32 threads with different threadIdx.y values but same threadIdx.x write to the same memory location (row 0), causing data races and completely corrupting the tile_a shared memory matrix. The subsequent dot product reads from tile_a[threadIdx.y][k], but rows 1-31 now contain garbage or zeros, not the correct input data.",
+      "survival_reason": "This mutation is not surviving - it fundamentally breaks the tiled matrix multiplication algorithm. With a 32x32 thread block, threadIdx.z is always 0, so the mutation causes all 32 rows of threads (per column) to race writing to row 0 of tile_a. The dot product then reads incorrect values from tile_a for any thread with threadIdx.y != 0. Since the GEMM result is completely corrupted, the subsequent BatchNorm, GELU, GroupNorm, Mean, and ReLU operations will all produce wrong results. Layer 2 already detected divergence with seed=10000, confirming this mutant is killable.",
+      "killable": true,
+      "kill_strategy": "Any non-zero input will expose this bug because the matrix multiplication is fundamentally broken. Use inputs with distinctive per-row values to make the corruption obvious - rows should produce different results but the mutated kernel will compute garbage for all rows where threadIdx.y != 0.",
+      "recommendations": "When writing tiled CUDA kernels, add compile-time or runtime assertions to verify that thread index dimensions match the expected block configuration. Consider using static_assert or template parameters to catch index dimension mismatches at compile time rather than runtime.",
+      "suggested_code": "def generate_inputs(device):\n    # Each row gets a distinct value to expose the threadIdx.z=0 bug\n    # Row i has value (i+1)*0.1, so correct GEMM should produce distinct results per row\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    for i in range(128):\n        x[i, :] = (i + 1) * 0.1\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8305,
+        "completion_tokens": 5135,
+        "total_tokens": 13440,
+        "reasoning_tokens": 1998
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original accumulates ~31 tiles of 100.0 values per tile iteration; mutant only accumulates 1 tile of 0.01 values. GEMM difference is O(31*100/0.01) ~ 310000x. Even after normalizations, this magnitude difference produces distinct outputs.",
+      "survival_reason": "The previous test used moderate uniform values per row, causing both kernels to produce values in a similar range after normalization operations. The GroupNorm + Mean pipeline can normalize away differences when the overall magnitude is similar. By making threadIdx.y=0 rows (which the mutant actually loads) have tiny values (0.01) while all other rows have huge values (100.0), the original produces results dominated by the large values while the mutant sees only small values - a 10000x scale difference that cannot be normalized away.",
+      "killable": true,
+      "kill_strategy": "Create extreme value disparity between rows loaded by threadIdx.y=0 (rows 0,32,64,96) and all other rows. Use 0.01 for threadIdx.y=0 rows and 100.0 for all others, creating massive GEMM output differences.",
+      "recommendations": "When testing tiled matrix operations, use inputs where values vary systematically by row position modulo tile size to detect incorrect thread indexing in shared memory operations.",
+      "suggested_code": "def generate_inputs(device):\n    # Large values for rows that would be loaded by threadIdx.y > 0\n    x = torch.full((128, 512), 100.0, device=device, dtype=torch.float32)\n    # Tiny values for rows loaded by threadIdx.y = 0 (indices 0, 32, 64, 96)\n    x[0, :] = 0.01\n    x[32, :] = 0.01\n    x[64, :] = 0.01\n    x[96, :] = 0.01\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8567,
+        "completion_tokens": 6502,
+        "total_tokens": 15069,
+        "reasoning_tokens": 2857
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With M=128, TILE_SIZE=32, threads with threadIdx.y∈[1,31] read from uninitialized tile_a[threadIdx.y][k]. Using per-row unique sparse patterns ensures correct GEMM produces distinct per-row outputs (row i depends on weight[:,i%32]), while mutant produces garbage for 93.75% of rows (all but rows 0,32,64,96).",
+      "survival_reason": "Previous attempts used uniform or semi-uniform values across rows. When all rows have similar values at the same columns, the race-condition winning value is close to the correct value. Additionally, normalization layers averaged out differences. By making each row depend on a unique column's weight, the correct computation produces row-specific results while the mutant computes garbage for all rows where threadIdx.y>0. The sparse diagonal-like pattern prevents any averaging from masking the corruption.",
+      "killable": true,
+      "kill_strategy": "Create input where each row has a single large non-zero value at a distinct column position within each tile. Row i has value at column (i % 32). This ensures tile_a[row] must contain specific per-row data; garbage in tile_a[1..31] will produce wildly different GEMM outputs.",
+      "recommendations": "When testing tiled GEMM kernels, use per-row unique sparse patterns to ensure each tile_a row is essential and non-interchangeable. Uniform or similar-valued inputs mask index-based bugs through value coincidence.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    # Each row has unique non-zero position within each tile\n    # This makes tile_a[row] uniquely important for that row's computation\n    for i in range(128):\n        col_in_tile = i % 32\n        # Set non-zero values in multiple tiles to ensure strong signal\n        for tile in range(16):\n            x[i, tile * 32 + col_in_tile] = 50.0 * (1 if tile % 2 == 0 else -1)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8846,
+        "completion_tokens": 6561,
+        "total_tokens": 15407,
+        "reasoning_tokens": 2470
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "tile_a[0] receives race between +1000 and -1000 from rows 0 and 31. GEMM for correct row 0: ~1000*512*weight_sum ≈ ±3200. Mutant row 0: uses race winner value. Rows 1-30 use garbage tile_a[1..30] → GEMM ≈ bias ≈ 0. Max difference exceeds atol=0.01 + rtol*|ref| threshold.",
+      "survival_reason": "Previous attempts used uniform or similar-magnitude values across rows, causing the race condition winner to produce values in the same range as correct computation. The Mean+ReLU operations averaged away differences. This new approach creates a sign-flip race condition (±1000) for tile_a[0] plus garbage for tile_a[1..30], ensuring massive divergence in GEMM outputs that cannot be normalized away by subsequent operations.",
+      "killable": true,
+      "kill_strategy": "Create extreme value disparity between rows 0 and 31 (and similarly for other blocks) to expose the threadIdx.z=0 race condition. Use +1000 vs -1000 to ensure tile_a[0] has wildly inconsistent values regardless of race winner, while rows 1-30 compute with garbage.",
+      "recommendations": "When testing CUDA kernels with shared memory tiling, always test with extreme value disparities between rows that map to different threadIdx.y values within the same tile block, as indexing bugs often cause race conditions or use of uninitialized memory.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    # Create race condition: row 0 and row 31 both write to tile_a[0] with opposite signs\n    x[0, :] = 1000.0\n    x[31, :] = -1000.0\n    # Repeat for all 4 blocks\n    x[32, :] = 1000.0\n    x[63, :] = -1000.0\n    x[64, :] = 1000.0\n    x[95, :] = -1000.0\n    x[96, :] = 1000.0\n    x[127, :] = -1000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9160,
+        "completion_tokens": 5828,
+        "total_tokens": 14988,
+        "reasoning_tokens": 2914
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation causes threadIdx.z (always 0) to be used instead of threadIdx.y when writing to tile_a. This means ALL threads write to tile_a[0][*], and tile_a[1..31][*] remain uninitialized (likely zero). Previous attempts used row-varying patterns, but the racing writes to tile_a[0] created unpredictable values. With CONSTANT input, all racing writes are identical (deterministic), while tile_a[1..31] = 0. For rows with threadIdx.y > 0, GEMM output = 0 (dot product with zeros). Reference computes correct non-zero results. After BatchNorm(mean=0,var=1), ref keeps values, mutant stays 0 for 31/32 rows per block.",
+      "survival_reason": "Previous attempts used row-varying input patterns trying to expose per-row computation differences. However, the racing writes to tile_a[0][*] from 32 different rows created unpredictable values that may have coincidentally matched expected outputs or been smoothed by normalization. With varying inputs, the corruption was chaotic. The key insight is that CONSTANT input makes the race condition DETERMINISTIC (all threads write same value to tile_a[0]), while tile_a[1..31] being zero causes systematic, reproducible corruption: rows 1-31 in each block compute 0 from GEMM instead of the correct constant*weights sum. This creates a stark 31/32 vs 1/32 split in each block that should survive through the normalizations.",
+      "killable": true,
+      "kill_strategy": "Use constant input (all 1.0) so racing writes to tile_a[0] are deterministic, while tile_a[1..31] remain zero. This causes rows 1-31 in each block to compute GEMM=0 while reference computes correct values. The systematic 31/32 corruption per block should produce detectable differences after normalization.",
+      "recommendations": "When testing tiled GEMM mutations, always include constant-value inputs to eliminate race condition variability and expose systematic corruption patterns. The normalization layers can mask chaotic differences but not systematic 31/32 row corruption.",
+      "suggested_code": "def generate_inputs(device):\n    # Constant input makes race conditions deterministic\n    # tile_a[1..31] = 0 causes 31/32 of rows to compute GEMM = 0\n    # Reference computes correct sum(weights) per row\n    x = torch.ones(128, 512, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 1083.87
+}

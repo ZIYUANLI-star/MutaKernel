@@ -1,0 +1,190 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a 2D transposed convolution operation with asymmetric input, asymmetric kernel, 
+    grouped, padded, and dilated.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (tuple): Size of the convolution kernel (height, width).
+        stride (tuple, optional): Stride of the convolution (height, width). Defaults to (1, 1).
+        padding (tuple, optional): Padding applied to the input (height, width). Defaults to (0, 0).
+        dilation (tuple, optional): Spacing between kernel elements (height, width). Defaults to (1, 1).
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), dilation: tuple = (1, 1), groups: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv_transpose2d = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 2D transposed convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height_out, width_out).
+        """
+        return self.conv_transpose2d(x)
+
+# Test code
+batch_size = 16
+in_channels = 32
+out_channels = 64
+kernel_size = (3, 5)
+height = 128
+width = 256
+stride = (2, 3)
+padding = (1, 2)
+dilation = (2, 1)
+groups = 4
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, dilation, groups]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Optimized 2D transposed convolution using PyTorch's functional API with channel splitting.
+    
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (tuple): Size of the convolution kernel (height, width).
+        stride (tuple, optional): Stride of the convolution (height, width). Defaults to (1, 1).
+        padding (tuple, optional): Padding applied to the input (height, width). Defaults to (0, 0).
+        dilation (tuple, optional): Spacing between kernel elements (height, width). Defaults to (1, 1).
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), dilation: tuple = (1, 1), groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        # Initialize parameters with correct shape (account for groups)
+        self.conv_transpose2d = nn.Module()
+        self.conv_transpose2d.weight = nn.Parameter(torch.empty((in_channels, out_channels // groups, kernel_size[0], kernel_size[1])))
+        if bias:
+            self.conv_transpose2d.bias = nn.Parameter(torch.empty(out_channels))
+        else:
+            self.conv_transpose2d.bias = None
+        
+        # Store parameters for forward pass
+        self.stride = tuple(stride)
+        self.padding = tuple(padding)
+        self.output_padding = (0, 0)  # Default for ConvTranspose2d
+        self.dilation = tuple(dilation)
+        self.groups = groups
+        
+        # Initialize weights
+        nn.init.kaiming_uniform_(self.conv_transpose2d.weight, nonlinearity='linear')
+        if self.conv_transpose2d.bias is not None:
+            nn.init.zeros_(self.conv_transpose2d.bias)
+
+    @torch.compile(backend='inductor', options={
+        'max_autotune': True,
+        'use_mixed_mm': True,
+        'coordinate_descent_tuning': True
+    })
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 2D transposed convolution by splitting into smaller group operations.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+            
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height_out, width_out).
+        """
+        # Enable TF32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Split input and weight into groups
+        x_groups = x.chunk(self.groups, dim=1)
+        w_groups = self.conv_transpose2d.weight.chunk(self.groups, dim=0)
+        
+        outputs = []
+        
+        for x_group, w_group in zip(x_groups, w_groups):
+            # Calculate output for each group
+            out_group = torch.conv_transpose2d(
+                x_group, w_group, None,
+                stride=self.stride, padding=self.padding,
+                output_padding=self.output_padding, groups=1,
+                dilation=self.dilation
+            )
+            outputs.append(out_group)
+        
+        # Concatenate outputs
+        output = torch.cat(outputs, dim=1)
+        
+        # Disable TF32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return output
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 53
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (26 failures)
+  - [large_magnitude seed=50000] max_diff=4.744034e-01, mean_diff=2.581935e-02, ref_range=[-1.4713e+03,1.4382e+03], orig_range=[-1.4714e+03,1.4380e+03]
+  - [large_magnitude seed=50001] max_diff=5.240479e-01, mean_diff=2.589077e-02, ref_range=[-1.4310e+03,1.5085e+03], orig_range=[-1.4310e+03,1.5084e+03]
+  - [near_overflow seed=50002] max_diff=6.928656e+26, mean_diff=2.592892e+25, ref_range=[-1.5183e+30,1.6770e+30], orig_range=[-1.5184e+30,1.6769e+30]
+  - [near_overflow seed=50003] max_diff=5.420710e+26, mean_diff=2.599646e+25, ref_range=[-1.4109e+30,1.4839e+30], orig_range=[-1.4108e+30,1.4839e+30]
+  - [all_negative seed=50008] max_diff=4.703903e-02, mean_diff=2.551084e-03, ref_range=[-1.3159e+02,1.3651e+02], orig_range=[-1.3159e+02,1.3648e+02]
+  - [all_negative seed=50009] max_diff=4.618454e-02, mean_diff=2.509704e-03, ref_range=[-1.4866e+02,1.4220e+02], orig_range=[-1.4866e+02,1.4222e+02]
+  - [all_positive seed=50010] max_diff=5.066681e-02, mean_diff=2.576378e-03, ref_range=[-1.4571e+02,1.3958e+02], orig_range=[-1.4572e+02,1.3959e+02]
+  - [all_positive seed=50011] max_diff=4.897690e-02, mean_diff=2.556164e-03, ref_range=[-1.3092e+02,1.4390e+02], orig_range=[-1.3092e+02,1.4392e+02]
+  ... and 18 more failures
+
+### training_stress (27 failures)
+  - [large_magnitude seed=70000] max_diff=5.408630e-01, mean_diff=2.595910e-02, ref_range=[-1.4366e+03,1.5048e+03], orig_range=[-1.4365e+03,1.5048e+03]
+  - [large_magnitude seed=70001] max_diff=5.170593e-01, mean_diff=2.621786e-02, ref_range=[-1.5064e+03,1.5224e+03], orig_range=[-1.5064e+03,1.5225e+03]
+  - [near_overflow seed=70002] max_diff=4.910978e+26, mean_diff=2.601517e+25, ref_range=[-1.6079e+30,1.6907e+30], orig_range=[-1.6079e+30,1.6903e+30]
+  - [near_overflow seed=70003] max_diff=4.889349e+26, mean_diff=2.598862e+25, ref_range=[-1.6178e+30,1.6084e+30], orig_range=[-1.6177e+30,1.6083e+30]
+  - [all_negative seed=70008] max_diff=5.749607e-02, mean_diff=2.605996e-03, ref_range=[-1.6304e+02,1.4890e+02], orig_range=[-1.6305e+02,1.4889e+02]
+  - [all_negative seed=70009] max_diff=5.916595e-02, mean_diff=2.633002e-03, ref_range=[-1.4617e+02,1.5358e+02], orig_range=[-1.4617e+02,1.5356e+02]
+  - [all_positive seed=70010] max_diff=5.044174e-02, mean_diff=2.629624e-03, ref_range=[-1.4531e+02,1.2806e+02], orig_range=[-1.4532e+02,1.2806e+02]
+  - [all_positive seed=70011] max_diff=4.737282e-02, mean_diff=2.579127e-03, ref_range=[-1.2774e+02,1.5271e+02], orig_range=[-1.2775e+02,1.5272e+02]
+  ... and 19 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

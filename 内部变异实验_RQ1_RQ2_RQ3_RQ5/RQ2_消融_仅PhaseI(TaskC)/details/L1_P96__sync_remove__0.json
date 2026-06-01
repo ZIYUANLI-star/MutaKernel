@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P96__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P96",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4366,
+        "completion_tokens": 3151,
+        "total_tokens": 7517,
+        "reasoning_tokens": 1144
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Reduction loop needs __syncthreads() between iterations. With 256 threads (8 warps) per block, removing sync causes inter-warp races. At s=64, warps 0-1 read shared_mem[64-127] before warps 2-3 finish writing from s=128. With 2048 blocks affected, errors accumulate in final sum.",
+      "survival_reason": "The mutant has NOT survived — it is killable. The removed __syncthreads() inside the reduction loop creates race conditions between warps within each block. In a 256-thread block (8 warps), threads execute in lockstep only within warps, not across warps. The reduction algorithm requires all threads to complete their writes before any thread reads the updated values in the next iteration. Without the barrier, threads in early warps read stale data from later warps, corrupting partial sums.",
+      "killable": true,
+      "kill_strategy": "Use uniform tensor values to create predictable element-wise losses. With predictions=2.0 and targets=0.0, every element produces loss=1.5, so the mean should be exactly 1.5. The race condition will corrupt partial block sums, causing the computed mean to deviate significantly from 1.5.",
+      "recommendations": "Always include synchronization barriers inside parallel reduction loops. Test reduction kernels with uniform values where the expected result is mathematically exact, making any race-condition-induced errors immediately detectable.",
+      "suggested_code": "def generate_inputs(device):\n    # Uniform values: each element has loss = |2-0| - 0.5*1.0 = 1.5\n    # Expected mean = 1.5 exactly\n    # Race condition will corrupt partial sums across 2048 blocks\n    predictions = torch.full((128, 4096), 2.0, dtype=torch.float32, device=device)\n    targets = torch.zeros((128, 4096), dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4267,
+        "completion_tokens": 4414,
+        "total_tokens": 8681,
+        "reasoning_tokens": 1748
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() inside the reduction loop creates inter-warp race conditions. With uniform values (all 1.5), even if threads read stale values, the stale values are still 1.5 or sums of 1.5s, causing limited divergence. Need extreme value contrast between positions (i%256)<128 and (i%256)>=128 within each block to maximize propagation when threads 0-63 potentially read stale zeros from positions 64-127 instead of partial sums.",
+      "survival_reason": "The previous attempt used uniform values (2.0 and 0.0), producing identical per-element losses of 1.5. With uniform values, the race condition between warps during reduction has limited impact because even stale reads are from the same uniform value space. The missing syncthreads at line 48 is inside the reduction loop, meaning threads in early warps (0-1) may read from positions 64-127 before warps 2-3 have written their iteration-1 sums. To exploit this, I need large values in positions 128-255 of each block (which get summed into positions 64-127 in iteration 1) and small/zero values in positions 0-127, so if the race causes stale reads, threads read 0 instead of large sums.",
+      "killable": true,
+      "kill_strategy": "Create alternating pattern where within each 256-element reduction block, positions 0-127 have zero loss and positions 128-255 have large loss (99.5). The race condition will cause threads 0-63 to potentially read stale zeros from positions 64-127 instead of the correct partial sums (~99.5), causing massive underestimation of the total loss.",
+      "recommendations": "When testing parallel reduction kernels with missing synchronization barriers, use inputs with extreme value contrasts between thread/warp boundaries that participate in different reduction iterations, rather than uniform values which mask race condition effects.",
+      "suggested_code": "def generate_inputs(device):\n    total_elements = 128 * 4096  # 524288 elements, 2048 reduction blocks\n    \n    # Create index-based mask: True where (flat_index % 256) >= 128\n    indices = torch.arange(total_elements, device=device)\n    mask = ((indices % 256) >= 128).float()\n    \n    # predictions: 100 where mask=1, 0 elsewhere\n    # targets: 0 everywhere\n    # Loss = |100-0| - 0.5*1.0 = 99.5 where mask=1, else 0\n    predictions_flat = mask * 100.0\n    targets_flat = torch.zeros(total_elements, dtype=torch.float32, device=device)\n    \n    predictions = predictions_flat.reshape(128, 4096)\n    targets = targets_flat.reshape(128, 4096)\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4638,
+        "completion_tokens": 5322,
+        "total_tokens": 9960,
+        "reasoning_tokens": 2245
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() at line 48 is inside the reduction loop. In iteration s=64, threads in warps 0-1 read from positions 64-127 which were written by threads in warps 2-3 during iteration s=128. Without sync, warps 0-1 may read stale zeros instead of updated values. By concentrating all non-zero losses in positions 192-255 of each block, the update chain goes: pos[64-127] = 0 + large -> pos[0-63] = 0 + pos[64-127]. If race occurs, pos[0-63] stays 0, losing ~50% of the block sum.",
+      "survival_reason": "Previous attempts failed because: (1) Uniform values create symmetric reduction where race conditions cause proportionally similar errors that still average correctly. (2) The alternating 0-127 vs 128-255 pattern directly adds large values in iteration s=128 but doesn't create critical cross-warp dependencies for iteration s=64. The key insight is that the race occurs between different warps: warps 2-3 write to positions 64-127 in iter1, and warps 0-1 read those positions in iter2. By placing all non-zero losses in positions 192-255 only, we create a chain where iter1 propagates values to 64-127, then iter2 (without sync) tries to read them. This maximizes the stale-read penalty.",
+      "killable": true,
+      "kill_strategy": "Place all non-zero element-wise losses exclusively in positions 192-255 of each 256-element reduction block. This creates a critical dependency: warp2-3 must complete writes to positions 64-127 (in iter s=128) before warp0-1 reads them (in iter s=64). Without sync, warps 0-1 read zeros, losing half the intended sum per block.",
+      "recommendations": "When testing parallel reduction kernels with removed synchronization, design inputs that create explicit cross-warp data dependencies. Identify which warps write to specific shared memory locations and which warps subsequently read them, then place distinguishing values along those dependency chains.",
+      "suggested_code": "def generate_inputs(device):\n    total_elements = 128 * 4096  # 524288 elements, 2048 reduction blocks\n    \n    # Create index-based mask for positions 192-255 within each 256-element block\n    indices = torch.arange(total_elements, device=device)\n    pos_in_block = indices % 256\n    mask = (pos_in_block >= 192).float()  # 1 for positions 192-255, 0 elsewhere\n    \n    # predictions: 1001 where mask=1, 0 elsewhere\n    # targets: 0 everywhere  \n    # Loss where mask=1: |1001 - 0| - 0.5*1.0 = 1000.5 (since abs_diff > beta=1)\n    # Loss where mask=0: |0 - 0| = 0\n    predictions = (mask * 1001.0).reshape(128, 4096)\n    targets = torch.zeros((128, 4096), dtype=torch.float32, device=device)\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5050,
+        "completion_tokens": 5462,
+        "total_tokens": 10512,
+        "reasoning_tokens": 2199
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Previous attempts placed non-zero values in positions 128-255 or 192-255, but the race condition between iteration s=128 and s=64 specifically affects positions 64-127 being read by threads 0-63. The EMD layer 2 found bitwise divergence with seed 10000, confirming the mutation causes differences, but they fall within allclose tolerance. To amplify: place maximum loss values ONLY at positions 64-127 AND 192-255 so after iteration s=128, positions 64-127 contain large sums. Without sync, threads 0-63 may read stale partial values from 64-127, causing ~50% loss of expected sum per block.",
+      "survival_reason": "Previous attempts failed because: Round 1 used uniform values giving no inter-position variance - any race just shifts timing, not correctness. Round 2 placed zeros in 0-127 and large values in 128-255, but the critical race is threads 64-127 writing to positions 64-127 vs threads 0-63 reading them in the next iteration. Round 3 only used positions 192-255, missing the direct positions 64-127 that threads 64-127 write to. The key insight is that positions 64-127 must ALSO have initial large values so thread 64-127's writes (adding positions 64-127 + 192-255) create large sums that can be lost when threads 0-63 read stale data.",
+      "killable": true,
+      "kill_strategy": "Place large loss values at positions 64-127 AND 192-255 within each 256-element block. After iteration s=128, threads 64-127 write large sums to positions 64-127. Without __syncthreads(), threads 0-63 in iteration s=64 may read zero/stale values from positions 64-127, losing approximately half the expected contribution. Using ~1e4 per element creates expected block sums of ~2.5e6, with potential 50% loss (~1.25e6 per block * 2048 blocks / 524288 elements ≈ 4.8e3 mean error).",
+      "recommendations": "When testing GPU reduction kernels with removed __syncthreads(), ensure test values are placed at exact positions where inter-warp data dependencies exist across reduction iterations - not just the final positions loaded, but positions that are written by higher-numbered threads and read by lower-numbered threads in subsequent iterations.",
+      "suggested_code": "def generate_inputs(device):\n    total_elements = 128 * 4096  # 524288 elements\n    \n    indices = torch.arange(total_elements, device=device)\n    pos_in_block = indices % 256\n    \n    # Critical positions: 64-127 (written by warps 2-3 in iter s=128, read by warps 0-1 in iter s=64)\n    # AND 192-255 (contributes to positions 64-127 after first iteration)\n    mask = ((pos_in_block >= 64) & (pos_in_block < 128)) | (pos_in_block >= 192)\n    \n    # predictions: 1e4 + 0.5 where mask=True, 0 elsewhere\n    # targets: 0 everywhere\n    # Loss where mask=True: |1e4 + 0.5| - 0.5*1.0 = 1e4 (since abs_diff >> beta=1)\n    predictions = (mask.float() * 10000.5).reshape(128, 4096)\n    targets = torch.zeros((128, 4096), dtype=torch.float32, device=device)\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5554,
+        "completion_tokens": 6139,
+        "total_tokens": 11693,
+        "reasoning_tokens": 2680
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() at line 48 is inside the reduction loop. For blockDim=256, critical cross-warp dependencies exist at s=128→s=64 (4 warps writing to positions 64-127, 2 warps reading from them) and s=64→s=32 (warp 1 writing to positions 32-63, warp 0 reading). Previous attempts placed values at positions 192-255, but modern GPUs often have implicit ordering from warp scheduling that makes the race hard to trigger consistently. The key insight: the race is most likely to manifest when forcing ALL computation to depend on the LAST writes in each iteration. Using alternating high-magnitude values (+/- patterns) within the critical read positions (64-127) can create scenarios where partial sum corruption causes large absolute errors that don't cancel out.",
+      "survival_reason": "Previous attempts (Rounds 1-4) all used patterns where losses were concentrated in specific high-index positions (192-255). This created a 'one-way' dependency where the expected behavior was additive. The race condition may be failing to manifest because: (1) warp scheduling on the test GPU naturally completes higher-indexed warps before lower ones need their data, (2) the L1/L2 cache hierarchy provides implicit visibility, or (3) compiler optimizations insert barriers. The fundamental flaw was assuming the race would reliably cause reads of zeros. A new approach should use patterns that cause maximum divergence when ANY corruption occurs, not just when specific positions are missed. By using denormalized floats or extreme cancellation scenarios, we can make even small synchronization timing differences produce large numerical errors.",
+      "killable": true,
+      "kill_strategy": "Use denormalized/subnormal float values that are highly sensitive to the order of floating-point operations. When reduction order changes due to missing synchronization, the accumulated rounding errors with subnormals can produce dramatically different results than properly synchronized reduction. Place subnormal values at positions 64-127 and 192-255 to maximize cross-warp dependency sensitivity.",
+      "recommendations": "When testing reduction kernels for synchronization bugs, include test cases using: (1) subnormal/denormalized floats to exploit floating-point non-associativity, (2) extreme value ranges (1e38 mixed with 1e-38) to trigger precision loss, and (3) multiple random seeds with thread-position-dependent values to increase race condition manifestation probability.",
+      "suggested_code": "def generate_inputs(device):\n    total_elements = 128 * 4096  # 524288 elements\n    \n    indices = torch.arange(total_elements, device=device)\n    pos_in_block = indices % 256\n    \n    # Target positions involved in cross-warp dependencies:\n    # 64-127: written by threads 64-127 in s=128, read by threads 0-63 in s=64\n    # 192-255: contribute to positions 64-127 in s=128\n    critical_mask = ((pos_in_block >= 64) & (pos_in_block < 128)) | (pos_in_block >= 192)\n    \n    # Use values that will create subnormal intermediate results\n    # predictions - targets will be ~1e-38 (near subnormal boundary)\n    # This makes reduction highly sensitive to operation order\n    base_val = 1.5e-38  # Just above subnormal threshold\n    \n    # Alternating pattern to prevent trivial cancellation\n    alt_sign = ((pos_in_block % 2) * 2 - 1).float()\n    \n    # At critical positions: alternating +/- tiny values\n    # At other positions: slightly larger values to ensure non-zero result\n    predictions_flat = torch.where(\n        critical_mask,\n        alt_sign * base_val,\n        torch.ones(total_elements, device=device) * 1e-35\n    )\n    targets_flat = torch.zeros(total_elements, dtype=torch.float32, device=device)\n    \n    predictions = predictions_flat.reshape(128, 4096)\n    targets = targets_flat.reshape(128, 4096)\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 460.13
+}

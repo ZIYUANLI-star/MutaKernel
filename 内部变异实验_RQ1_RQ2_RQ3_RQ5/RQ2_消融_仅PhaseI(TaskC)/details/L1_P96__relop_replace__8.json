@@ -1,0 +1,143 @@
+{
+  "mutant_id": "L1_P96__relop_replace__8",
+  "operator_name": "relop_replace",
+  "kernel_name": "L1_P96",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4407,
+        "completion_tokens": 3742,
+        "total_tokens": 8149,
+        "reasoning_tokens": 1524
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "reduction_blocks = 2048. Original loop: i ∈ [0,2047]. Mutated loop: i ∈ [0,2048]. Index 2048 is out-of-bounds for block_sums_cpu (size 2048). The OOB read adds garbage value g to total_loss, causing mean_loss to differ by g/524288.",
+      "survival_reason": "The mutation changes the loop termination condition from `i < reduction_blocks` to `i <= reduction_blocks`, causing an extra iteration that accesses memory beyond the allocated tensor. This is undefined behavior that reads garbage memory on the CPU side after the tensor's valid data. The garbage value gets incorporated into the final mean loss calculation. While the exact garbage value is non-deterministic, it is unlikely to be exactly zero, causing observable differences in the output. The EMD Layer 2 confirmed divergence at seed 10011.",
+      "killable": true,
+      "kill_strategy": "Use any valid inputs — the bug is in the reduction loop logic, not input-dependent. The out-of-bounds memory access will add garbage to the sum. Using the seed that showed divergence (10011) increases reproduction reliability. Random normal inputs provide a predictable reference loss value.",
+      "recommendations": "Loop bound mutations (< vs <=) should be tested with precise element counting. For reduction kernels, verify the exact number of elements summed matches the expected count. Consider adding bounds-checking assertions in debug builds.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10011)\n    predictions = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4245,
+        "completion_tokens": 3798,
+        "total_tokens": 8043,
+        "reasoning_tokens": 1553
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With zero inputs: ref_loss=0, tolerance=0.01. Mutant reads garbage at index 2048. Need |garbage|/524288 > 0.01, i.e., |garbage| > 5243. Random inputs had ref_loss~0.5 requiring |garbage| > 7864 to detect. Zero inputs lower the detection threshold by ~33%.",
+      "survival_reason": "The previous attempt used random normal inputs which produced a reference loss around 0.5. The relative tolerance (rtol=0.01) added ~0.005 to the threshold, requiring the garbage value to exceed 7864 to be detected. The out-of-bounds memory happened to contain a value smaller than this. By using identical zero inputs, we eliminate the reference value entirely, reducing the detection threshold to 5243. This increases the probability that whatever garbage exists in memory will exceed the tolerance.",
+      "killable": true,
+      "kill_strategy": "Use predictions=targets=zeros to make expected loss exactly 0, minimizing the tolerance threshold. Any non-trivial garbage value from the out-of-bounds read will then exceed atol=0.01.",
+      "recommendations": "When testing reduction loops with boundary conditions, use inputs that produce zero expected outputs to maximize sensitivity to any spurious additions from out-of-bounds accesses or uninitialized memory.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4407,
+        "completion_tokens": 3667,
+        "total_tokens": 8074,
+        "reasoning_tokens": 1634
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation reads out-of-bounds index `block_sums_cpu[2048]` (array has 2048 elements). For detection: |garbage_value| / 524288 > 0.01 + 0.01*|ref_loss|. With ref_loss≈0, need |garbage|>5242.88. With ref_loss≈1, need |garbage|>10485. The garbage memory appears consistently near-zero, so the infected value doesn't propagate enough to exceed tolerance.",
+      "survival_reason": "Round 1 failed because random inputs produce ref_loss≈1, requiring garbage>10485 for detection. Round 2 with zeros produces ref_loss=0, still requiring garbage>5242.88. Both failed because the out-of-bounds memory read returns values much smaller than these thresholds. The memory after the allocation (uninitialized CPU memory from tensor.cpu() transfer) appears to contain near-zero values. This is undefined behavior that happens to be benign. A fundamentally different approach is to try to influence memory layout by using specific value patterns that might leave traces in adjacent allocations, or use inf/NaN boundary values.",
+      "killable": true,
+      "kill_strategy": "Use inf values in predictions to potentially trigger different memory patterns or numerical edge cases. If predictions contain inf and targets contain 0, the loss computation produces inf values which may propagate differently through the reduction and potentially interact with memory in unexpected ways. This tests if extreme floating-point values create detectable differences.",
+      "recommendations": "Add assertions or bounds checking on loop indices in CUDA/C++ code, especially for host-side memory access. Use static analysis tools to detect off-by-one errors in reduction loops. Consider using torch::sum() instead of manual reduction to avoid such bugs.",
+      "suggested_code": "def generate_inputs(device):\n    # Use inf values to create extreme losses that might expose the bug\n    # through different memory/numerical behavior\n    predictions = torch.full((128, 4096), float('inf'), device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4633,
+        "completion_tokens": 3931,
+        "total_tokens": 8564,
+        "reasoning_tokens": 1931
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation reads out-of-bounds at block_sums[reduction_blocks] where reduction_blocks=2048. The garbage value is divided by 524288 elements. For atol=0.01, rtol=0.01, need |garbage|/524288 > 0.01 + 0.01*|ref|, thus |garbage| > ~5243 for small ref. CUDA memory from torch::zeros or caching allocator typically returns near-zero values, making |garbage| << 5243.",
+      "survival_reason": "Round 1 failed because random inputs produce ref≈0.5, requiring |garbage|>7864. Round 2 with zeros required |garbage|>5243. Round 3 was invalid due to inf. All failed because the out-of-bounds memory read returns near-zero values on most systems. The EMD divergence at seed 10011 likely found a memory state where garbage was non-negligible, but this is non-deterministic. The key issue is that undefined behavior (out-of-bounds read) produces platform-dependent results. I'll try maximum-magnitude finite inputs to create large loss values that might influence CUDA memory allocation patterns or increase chances the garbage value in adjacent memory contains remnants of large computations.",
+      "killable": true,
+      "kill_strategy": "Use maximum-magnitude inputs (3.4e38 vs -3.4e38) to create extremely large element-wise losses. This may: (1) cause memory patterns where adjacent memory contains large values, (2) trigger different allocation paths in CUDA caching allocator, (3) increase likelihood that nearby memory contains non-zero remnants. The large total_loss makes even small relative garbage additions potentially detectable.",
+      "recommendations": "For mutation testing of memory-access bugs, consider: (1) running tests multiple times to catch non-deterministic UB, (2) using memory sanitizers (compute-sanitizer) that detect out-of-bounds accesses directly, (3) adding explicit bounds checking in test harnesses, (4) using tighter tolerances (atol=0, rtol=0) for exact comparison tests on known-deterministic computations.",
+      "suggested_code": "def generate_inputs(device):\n    # Use max finite float values with opposite signs\n    # This creates abs_diff ≈ 6.8e38, loss ≈ 6.8e38 per element\n    # Large values may influence memory allocation patterns\n    max_float = 3.4028235e+38\n    predictions = torch.full((128, 4096), max_float / 2, device=device, dtype=torch.float32)\n    targets = torch.full((128, 4096), -max_float / 2, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4943,
+        "completion_tokens": 3633,
+        "total_tokens": 8576,
+        "reasoning_tokens": 1862
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "total_elements = 128*4096 = 524288, reduction_blocks = 2048. The out-of-bounds read at index 2048 adds garbage_value to total_loss. Error in mean = garbage_value / 524288. For tolerance 0.01 + 0.01*|ref|, with |ref|≈0, need garbage > 5243 to exceed tolerance. CPU memory allocator typically returns zero-initialized or small-residual memory.",
+      "survival_reason": "Round 1-4 failed because the out-of-bounds CPU memory read returns a value that, when divided by 524288 elements, produces an error smaller than the tolerance threshold (atol=0.01). Random inputs (R1) created moderate losses but garbage/524288 was too small. Zeros (R2) had ref=0 but garbage was also near-zero. Inf values (R3,R4) caused invalid outputs in both versions. The fundamental issue is we cannot control the out-of-bounds memory content, and the division by 524288 dilutes any realistic garbage value below detection threshold. Previous attempts focused on input values but the bug is in post-computation CPU memory, which input values don't directly influence.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable through value-level testing because: (1) The out-of-bounds read occurs on CPU memory after .cpu() copy, not on GPU where we might influence allocator behavior; (2) CPU memory at out-of-bounds location is typically zero or small residual values; (3) Division by 524288 elements makes any reasonable garbage value (< 5243) fall within tolerance; (4) We cannot inject specific values into the out-of-bounds memory location through input manipulation. This mutation requires either memory sanitizer detection or shape-based testing where total_elements creates different reduction_blocks values.",
+      "recommendations": "Add address sanitizer (ASAN) or bounds-checking compilation flags for CPU code paths. The mutation `i <= reduction_blocks` vs `i < reduction_blocks` is a classic off-by-one buffer overread that static analysis or runtime bounds checking would catch. For mutation testing coverage, consider tests where the loop bound exactly equals the array size (total_elements % block_size == 0) which makes the off-by-one more likely to read adjacent meaningful data.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 414.0
+}

@@ -1,0 +1,46 @@
+{
+  "mutant_id": "L1_P23__index_replace__8",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P23",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4808,
+        "completion_tokens": 3016,
+        "total_tokens": 7824,
+        "reasoning_tokens": 936
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "blockDim.y = 1 for 1D block launch, so blockDim.y/2 = 0 (integer division). The max reduction loop never executes since initial s=0 fails the s>0 condition. This leaves row_max as only thread 0's partial max over 64 elements (indices 0,256,...,16128) instead of the true max over all 16384 elements.",
+      "survival_reason": "The mutation changes the loop bound from blockDim.x/2 (=128) to blockDim.y/2 (=0). Since the kernel uses 1D thread blocks (256,1,1), blockDim.y=1 and integer division yields 0. The loop condition s>0 immediately fails, so the parallel max reduction never combines partial results from different threads. Only thread 0's contribution to shared_max[0] survives, meaning row_max only reflects the maximum among indices 0, 256, 512, etc. If larger values exist at other indices, the softmax computation uses wrong row_max, causing exp() to overflow to inf when the difference between actual values and incorrect row_max exceeds ~88.",
+      "killable": true,
+      "kill_strategy": "Create input where thread 0's indices (0, 256, 512, ...) contain small values like -100, while other indices contain 0. The mutant will use row_max=-100 instead of 0, causing exp(0-(-100))=exp(100)=inf, leading to completely wrong softmax output.",
+      "recommendations": "When testing parallel reductions in CUDA kernels, verify that loop bounds correctly reference the intended dimension (blockDim.x for 1D reductions). Create targeted inputs where partial results from specific threads differ significantly from the combined result to catch broken reduction patterns.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, dtype=torch.float32, device=device)\n    # Thread 0 processes indices 0, 256, 512, ... (stride = blockDim.x = 256)\n    # Set these to very negative values\n    for i in range(0, 16384, 256):\n        x[:, i] = -100.0\n    # Other indices stay at 0, so true max = 0\n    # Mutant will use row_max = -100, causing exp(100) = inf\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,6.1275e-05], mut_range=[nan,nan]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 1,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Create input where thread 0's indices (0, 256, 512, ...) contain small values like -100, while other indices contain 0. The mutant will use row_max=-100 instead of 0, causing exp(0-(-100))=exp(100)=inf, leading to completely wrong softmax output.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, dtype=torch.float32, device=device)\n    # Thread 0 processes indices 0, 256, 512, ... (stride = blockDim.x = 256)\n    # Set these to very negative values\n    for i in range(0, 16384, 256):\n        x[:, i] = -100.0\n    # Other indices stay at 0, so true max = 0\n    # Mutant will use row_max = -100, causing exp(100) = inf\n    return [x]"
+  },
+  "elapsed_sec": 88.28
+}

@@ -1,0 +1,146 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(Model, self).__init__()
+        
+        layers = []
+        current_input_size = input_size
+        
+        for layer_size in layer_sizes:
+            layers.append(nn.Linear(current_input_size, layer_size))
+            layers.append(nn.ReLU())
+            current_input_size = layer_size
+        
+        layers.append(nn.Linear(current_input_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        return self.network(x)
+
+# Test code
+batch_size = 128
+input_size = 16384
+layer_sizes = [16384, 16384]
+output_size = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, layer_sizes, output_size]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, layer_sizes, output_size):
+        super(ModelNew, self).__init__()
+        
+        # Initialize parameters - we'll rename them later to match original
+        self.fc1_weight = nn.Parameter(torch.randn(layer_sizes[0], input_size))
+        self.fc1_bias = nn.Parameter(torch.zeros(layer_sizes[0]))
+        self.fc2_weight = nn.Parameter(torch.randn(layer_sizes[1], layer_sizes[0]))
+        self.fc2_bias = nn.Parameter(torch.zeros(layer_sizes[1]))
+        self.fc3_weight = nn.Parameter(torch.randn(output_size, layer_sizes[1]))
+        self.fc3_bias = nn.Parameter(torch.zeros(output_size))
+
+    def load_state_dict(self, state_dict):
+        # Rename keys to match
+        new_state_dict = {}
+        new_state_dict['fc1_weight'] = state_dict['network.0.weight']
+        new_state_dict['fc1_bias'] = state_dict['network.0.bias']
+        new_state_dict['fc2_weight'] = state_dict['network.2.weight']
+        new_state_dict['fc2_bias'] = state_dict['network.2.bias']
+        new_state_dict['fc3_weight'] = state_dict['network.4.weight']
+        new_state_dict['fc3_bias'] = state_dict['network.4.bias']
+        super().load_state_dict(new_state_dict)
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def forward(self, x):
+        # Enable TF32
+        torch.set_float32_matmul_precision('high')
+        
+        # Use torch.addmm for efficient matrix multiply + bias
+        x = torch.addmm(self.fc1_bias, x, self.fc1_weight.T)
+        x = torch.clamp_min(x, 0.0)  # ReLU
+        
+        x = torch.addmm(self.fc2_bias, x, self.fc2_weight.T)
+        x = torch.clamp_min(x, 0.0)  # ReLU
+        
+        x = torch.addmm(self.fc3_bias, x, self.fc3_weight.T)
+        
+        # Reset to default
+        torch.set_float32_matmul_precision('medium')
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 51
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (25 failures)
+  - [large_magnitude seed=50000] max_diff=1.247070e+00, mean_diff=1.650489e-01, ref_range=[-4.5801e+02,5.6836e+02], orig_range=[-4.5704e+02,5.6711e+02]
+  - [large_magnitude seed=50001] max_diff=9.701843e-01, mean_diff=1.643611e-01, ref_range=[-4.4410e+02,4.4055e+02], orig_range=[-4.4319e+02,4.3964e+02]
+  - [near_overflow seed=50002] max_diff=1.056337e+27, mean_diff=1.648003e+26, ref_range=[-4.9529e+29,4.7919e+29], orig_range=[-4.9424e+29,4.7828e+29]
+  - [near_overflow seed=50003] max_diff=1.022902e+27, mean_diff=1.646239e+26, ref_range=[-4.3108e+29,4.7873e+29], orig_range=[-4.3012e+29,4.7776e+29]
+  - [all_negative seed=50008] max_diff=9.545517e-02, mean_diff=1.655524e-02, ref_range=[-4.1198e+01,4.7230e+01], orig_range=[-4.1108e+01,4.7141e+01]
+  - [all_negative seed=50009] max_diff=9.720230e-02, mean_diff=1.657857e-02, ref_range=[-4.4422e+01,4.7762e+01], orig_range=[-4.4331e+01,4.7664e+01]
+  - [all_positive seed=50010] max_diff=1.108208e-01, mean_diff=1.651902e-02, ref_range=[-4.3459e+01,4.9606e+01], orig_range=[-4.3366e+01,4.9496e+01]
+  - [all_positive seed=50011] max_diff=1.054497e-01, mean_diff=1.633862e-02, ref_range=[-4.4480e+01,4.3590e+01], orig_range=[-4.4375e+01,4.3494e+01]
+  ... and 17 more failures
+
+### training_stress (26 failures)
+  - [large_magnitude seed=70000] max_diff=1.000366e+00, mean_diff=1.658356e-01, ref_range=[-4.6072e+02,4.3642e+02], orig_range=[-4.5978e+02,4.3556e+02]
+  - [large_magnitude seed=70001] max_diff=1.092285e+00, mean_diff=1.657707e-01, ref_range=[-4.5492e+02,5.1882e+02], orig_range=[-4.5397e+02,5.1773e+02]
+  - [near_overflow seed=70002] max_diff=1.009982e+27, mean_diff=1.618712e+26, ref_range=[-4.5975e+29,4.3090e+29], orig_range=[-4.5884e+29,4.2996e+29]
+  - [near_overflow seed=70003] max_diff=1.011795e+27, mean_diff=1.649985e+26, ref_range=[-4.7811e+29,4.8921e+29], orig_range=[-4.7714e+29,4.8821e+29]
+  - [all_negative seed=70008] max_diff=9.310913e-02, mean_diff=1.646630e-02, ref_range=[-4.9085e+01,4.5001e+01], orig_range=[-4.8992e+01,4.4910e+01]
+  - [all_negative seed=70009] max_diff=1.035995e-01, mean_diff=1.652602e-02, ref_range=[-4.6542e+01,4.7401e+01], orig_range=[-4.6438e+01,4.7305e+01]
+  - [all_positive seed=70010] max_diff=1.093636e-01, mean_diff=1.660956e-02, ref_range=[-5.4545e+01,4.5507e+01], orig_range=[-5.4441e+01,4.5412e+01]
+  - [all_positive seed=70011] max_diff=9.723282e-02, mean_diff=1.656065e-02, ref_range=[-4.5897e+01,4.2684e+01], orig_range=[-4.5806e+01,4.2592e+01]
+  ... and 18 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

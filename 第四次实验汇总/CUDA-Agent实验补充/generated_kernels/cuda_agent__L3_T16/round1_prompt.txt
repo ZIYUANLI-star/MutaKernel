@@ -1,0 +1,193 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# From https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+
+class Model(nn.Module):
+    """
+    A vanilla multi-head masked self-attention layer with a projection at the end.
+    It is possible to use torch.nn.MultiheadAttention here but I am including an
+    explicit implementation here to show that there is nothing too scary here.
+    """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # regularization
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+batch_size = 128
+max_seqlen = 1024
+seq_len = 512
+n_embd = 768
+n_head = 8
+attn_pdrop = 0.0
+resid_pdrop = 0.0
+
+def get_inputs():
+    return [torch.rand(batch_size, seq_len, n_embd)]
+
+def get_init_inputs():
+    return [n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+import math
+
+class ModelNew(nn.Module):
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        
+        # Enable TF32 and use FP16 for matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Convert to FP16 for faster computation
+        x_fp16 = x.half()
+        attn_weight_fp16 = self.c_attn.weight.half()
+        attn_bias_fp16 = self.c_attn.bias.half()
+        proj_weight_fp16 = self.c_proj.weight.half()
+        proj_bias_fp16 = self.c_proj.bias.half()
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        qkv = x_fp16 @ attn_weight_fp16.T + attn_bias_fp16
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Reshape and transpose
+        k = k.view(B, T, self.n_head, C // self.n_head).permute(0, 2, 1, 3) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).permute(0, 2, 1, 3) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).permute(0, 2, 1, 3) # (B, nh, T, hs)
+
+        # causal self-attention with TF32
+        attn_weights = q @ k.transpose(-1, -2)
+        attn_weights = attn_weights / math.sqrt(k.size(-1))
+        
+        # Convert mask to FP16
+        bias_fp16 = self.bias[:,:,:T,:T].half()
+        
+        # Mask
+        attn_weights = attn_weights.masked_fill(bias_fp16 == 0, float('-inf'))
+        
+        # Softmax
+        attn_weights = attn_weights.softmax(dim=-1)
+        
+        # Attention output with TF32
+        attn_output = attn_weights @ v
+        
+        # Reshape
+        attn_output = attn_output.permute(0, 2, 1, 3).contiguous().view(B, T, C)
+        
+        # Output projection with TF32
+        y_fp16 = attn_output @ proj_weight_fp16.T + proj_bias_fp16
+        
+        # Convert back to FP32
+        y = y_fp16.float()
+        
+        # Disable TF32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return y
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 56
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=nan, mean_diff=nan, ref_range=[-1.8014e+03,1.8933e+03], orig_range=[nan,nan]
+  - [large_magnitude seed=50001] max_diff=nan, mean_diff=nan, ref_range=[-1.8000e+03,1.8570e+03], orig_range=[nan,nan]
+  - [all_negative seed=50008] max_diff=nan, mean_diff=nan, ref_range=[-1.7151e+02,1.7644e+02], orig_range=[nan,nan]
+  - [all_negative seed=50009] max_diff=nan, mean_diff=nan, ref_range=[-1.8377e+02,1.7827e+02], orig_range=[nan,nan]
+  - [all_positive seed=50010] max_diff=nan, mean_diff=nan, ref_range=[-1.7268e+02,1.8666e+02], orig_range=[nan,nan]
+  - [all_positive seed=50011] max_diff=nan, mean_diff=nan, ref_range=[-1.8352e+02,1.7985e+02], orig_range=[nan,nan]
+  - [mixed_extremes seed=50012] max_diff=nan, mean_diff=nan, ref_range=[-1.2780e+04,1.3846e+04], orig_range=[nan,nan]
+  - [mixed_extremes seed=50013] max_diff=nan, mean_diff=nan, ref_range=[-1.3676e+04,1.2946e+04], orig_range=[nan,nan]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=nan, mean_diff=nan, ref_range=[-1.8238e+03,1.9308e+03], orig_range=[nan,nan]
+  - [large_magnitude seed=70001] max_diff=nan, mean_diff=nan, ref_range=[-1.8529e+03,1.8982e+03], orig_range=[nan,nan]
+  - [all_negative seed=70008] max_diff=nan, mean_diff=nan, ref_range=[-1.8026e+02,1.7801e+02], orig_range=[nan,nan]
+  - [all_negative seed=70009] max_diff=nan, mean_diff=nan, ref_range=[-1.6248e+02,1.7838e+02], orig_range=[nan,nan]
+  - [all_positive seed=70010] max_diff=nan, mean_diff=nan, ref_range=[-1.7234e+02,1.7103e+02], orig_range=[nan,nan]
+  - [all_positive seed=70011] max_diff=nan, mean_diff=nan, ref_range=[-1.7586e+02,1.9039e+02], orig_range=[nan,nan]
+  - [mixed_extremes seed=70012] max_diff=nan, mean_diff=nan, ref_range=[-1.3321e+04,1.3496e+04], orig_range=[nan,nan]
+  - [mixed_extremes seed=70013] max_diff=nan, mean_diff=nan, ref_range=[-1.3112e+04,1.3000e+04], orig_range=[nan,nan]
+  ... and 20 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

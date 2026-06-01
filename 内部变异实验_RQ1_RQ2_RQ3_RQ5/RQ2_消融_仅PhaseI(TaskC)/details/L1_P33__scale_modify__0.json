@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P33__scale_modify__0",
+  "operator_name": "scale_modify",
+  "kernel_name": "L1_P33",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8184,
+        "completion_tokens": 5972,
+        "total_tokens": 14156,
+        "reasoning_tokens": 2537
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation changes rsqrt(var+eps) to (var+eps) in inference kernel. With running_var=1.0: original inv_std≈0.999995, mutant inv_std=1.00001. The 0.0015% difference is below 1% tolerance with defaults, BUT the kernel is only exercised in eval mode, and the test framework must explicitly call model.eval() to trigger this path.",
+      "survival_reason": "The mutation is in the inference kernel which requires training=False. With default running_var=1.0, the numerical difference between rsqrt(1.00001)≈0.999995 and 1.00001 is only 0.0015%, falling below the atol/rtol=1% threshold for typical input magnitudes. However, the mutation fundamentally breaks the BatchNorm math - it computes (var+eps) instead of 1/sqrt(var+eps), which would be catastrophically wrong for any running_var significantly different from 1.0. The mutant survives only because default initialization makes var≈1, causing rsqrt(1+ε)≈1+ε to hold approximately.",
+      "killable": true,
+      "kill_strategy": "Run the model in eval mode with very large input values. Even with default running_var=1.0, large enough input magnitudes will accumulate enough absolute difference. Alternatively, if the testing framework supports running training first (to update running_var to a non-1 value) then switching to eval mode, the mutation would be immediately exposed.",
+      "recommendations": "Mutation testing for BatchNorm should ensure both training and eval mode paths are tested separately. The inference kernel has fundamentally different computation that won't be exercised if only training mode is tested. Consider adding explicit mode-switching assertions in test coverage tools.",
+      "suggested_code": "def generate_inputs(device):\n    # Use large values to maximize absolute difference\n    # The scale difference of 0.0015% needs large inputs to exceed atol\n    x = torch.full((16, 64, 256, 256), 10000.0, dtype=torch.float32, device=device)\n    # Add some variation to exercise different code paths\n    x[:, ::2, :, :] = -10000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8065,
+        "completion_tokens": 5573,
+        "total_tokens": 13638,
+        "reasoning_tokens": 2353
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "With default running_var=1.0 and eps=1e-5: Original inv_std=rsqrt(1.00001)≈0.999995, Mutated inv_std=1.00001. Ratio≈1.000015 (0.0015% difference). For any output x: |error|=0.000015*|x|, tolerance=0.01+0.01*|x|. Solving 0.000015*|x|>0.01+0.01*|x| gives -0.009985*|x|>0.01, which is impossible. The mutation only affects inference path with fixed running_var=1.0, making relative error (0.0015%) always less than rtol (1%).",
+      "survival_reason": "The previous attempt with large constant values (±10000) failed because with running_var=1.0, the ratio between rsqrt(1+eps)≈0.999995 and (1+eps)=1.00001 is only 1.000015, a 0.0015% relative difference. Since rtol=1%, this is always within tolerance regardless of input magnitude. The mutation is in the inference kernel, and the default model state (running_var=1.0, initialized in __init__) cannot be modified through input values alone. Training mode uses an unmutated kernel, so it cannot expose the bug. The only way to kill would be to modify running_var to a value significantly different from 1.0, requiring model state access or a multi-phase test that updates running_var in training then tests in eval mode.",
+      "killable": false,
+      "kill_strategy": "Unkillable under current testing contract. The mutation changes rsqrt(var+eps) to (var+eps) in the inference kernel. With the fixed default running_var=1.0, the relative difference is only 0.0015%, well below the 1% rtol threshold. Killing requires either: (1) ability to modify model.bn.running_var to a non-1.0 value, or (2) a test framework that runs training passes to update running_var before the eval comparison.",
+      "recommendations": "When testing batch normalization kernels, the test framework should either: (1) allow tests to specify custom running statistics buffers, (2) run both training and eval modes in sequence with the same model instance, or (3) test with non-default running_var values. The fixed running_var=1.0 creates a degenerate case where rsqrt(1)≈1, masking mutations that alter the rsqrt operation.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 228.71
+}

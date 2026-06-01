@@ -1,0 +1,40 @@
+{
+  "mutant_id": "L1_P100__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P100",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5143,
+        "completion_tokens": 3254,
+        "total_tokens": 8397,
+        "reasoning_tokens": 1487
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "With input size=128 and block_size=256, num_blocks=1. All 256 threads execute in a single block. Threads 128-255 skip the margin computation (idx >= size) and write 0.0f to shared_mem[128..255]. The first reduction step (stride=128) has threads 0-127 read from shared_mem[128..255]. The removed __syncthreads() creates a theoretical race where threads 0-127 might read garbage before threads 128-255 write 0.0f. However, this is a timing-dependent race condition, not value-dependent. With all threads in a single block executing nearly identical code paths, warp scheduling keeps threads sufficiently synchronized that the race never manifests in practice.",
+      "survival_reason": "The mutation removes a __syncthreads() barrier between shared memory writes and reads during reduction, creating a theoretical race condition. However, with only 128 input elements (fixed shape [128,1]), only 1 block with 256 threads is launched. Threads 128-255 have minimal work (skip the margin calculation) and write 0.0f to their shared memory positions. The race would only manifest if threads 0-127 read from positions 128-255 before those threads write. Since this is timing-dependent (not value-dependent), no input values can deterministically trigger it. Modern GPU warp schedulers and the simple uniform code path keep threads sufficiently synchronized that the race never produces observable differences across 112+ test rounds.",
+      "killable": false,
+      "kill_strategy": "UNKILLABLE via value manipulation. The mutation introduces a race condition that depends on GPU thread scheduling timing, not input values. With the fixed input shape [128,1], only 1 block is launched, and inter-warp timing within a single block consistently allows threads 128-255 to complete their shared memory writes before threads 0-127 read from those locations. Triggering this race would require either (a) changing input size to require multiple blocks with different timing characteristics, or (b) running on hardware with different warp scheduling behavior - neither of which is achievable through value changes alone.",
+      "recommendations": "For mutation testing of synchronization barriers, augment the test harness to (1) test with input sizes that span multiple blocks with varying fill patterns, (2) run kernels under artificial contention/stress to expose timing-dependent races, or (3) use CUDA race detection tools like compute-sanitizer --tool racecheck. Fixed-shape contracts may inadvertently make synchronization mutations unkillable when the shape happens to produce benign thread scheduling.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 2
+  },
+  "elapsed_sec": 58.08
+}

@@ -1,0 +1,358 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ShuffleNetUnit(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        """
+        ShuffleNet unit implementation.
+
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param groups: Number of groups for group convolution.
+        """
+        super(ShuffleNetUnit, self).__init__()
+        
+        # Ensure the output channels are divisible by groups
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+        
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        
+        # Shuffle operation
+        self.shuffle = ChannelShuffle(groups)
+        
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    def forward(self, x):
+        """
+        Forward pass for ShuffleNet unit.
+
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out = self.shuffle(out)
+        out = F.relu(self.bn3(self.conv3(out)))
+        
+        out += self.shortcut(x)
+        return out
+
+class ChannelShuffle(nn.Module):
+    def __init__(self, groups):
+        """
+        Channel shuffle operation.
+
+        :param groups: Number of groups for shuffling.
+        """
+        super(ChannelShuffle, self).__init__()
+        self.groups = groups
+    
+    def forward(self, x):
+        """
+        Forward pass for channel shuffle.
+
+        :param x: Input tensor, shape (batch_size, channels, height, width)
+        :return: Output tensor, shape (batch_size, channels, height, width)
+        """
+        batch_size, channels, height, width = x.size()
+        channels_per_group = channels // self.groups
+        
+        # Reshape
+        x = x.view(batch_size, self.groups, channels_per_group, height, width)
+        
+        # Transpose
+        x = x.transpose(1, 2).contiguous()
+        
+        # Flatten
+        x = x.view(batch_size, -1, height, width)
+        
+        return x
+
+class Model(nn.Module):
+    def __init__(self, num_classes=1000, groups=3, stages_repeats=[3, 7, 3], stages_out_channels=[24, 240, 480, 960]):
+        """
+        ShuffleNet architecture.
+
+        :param num_classes: Number of output classes.
+        :param groups: Number of groups for group convolution.
+        :param stages_repeats: List of ints specifying the number of repeats for each stage.
+        :param stages_out_channels: List of ints specifying the output channels for each stage.
+        """
+        super(Model, self).__init__()
+        
+        self.conv1 = nn.Conv2d(3, stages_out_channels[0], kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        self.stage2 = self._make_stage(stages_out_channels[0], stages_out_channels[1], stages_repeats[0], groups)
+        self.stage3 = self._make_stage(stages_out_channels[1], stages_out_channels[2], stages_repeats[1], groups)
+        self.stage4 = self._make_stage(stages_out_channels[2], stages_out_channels[3], stages_repeats[2], groups)
+        
+        self.conv5 = nn.Conv2d(stages_out_channels[3], 1024, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn5 = nn.BatchNorm2d(1024)
+        
+        self.fc = nn.Linear(1024, num_classes)
+    
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        """
+        Helper function to create a stage of ShuffleNet units.
+
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param repeats: Number of ShuffleNet units in the stage.
+        :param groups: Number of groups for group convolution.
+        :return: nn.Sequential containing the stage.
+        """
+        layers = []
+        layers.append(ShuffleNetUnit(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnit(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        Forward pass for ShuffleNet.
+
+        :param x: Input tensor, shape (batch_size, 3, height, width)
+        :return: Output tensor, shape (batch_size, num_classes)
+        """
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.maxpool(x)
+        
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        
+        x = F.relu(self.bn5(self.conv5(x)))
+        x = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        
+        return x
+
+# Test code
+batch_size = 10
+input_channels = 3
+height = 224
+width = 224
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, input_channels, height, width)]
+
+def get_init_inputs():
+    return [num_classes]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+# Enable TensorFloat32 for better performance
+torch.set_float32_matmul_precision('high')
+
+class ShuffleNetUnit(nn.Module):
+    def __init__(self, in_channels, out_channels, groups=3):
+        super(ShuffleNetUnit, self).__init__()
+        
+        assert out_channels % 4 == 0
+        mid_channels = out_channels // 4
+        
+        # First 1x1 group convolution
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+        
+        # Depthwise 3x3 convolution
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, stride=1, padding=1, groups=mid_channels, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        
+        # Second 1x1 group convolution
+        self.conv3 = nn.Conv2d(mid_channels, out_channels, kernel_size=1, stride=1, padding=0, groups=groups, bias=False)
+        self.bn3 = nn.BatchNorm2d(out_channels)
+        
+        # Shortcut connection if input and output channels are the same
+        if in_channels == out_channels:
+            self.shortcut = nn.Sequential()
+        else:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+    
+    @torch.compile(backend="inductor")
+    def forward(self, x):
+        # Use PyTorch group convolution
+        out = torch.conv2d(x, self.conv1.weight, bias=None, stride=[1, 1], padding=[0, 0], groups=3)
+        # BatchNorm + ReLU
+        out = out * self.bn1.weight.view(1, -1, 1, 1) + self.bn1.bias.view(1, -1, 1, 1)
+        out = torch.relu(out)
+        
+        # Use PyTorch depthwise convolution
+        out = torch.conv2d(out, self.conv2.weight, bias=None, stride=[1, 1], padding=[1, 1], groups=self.conv2.groups)
+        # BatchNorm
+        out = out * self.bn2.weight.view(1, -1, 1, 1) + self.bn2.bias.view(1, -1, 1, 1)
+        
+        # Channel shuffle - use PyTorch implementation
+        batch_size, channels, height, width = out.size()
+        channels_per_group = channels // 3
+        out = out.view(batch_size, 3, channels_per_group, height, width)
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(batch_size, -1, height, width)
+        
+        # Use PyTorch group convolution
+        out = torch.conv2d(out, self.conv3.weight, bias=None, stride=[1, 1], padding=[0, 0], groups=3)
+        # BatchNorm
+        out = out * self.bn3.weight.view(1, -1, 1, 1) + self.bn3.bias.view(1, -1, 1, 1)
+        out = torch.relu(out)
+        
+        # Shortcut connection
+        if self.shortcut:
+            shortcut_out = torch.conv2d(x, self.shortcut[0].weight, bias=None, stride=[1, 1], padding=[0, 0], groups=1)
+            # BatchNorm
+            shortcut_out = shortcut_out * self.shortcut[1].weight.view(1, -1, 1, 1) + self.shortcut[1].bias.view(1, -1, 1, 1)
+            out += shortcut_out
+        else:
+            out += x
+        
+        return out
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes=1000, groups=3, stages_repeats=[3, 7, 3], stages_out_channels=[24, 240, 480, 960]):
+        super(ModelNew, self).__init__()
+        
+        self.conv1 = nn.Conv2d(3, stages_out_channels[0], kernel_size=3, stride=2, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(stages_out_channels[0])
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        
+        self.stage2 = self._make_stage(stages_out_channels[0], stages_out_channels[1], stages_repeats[0], groups)
+        self.stage3 = self._make_stage(stages_out_channels[1], stages_out_channels[2], stages_repeats[1], groups)
+        self.stage4 = self._make_stage(stages_out_channels[2], stages_out_channels[3], stages_repeats[2], groups)
+        
+        self.conv5 = nn.Conv2d(stages_out_channels[3], 1024, kernel_size=1, stride=1, padding=0, bias=False)
+        self.bn5 = nn.BatchNorm2d(1024)
+        
+        self.fc = nn.Linear(1024, num_classes)
+    
+    def _make_stage(self, in_channels, out_channels, repeats, groups):
+        layers = []
+        layers.append(ShuffleNetUnit(in_channels, out_channels, groups))
+        for _ in range(1, repeats):
+            layers.append(ShuffleNetUnit(out_channels, out_channels, groups))
+        return nn.Sequential(*layers)
+    
+    @torch.compile(backend="inductor")
+    def forward(self, x):
+        # Enable TensorFloat32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Conv1
+        x = torch.conv2d(x, self.conv1.weight, bias=None, stride=[2, 2], padding=[1, 1], groups=1)
+        # BatchNorm + ReLU
+        x = x * self.bn1.weight.view(1, -1, 1, 1) + self.bn1.bias.view(1, -1, 1, 1)
+        x = torch.relu(x)
+        
+        # MaxPool
+        x = torch.max_pool2d(x, kernel_size=3, stride=2, padding=1)
+        
+        # Stages
+        x = self.stage2(x)
+        x = self.stage3(x) 
+        x = self.stage4(x)
+        
+        # Conv5
+        x = torch.conv2d(x, self.conv5.weight, bias=None, stride=[1, 1], padding=[0, 0], groups=1)
+        # BatchNorm + ReLU
+        x = x * self.bn5.weight.view(1, -1, 1, 1) + self.bn5.bias.view(1, -1, 1, 1)
+        x = torch.relu(x)
+        
+        # AdaptiveAvgPool - use PyTorch implementation
+        x = x.mean(dim=(2, 3), keepdim=True)
+        x = x.view(x.size(0), -1)
+        
+        # FC
+        x = x @ self.fc.weight.T + self.fc.bias
+        
+        # Disable TensorFloat32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 60
+Failing dimensions: value_stress, training_stress, repeated_run
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (16 failures)
+  - [large_magnitude seed=50000] max_diff=5.954361e-02, mean_diff=1.212269e-02, ref_range=[-1.6194e+02,2.0578e+02], orig_range=[-1.6194e+02,2.0579e+02]
+  - [large_magnitude seed=50001] max_diff=4.785919e-02, mean_diff=1.063851e-02, ref_range=[-1.5538e+02,1.5820e+02], orig_range=[-1.5538e+02,1.5822e+02]
+  - [near_overflow seed=50002] max_diff=6.092089e+25, mean_diff=1.232181e+25, ref_range=[-1.6339e+29,2.0215e+29], orig_range=[-1.6342e+29,2.0216e+29]
+  - [near_overflow seed=50003] max_diff=6.296803e+25, mean_diff=1.084588e+25, ref_range=[-1.4739e+29,1.6031e+29], orig_range=[-1.4740e+29,1.6030e+29]
+  - [mixed_extremes seed=50012] max_diff=3.988953e-01, mean_diff=8.014819e-02, ref_range=[-1.0728e+03,1.1537e+03], orig_range=[-1.0730e+03,1.1538e+03]
+  - [mixed_extremes seed=50013] max_diff=3.767395e-01, mean_diff=7.898347e-02, ref_range=[-1.2127e+03,1.1135e+03], orig_range=[-1.2126e+03,1.1134e+03]
+  - [head_heavy seed=50024] max_diff=4.732056e-01, mean_diff=2.595865e-02, ref_range=[-1.2339e+03,1.1806e+03], orig_range=[-1.2339e+03,1.1807e+03]
+  - [head_heavy seed=50025] max_diff=3.982391e-01, mean_diff=2.869670e-02, ref_range=[-1.3581e+03,1.5320e+03], orig_range=[-1.3580e+03,1.5321e+03]
+  ... and 8 more failures
+
+### training_stress (42 failures)
+  - [large_magnitude seed=70000] max_diff=1.512094e+02, mean_diff=3.864161e+01, ref_range=[-7.1913e-01,7.5643e-01], orig_range=[-1.5192e+02,1.3506e+02]
+  - [large_magnitude seed=70001] max_diff=1.761556e+02, mean_diff=3.941630e+01, ref_range=[-7.9645e-01,6.4271e-01], orig_range=[-1.7623e+02,1.6038e+02]
+  - [near_overflow seed=70002] max_diff=1.689303e+29, mean_diff=4.206028e+28, ref_range=[-3.1160e-02,3.1241e-02], orig_range=[-1.6893e+29,1.4454e+29]
+  - [near_overflow seed=70003] max_diff=1.696626e+29, mean_diff=4.118169e+28, ref_range=[-3.1210e-02,3.1176e-02], orig_range=[-1.6966e+29,1.5623e+29]
+  - [near_zero seed=70004] max_diff=8.154360e-01, mean_diff=1.822670e-01, ref_range=[-6.9918e-01,8.1678e-01], orig_range=[-3.1224e-02,3.1043e-02]
+  - [near_zero seed=70005] max_diff=6.994041e-01, mean_diff=1.853509e-01, ref_range=[-7.0902e-01,7.1116e-01], orig_range=[-3.1242e-02,3.1189e-02]
+  - [denormals seed=70006] max_diff=9.393720e-01, mean_diff=1.913168e-01, ref_range=[-9.3302e-01,6.1246e-01], orig_range=[-3.1205e-02,3.1213e-02]
+  - [denormals seed=70007] max_diff=7.844114e-01, mean_diff=1.850528e-01, ref_range=[-7.8428e-01,7.8873e-01], orig_range=[-3.1059e-02,3.1248e-02]
+  ... and 34 more failures
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

@@ -1,0 +1,46 @@
+{
+  "mutant_id": "L1_P38__const_perturb__25",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P38",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5161,
+        "completion_tokens": 5697,
+        "total_tokens": 10858,
+        "reasoning_tokens": 1787
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The reduction loop offset=15,7,3,1 yields thread 0 = W[0]+W[1]+W[3]+W[4]+W[7], missing warps 2,5,6. With 8 warps (blockDim.x=256, 256/32=8), this excludes 3/8 of contributions. When input has values ONLY in positions processed by warps 2,5,6, mutant computes batch_sum≈0→1.0 while correct computes actual sum.",
+      "survival_reason": "The mutation changes the shuffle-down reduction pattern from powers of 2 (16,8,4,2,1) to non-powers (15,7,3,1). With 8 warps contributing partial sums, the mutated pattern fails to include contributions from warps 2, 5, and 6. By constructing input where all non-zero values reside in positions processed exclusively by these warps, the mutant's computed L1 norm becomes nearly zero (triggering the divide-by-zero guard to set it to 1.0), while the correct norm equals the actual sum. This causes output values to differ by a factor equal to the actual L1 norm.",
+      "killable": true,
+      "kill_strategy": "Create input with non-zero values (e.g., 1000.0) ONLY at positions processed by warps 2, 5, and 6 (positions 256-383, 640-767, 768-895 and their stride-1024 repeats), and zeros elsewhere. The mutant will compute batch_sum≈0→1.0 while correct computes ~384000, producing outputs differing by 6 orders of magnitude.",
+      "recommendations": "Warp-level reduction loops using shuffle instructions must use power-of-2 offsets (16,8,4,2,1) to correctly reduce across all participating lanes. Mutation testing should verify reduction correctness by testing inputs where specific warps contribute disproportionately to the final result.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Place values ONLY in positions processed by warps 2, 5, 6\n    # Warp k processes threads 32k to 32k+31, each starting at position tid*4\n    # With stride=1024, they repeat every 1024 positions\n    for batch in range(16):\n        for base in range(0, 16384, 1024):\n            # Warp 2: threads 64-95 -> positions base+256 to base+383\n            end2 = min(base + 384, 16384)\n            if base + 256 < 16384:\n                x[batch, base+256:end2] = 1000.0\n            # Warp 5: threads 160-191 -> positions base+640 to base+767\n            end5 = min(base + 768, 16384)\n            if base + 640 < 16384:\n                x[batch, base+640:end5] = 1000.0\n            # Warp 6: threads 192-223 -> positions base+768 to base+895\n            end6 = min(base + 896, 16384)\n            if base + 768 < 16384:\n                x[batch, base+768:end6] = 1000.0\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=9.999998e+02, mean_diff=3.749999e+02, ref_range=[0.0000e+00,1.6276e-04], mut_range=[0.0000e+00,1.0000e+03]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 1,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Create input with non-zero values (e.g., 1000.0) ONLY at positions processed by warps 2, 5, and 6 (positions 256-383, 640-767, 768-895 and their stride-1024 repeats), and zeros elsewhere. The mutant will compute batch_sum≈0→1.0 while correct computes ~384000, producing outputs differing by 6 orders of magnitude.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Place values ONLY in positions processed by warps 2, 5, 6\n    # Warp k processes threads 32k to 32k+31, each starting at position tid*4\n    # With stride=1024, they repeat every 1024 positions\n    for batch in range(16):\n        for base in range(0, 16384, 1024):\n            # Warp 2: threads 64-95 -> positions base+256 to base+383\n            end2 = min(base + 384, 16384)\n            if base + 256 < 16384:\n                x[batch, base+256:end2] = 1000.0\n            # Warp 5: threads 160-191 -> positions base+640 to base+767\n            end5 = min(base + 768, 16384)\n            if base + 640 < 16384:\n                x[batch, base+640:end5] = 1000.0\n            # Warp 6: threads 192-223 -> positions base+768 to base+895\n            end6 = min(base + 896, 16384)\n            if base + 768 < 16384:\n                x[batch, base+768:end6] = 1000.0\n    return [x]"
+  },
+  "elapsed_sec": 119.6
+}

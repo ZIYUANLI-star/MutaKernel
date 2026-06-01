@@ -1,0 +1,272 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Cosine Similarity Loss for comparing vectors.
+
+    Parameters:
+        None
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, predictions, targets):
+        cosine_sim = torch.nn.functional.cosine_similarity(predictions, targets, dim=1)
+        return torch.mean(1 - cosine_sim)
+
+batch_size = 128
+input_shape = (4096, )
+dim = 1
+
+def get_inputs():
+    return [torch.randn(batch_size, *input_shape), torch.randn(batch_size, *input_shape)]
+
+def get_init_inputs():
+    return []
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fully fused cosine similarity loss with vectorized memory access
+cosine_loss_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<int THREADS_PER_BLOCK, int ELEMENTS_PER_THREAD>
+__global__ void cosine_loss_fused_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ output,
+    int batch_size,
+    int feature_size
+) {
+    __shared__ float shared_dot[THREADS_PER_BLOCK];
+    __shared__ float shared_pred_norm[THREADS_PER_BLOCK];
+    __shared__ float shared_target_norm[THREADS_PER_BLOCK];
+    
+    int tid = threadIdx.x;
+    int batch_idx = blockIdx.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const float* pred_ptr = predictions + batch_idx * feature_size;
+    const float* target_ptr = targets + batch_idx * feature_size;
+    
+    // Initialize accumulators
+    float dot_product = 0.0f;
+    float norm_pred = 0.0f;
+    float norm_target = 0.0f;
+    
+    // Vectorized processing for better memory bandwidth utilization
+    for (int base = 0; base < feature_size; base += THREADS_PER_BLOCK * ELEMENTS_PER_THREAD) {
+        int idx = base + tid * ELEMENTS_PER_THREAD;
+        
+        #pragma unroll
+        for (int i = 0; i < ELEMENTS_PER_THREAD; i++) {
+            int element_idx = idx + i;
+            if (element_idx < feature_size) {
+                float pred_val = pred_ptr[element_idx];
+                float target_val = target_ptr[element_idx];
+                dot_product += pred_val * target_val;
+                norm_pred += pred_val * pred_val;
+                norm_target += target_val * target_val;
+            }
+        }
+    }
+    
+    // Store thread results in shared memory
+    shared_dot[tid] = dot_product;
+    shared_pred_norm[tid] = norm_pred;
+    shared_target_norm[tid] = norm_target;
+    __syncthreads();
+    
+    // Parallel reduction using warp shuffles for better efficiency
+    for (int stride = THREADS_PER_BLOCK / 2; stride >= 32; stride >>= 1) {
+        if (tid < stride) {
+            shared_dot[tid] += shared_dot[tid + stride];
+            shared_pred_norm[tid] += shared_pred_norm[tid + stride];
+            shared_target_norm[tid] += shared_target_norm[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Warp-level reduction
+    if (tid < 32) {
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 16);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 16);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 16);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 8);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 8);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 8);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 4);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 4);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 4);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 2);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 2);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 2);
+        
+        shared_dot[tid] += __shfl_down_sync(0xffffffff, shared_dot[tid], 1);
+        shared_pred_norm[tid] += __shfl_down_sync(0xffffffff, shared_pred_norm[tid], 1);
+        shared_target_norm[tid] += __shfl_down_sync(0xffffffff, shared_target_norm[tid], 1);
+    }
+    __syncthreads();
+    
+    // First thread computes final loss for this batch
+    if (tid == 0) {
+        const float epsilon = 1e-8f;
+        float norm_product = sqrtf(shared_pred_norm[0] + epsilon) * sqrtf(shared_target_norm[0] + epsilon);
+        float cosine_sim = shared_dot[0] / (norm_product + epsilon);
+        float loss = 1.0f - cosine_sim;
+        
+        // Atomic add to accumulate mean
+        atomicAdd(output, loss / batch_size);
+    }
+}
+
+torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto batch_size = predictions.size(0);
+    auto feature_size = predictions.size(1);
+    
+    // Allocate output tensor (single value)
+    auto options = torch::TensorOptions()
+        .dtype(predictions.dtype())
+        .device(predictions.device());
+    auto output = torch::zeros({1}, options);
+    
+    // Choose optimal configuration based on feature size
+    const int THREADS = 256;
+    const int ELEMENTS_PER_THREAD = 4;  // Process 4 elements per thread for better memory coalescing
+    
+    dim3 grid_size(batch_size, 1, 1);
+    dim3 block_size(THREADS, 1, 1);
+    
+    // Launch fused kernel - one block per batch element
+    cosine_loss_fused_kernel<THREADS, ELEMENTS_PER_THREAD><<<grid_size, block_size>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        feature_size
+    );
+    
+    return output.squeeze();
+}
+"""
+
+cosine_loss_cpp_source = "torch::Tensor cosine_loss_cuda(torch::Tensor predictions, torch::Tensor targets);"
+
+# Compile the inline CUDA code - fixed compiler flags
+cosine_loss = load_inline(
+    name="cosine_loss",
+    cpp_sources=cosine_loss_cpp_source,
+    cuda_sources=cosine_loss_source,
+    functions=["cosine_loss_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fully fused custom CUDA kernel for cosine similarity loss.
+    Features vectorized memory access and warp-level reductions.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.cosine_loss = cosine_loss
+
+    def forward(self, predictions, targets):
+        # Use custom CUDA kernel for fully fused cosine similarity loss computation
+        return self.cosine_loss.cosine_loss_cuda(predictions, targets)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 12)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=near_overflow, seed=348, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[2] policy=near_overflow, seed=349, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[3] policy=near_overflow, seed=350, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[4] policy=near_epsilon, seed=390, mode=train_value:
+      max_diff=1.127449e-01, mean_diff=1.127449e-01, ref_range=[2.4250e-01,2.4250e-01], orig_range=[3.5524e-01,3.5524e-01]
+[5] policy=near_epsilon, seed=391, mode=train_value:
+      max_diff=1.129973e-01, mean_diff=1.129973e-01, ref_range=[2.4223e-01,2.4223e-01], orig_range=[3.5523e-01,3.5523e-01]
+[6] policy=near_epsilon, seed=392, mode=train_value:
+      max_diff=1.128825e-01, mean_diff=1.128825e-01, ref_range=[2.4187e-01,2.4187e-01], orig_range=[3.5475e-01,3.5475e-01]
+[7] policy=near_overflow, seed=354, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[8] policy=near_overflow, seed=355, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[9] policy=near_overflow, seed=356, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[10] policy=near_epsilon, seed=393, mode=train_value:
+      max_diff=1.128928e-01, mean_diff=1.128928e-01, ref_range=[2.4115e-01,2.4115e-01], orig_range=[3.5404e-01,3.5404e-01]
+[11] policy=near_epsilon, seed=394, mode=train_value:
+      max_diff=1.129281e-01, mean_diff=1.129281e-01, ref_range=[2.4125e-01,2.4125e-01], orig_range=[3.5417e-01,3.5417e-01]
+[12] policy=near_epsilon, seed=395, mode=train_value:
+      max_diff=1.127875e-01, mean_diff=1.127875e-01, ref_range=[2.4127e-01,2.4127e-01], orig_range=[3.5406e-01,3.5406e-01]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

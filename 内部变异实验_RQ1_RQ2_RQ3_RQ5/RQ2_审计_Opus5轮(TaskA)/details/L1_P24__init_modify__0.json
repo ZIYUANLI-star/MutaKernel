@@ -1,0 +1,121 @@
+{
+  "mutant_id": "L1_P24__init_modify__0",
+  "operator_name": "init_modify",
+  "kernel_name": "L1_P24",
+  "tier": 3,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6621,
+        "completion_tokens": 4112,
+        "total_tokens": 10733,
+        "reasoning_tokens": 1501
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "With input shape [16,16384], BLOCK_SIZE=512. If all values are -1e11 (< -1e10), original computes global_max=-1e11 correctly, but mutant gets fmaxf(-1e10f,-1e11f)=-1e10f (wrong). This causes exp(val-max)=exp(-9e10)≈0, sum≈0, log(sum)=-inf, making output=inf instead of ≈-9.7.",
+      "survival_reason": "The mutation replaces -INFINITY with -1e10f as the reduction identity for finding the maximum. When all input values in a row are less than -1e10f, the mutant's initialization value incorrectly dominates the max computation. The testing suite included 'all_negative' and 'large_magnitude' tests, but none used values extreme enough (below -1e10) to trigger this edge case. Since float32 supports values down to ~-3.4e38, values like -1e11 are perfectly valid and expose the bug.",
+      "killable": true,
+      "kill_strategy": "Provide input where ALL values are less than -1e10f (e.g., uniformly -1e11). This causes the mutant to compute an incorrect global maximum (-1e10 instead of -1e11), leading to catastrophic underflow in exp() and producing inf outputs instead of the correct ~-9.7.",
+      "recommendations": "When testing reduction operations, always test with values beyond the mutant's boundary constants (here -1e10f). Extreme negative value testing should include values like -1e11, -1e20, not just 'negative' values in a typical range. The identity element for max reductions should always be -INFINITY, never a finite approximation.",
+      "suggested_code": "def generate_inputs(device):\n    # All values are -1e11, guaranteed to be less than mutant's -1e10f init\n    # Original: global_max = -1e11, output ≈ -log(16384) ≈ -9.7\n    # Mutant: global_max = -1e10 (wrong), exp underflows, output = inf\n    x = torch.full((16, 16384), -1e11, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=inf, mean_diff=inf, ref_range=[-9.7041e+00,-9.7041e+00], mut_range=[inf,inf]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6242,
+        "completion_tokens": 5922,
+        "total_tokens": 12164,
+        "reasoning_tokens": 2395
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Thread i processes indices i mod 512. If indices where (i mod 512) >= 256 are -inf, threads 256-511 never update thread_max (fmaxf(-1e10f, -inf) = -1e10f). If indices where (i mod 512) < 256 are -2e10, threads 0-255 get thread_max = -2e10. Reduction: Original max(-2e10, -INFINITY) = -2e10; Mutant max(-2e10, -1e10f) = -1e10f. Different global_max causes exp underflow in mutant.",
+      "survival_reason": "Previous attempts failed because they either: (1) used uniform values that all threads processed, overwriting the initial value, or (2) used NaN which contaminates results equally in both versions. The key insight is that -inf values don't update thread_max via fmaxf, but still contribute exp(-inf)=0 to the sum without causing NaN. By carefully placing -inf at positions processed by high-indexed threads, those threads retain their initial value, which differs between original (-INFINITY) and mutant (-1e10f).",
+      "killable": true,
+      "kill_strategy": "Create input where positions with (index mod 512) >= 256 are -inf, and positions with (index mod 512) < 256 are -2e10. Threads 256-511 only see -inf (keeps initial), threads 0-255 see -2e10. Original global_max=-2e10, Mutant global_max=-1e10f. Mutant's exp(-2e10 - (-1e10f)) underflows to 0, causing log(0)=-inf, yielding inf outputs instead of ~-9.",
+      "recommendations": "When testing reduction kernels with custom initial values, test patterns where specific thread subsets only see special values (-inf, NaN) that don't update accumulators via fmaxf/fminf semantics, while other threads see finite values near the mutated boundary.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.empty((16, 16384), dtype=torch.float32, device=device)\n    for i in range(16384):\n        if (i % 512) >= 256:\n            x[:, i] = float('-inf')\n        else:\n            x[:, i] = -2e10\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6529,
+        "completion_tokens": 7425,
+        "total_tokens": 13954,
+        "reasoning_tokens": 3215
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "log_softmax is shift-invariant. With val=-1e10-100: exp(-100)≈3.7e-44 (denormal, non-zero). Original output=-log(16384)≈-9.7. Mutant: sum=16384*3.7e-44≈6e-40, log(6e-40)≈-90, output=(-1e10-100)-(-90-1e10)=-10. Difference=0.3 > tolerance≈0.11.",
+      "survival_reason": "Previous attempts used values causing complete exp() underflow to 0, producing inf outputs that the test framework may handle specially. The log_softmax function is shift-invariant, so wrong max values don't matter unless exp() produces denormals (non-zero but tiny). Values around -1e10-100 put exp() in the denormal range, producing finite but incorrect outputs that can be measured by torch.allclose.",
+      "killable": true,
+      "kill_strategy": "Use all values = -1e10 - 100 (= -10000000100). This makes exp(val - mutant_max) = exp(-100) ≈ 3.7e-44 (denormal, not zero). The mutant computes log(denormal_sum) correctly but gets a different log_sum_exp, producing output ≈ -10 instead of ≈ -9.7, a difference of 0.3 exceeding the tolerance.",
+      "recommendations": "Test log_softmax mutations with values in the denormal exp() range (-1e10 - 88 to -1e10 - 150) to produce finite but incorrect outputs, as the function's shift-invariance makes it robust to many max-finding errors.",
+      "suggested_code": "def generate_inputs(device):\n    # Values at -1e10 - 100: close enough that exp(-100) is denormal (non-zero)\n    # Original: max=-1e10-100, exp(0)=1, output≈-9.7\n    # Mutant: max=-1e10, exp(-100)≈3.7e-44, output≈-10\n    x = torch.full((16, 16384), -1e10 - 100, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=9.704061e+00, mean_diff=9.704061e+00, ref_range=[-9.7041e+00,-9.7041e+00], mut_range=[0.0000e+00,0.0000e+00]",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6898,
+        "completion_tokens": 6435,
+        "total_tokens": 13333,
+        "reasoning_tokens": 2743
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Float32 precision at 1e10 is ~1000. For mutant to fail, need all values < -1e10. But with values significantly below -1e10, the original kernel suffers catastrophic cancellation: log_sum_exp = log(N) + v ≈ v (since |v| >> 9.7), so output = v - v = 0 instead of -9.7. Both kernels produce incorrect results for extreme negative inputs, making them appear equivalent to the test framework.",
+      "survival_reason": "The mutation from -INFINITY to -1e10f is effectively equivalent for float32 inputs because the only inputs that could expose the difference (all values < -1e10f) also cause the original kernel to fail due to catastrophic cancellation in the final subtraction. When all values are around -1e10 or below, computing log_sum_exp = log(N) + v loses the log(N) term to float32 rounding, causing output = v - v ≈ 0 instead of -log(N). The test framework requires the original to match the reference AND the mutant to differ, but for this value range, both original and mutant fail to match the reference.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable within the given constraints. The only values that could expose the mutation (all < -1e10f) also cause precision failures in the original kernel due to catastrophic cancellation when computing the final output. The mutation is equivalent for all practically testable float32 inputs.",
+      "recommendations": "When implementing log-sum-exp computations with custom CUDA kernels, use higher precision (float64) accumulators or numerically stable formulations that avoid catastrophic cancellation. The -INFINITY vs -1e10f difference is a robustness concern but untestable when the kernel has precision issues at extreme value ranges. Consider adding explicit range validation or using mixed-precision computation for critical reductions.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 3
+  },
+  "elapsed_sec": 464.56
+}

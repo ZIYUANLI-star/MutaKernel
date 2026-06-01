@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P97__sync_remove__2",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P97",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5548,
+        "completion_tokens": 5746,
+        "total_tokens": 11294,
+        "reasoning_tokens": 2199
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The __syncthreads() at line 91 acts as a memory fence ensuring shared memory writes from the warp-level reduction are visible before thread 0 reads shared_dot[0]. Without it, thread 0 may read stale values due to compiler register caching or incomplete memory flushes. With 256 threads per block and feature_size=4096, each thread processes 4 elements per iteration, and the parallel reduction accumulates values in shared memory. The warp shuffles modify shared_*[tid] for tid<32, but without the fence, these writes may not be committed before the final read.",
+      "survival_reason": "The removed __syncthreads() serves as a critical memory fence after the warp-level reduction. While __shfl_down_sync synchronizes warp execution, it does not guarantee shared memory visibility. The compiler may optimize by keeping partial results in registers rather than committing to shared memory. When thread 0 reads shared_dot[0] to compute cosine_sim, it may read an incomplete or stale value. This manifests as incorrect loss computation, especially with high-variance input data where partial reduction errors become significant.",
+      "killable": true,
+      "kill_strategy": "Use high-magnitude values with high variance across features to ensure the partial sums in the reduction are large and distinct. Any synchronization issue causing incomplete reduction will produce noticeably different results. Also use values that stress numerical precision (large magnitudes near 1e3-1e4) to amplify any race condition effects.",
+      "recommendations": "Memory fences (__syncthreads__) after warp-level reductions should be tested with structured adversarial inputs that make partial reduction values large and distinctive. Tests should verify that removing such barriers causes detectable divergence, confirming their necessity for correctness.",
+      "suggested_code": "def generate_inputs(device):\n    import torch\n    torch.manual_seed(42)\n    # Create high-magnitude values with structure to stress reduction\n    predictions = torch.randn(128, 4096, device=device, dtype=torch.float32) * 100.0\n    targets = torch.randn(128, 4096, device=device, dtype=torch.float32) * 100.0\n    # Add structured pattern to make partial sums distinctive\n    predictions[:, ::2] = predictions[:, ::2].abs() + 50.0\n    predictions[:, 1::2] = -predictions[:, 1::2].abs() - 50.0\n    targets[:, ::2] = targets[:, ::2].abs() + 50.0\n    targets[:, 1::2] = -targets[:, 1::2].abs() - 50.0\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5530,
+        "completion_tokens": 5210,
+        "total_tokens": 10740,
+        "reasoning_tokens": 2048
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The removed __syncthreads() at line 91 is after the warp-level reduction where only threads 0-31 participate. Thread 0, which reads shared_dot[0]/shared_pred_norm[0]/shared_target_norm[0], is the SAME thread that wrote those values in the warp reduction. A thread's own writes are always visible to itself without barrier. However, with --use_fast_math, compiler may reorder shared memory operations. To expose this, we need inputs where: (1) reduction partial sums vary wildly across threads, (2) numerical precision of final computation is near tolerance boundary.",
+      "survival_reason": "Previous attempt used high-magnitude values (±100 range) but with uniform distribution across all threads' workloads. This didn't expose the race because thread 0's self-consistency holds for uniform workloads. The removed sync would only matter if compiler reorders shared memory stores/loads, which requires highly non-uniform partial sums across the warp where any register caching divergence would compound. We need near-zero vectors with sparse non-zero elements that create extremely sensitive cosine computations, where even minor floating-point reordering from missing barriers produces detectable differences.",
+      "killable": true,
+      "kill_strategy": "Create sparse near-orthogonal vectors with small norms where cosine similarity approaches 0 (loss approaches 1). Position non-zero elements such that different warp lanes have vastly different partial sums (some lanes get all the significant values). This maximizes sensitivity to any memory reordering the compiler might do without the barrier.",
+      "recommendations": "When removing __syncthreads() barriers, test with inputs that create highly non-uniform partial sums across warp lanes and that produce results near numerical precision boundaries or tolerance thresholds.",
+      "suggested_code": "def generate_inputs(device):\n    import torch\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    # Place non-zero values only in indices processed by thread 0 (indices 0-3, 1024-1027, 2048-2051, 3072-3075)\n    # and thread 16 (indices 64-67, etc.) to create high variance in warp reduction\n    # Thread i in first iteration processes indices: i*4, i*4+1, i*4+2, i*4+3\n    \n    for batch in range(128):\n        # Thread 0's elements - large positive values\n        predictions[batch, 0:4] = 1e3\n        predictions[batch, 1024:1028] = 1e3\n        predictions[batch, 2048:2052] = -1e3\n        predictions[batch, 3072:3076] = -1e3\n        \n        # Thread 16's elements (index 64-67) - orthogonal direction\n        targets[batch, 64:68] = 1e3\n        targets[batch, 1088:1092] = 1e3\n        targets[batch, 2112:2116] = -1e3\n        targets[batch, 3136:3140] = -1e3\n    \n    # Predictions and targets are nearly orthogonal (dot product ~ 0)\n    # Norms are large, so cosine_sim ~ 0, loss ~ 1\n    # Any timing/ordering issue in warp reduction will affect the small dot product significantly\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6075,
+        "completion_tokens": 4695,
+        "total_tokens": 10770,
+        "reasoning_tokens": 2103
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() at line 91 is after warp-level reduction where threads 0-31 compute final sums using __shfl_down_sync. Thread 0 both writes and reads shared_dot[0]. The warp shuffle provides implicit synchronization. However, compiler optimizations with --use_fast_math may reorder memory operations. To expose this, use identical large-magnitude vectors where loss=0 exactly - any numerical deviation will be detectable. With 4096 elements summed, using values ~1e3 gives sums ~4e9, where reduction ordering can affect precision.",
+      "survival_reason": "Round 1 failed because high-magnitude random values still produced losses in the ~0.5-1.5 range where atol/rtol=0.01 allows ~1-2% relative error. Round 2 failed because sparse orthogonal vectors gave loss≈1 which is insensitive to small perturbations. The key insight is that the barrier removal can cause thread 0 to read from shared memory before its own writes are globally visible (with aggressive compiler optimizations). Using IDENTICAL predictions and targets gives theoretical loss=0, where ANY deviation is immediately detectable. With large uniform values (1e3), the squared sums reach ~4e9 per batch element, making floating-point reduction ordering critical for precision.",
+      "killable": true,
+      "kill_strategy": "Use identical prediction and target tensors with uniform large values (~1e3). This gives exact cosine_sim=1 and loss=0. Any memory reordering or reduction error will produce non-zero loss. With values at 1e3 and 4096 elements, accumulated sums hit ~4e9 where precision matters. The tolerance check |ref - mut| > 0.01 + 0.01*|ref| becomes |ref - mut| > 0.01 when ref≈0, so even tiny errors should be detectable.",
+      "recommendations": "For GPU kernels with warp-level reductions followed by single-thread consumption, always keep the trailing __syncthreads() unless formally verified unnecessary. Test with identical inputs (expected output exactly 0 or 1) to catch precision bugs that percentage-based tolerances miss.",
+      "suggested_code": "def generate_inputs(device):\n    import torch\n    # Identical large-magnitude vectors: cosine_sim = 1, loss = 0\n    # Using 1e3 magnitude: sum of squares = 4096 * 1e6 = 4.096e9\n    # At this scale, reduction ordering affects lower bits\n    predictions = torch.full((128, 4096), 1e3, device=device, dtype=torch.float32)\n    targets = predictions.clone()\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6374,
+        "completion_tokens": 3901,
+        "total_tokens": 10275,
+        "reasoning_tokens": 1733
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The removed __syncthreads() after warp-level reduction is between warp 0's writes to shared_dot[0] and thread 0's read of shared_dot[0]. Since thread 0 is in warp 0 and SIMT guarantees warp-synchronous execution, thread 0 reading its own write doesn't require explicit sync. However, bitwise divergence was detected at seed 10003, suggesting small numerical differences exist. Previous attempts failed because differences stayed within atol=1e-2, rtol=1e-2 tolerance (~0.03 for typical loss values 0-2). Need inputs that amplify tiny numerical differences.",
+      "survival_reason": "Previous attempts used (1) high-magnitude uniform scaling which doesn't stress division sensitivity, (2) sparse orthogonal vectors where loss≈1 has 0.02 relative tolerance, and (3) identical vectors where loss=0 has only 0.01 absolute tolerance threshold. All failed because any race-induced error was smaller than the ~0.01-0.03 tolerance. The key insight is that tiny errors get amplified when dividing by small numbers. We need vectors where norm_product (the divisor in cosine_sim calculation) is extremely small but non-zero, so any tiny error in the dot product or norms causes a large relative change in the final loss value.",
+      "killable": true,
+      "kill_strategy": "Create inputs where predictions has very small norm (near the epsilon=1e-8 regime) while targets has normal magnitude. This makes norm_product ≈ 1e-4 or smaller, so any numerical error in the reduction of order 1e-6 would cause relative errors of 1% or more in cosine_sim, potentially exceeding the tolerance threshold.",
+      "recommendations": "When removing synchronization barriers, test with inputs that stress numerical precision boundaries - specifically inputs causing very small divisors in the computation, where tiny errors from timing differences get amplified into detectable output differences.",
+      "suggested_code": "def generate_inputs(device):\n    import torch\n    torch.manual_seed(12345)\n    # Predictions with very small values (norm ~ 1e-4 * sqrt(4096) ~ 0.0064)\n    # This puts norm_pred near epsilon regime\n    predictions = torch.randn(128, 4096, device=device, dtype=torch.float32) * 1e-4\n    \n    # Targets with normal magnitude (norm ~ sqrt(4096) ~ 64)\n    targets = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    \n    # Make predictions and targets correlated (same sign pattern) to get non-trivial dot product\n    # dot ~ 1e-4 * 64 * 4096 * correlation ~ small but not zero\n    # norm_product ~ 0.0064 * 64 ~ 0.4, division amplifies errors\n    predictions = predictions.abs() * targets.sign()\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6753,
+        "completion_tokens": 4607,
+        "total_tokens": 11360,
+        "reasoning_tokens": 2036
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads at line 91 is after warp-level reduction where thread 0 computes final value from its own shared memory write. With tolerance 1e-2, bitwise differences from compiler/memory reordering effects need amplification via extreme magnitudes to exceed atol+rtol*|ref|. Previous attempts used max ~1e4 scale; using 1e6 scale with seed 10003 (known to produce divergence) should amplify numerical precision differences in the reduction from ~1e-6 to ~1e-2 range.",
+      "survival_reason": "Previous attempts failed because: (1) High-magnitude 1e2-1e3 scale wasn't extreme enough to amplify precision differences past tolerance; (2) Sparse patterns reduced numerical accumulation stress; (3) Identical vectors created trivial reduction paths; (4) Small-norm inputs made absolute errors small. The EMD found bitwise divergence at seed 10003, meaning the race condition DOES occur but produces sub-tolerance differences. Scaling inputs by 1e6 while using the divergence-triggering seed should amplify these fp32 precision cascades in the 4096-element reduction sums (each ~1e12 magnitude) past the 1e-2 tolerance threshold.",
+      "killable": true,
+      "kill_strategy": "Use seed 10003 (known to produce divergence) with extreme magnitude (1e6) to amplify floating-point precision differences in the reduction tree past the tolerance threshold. At 1e6 scale, accumulated sums reach ~1e12 where fp32 mantissa precision (~7 decimal digits) loses significant bits, and reduction ordering differences become magnified.",
+      "recommendations": "For testing GPU reductions with removed sync barriers, use extreme value magnitudes (1e5-1e7) combined with seeds known to produce bitwise divergence to push numerical differences past tolerance thresholds - fp32 precision degradation at high magnitudes can transform sub-tolerance races into detectable errors.",
+      "suggested_code": "def generate_inputs(device):\n    import torch\n    # Use seed 10003 which found bitwise divergence in EMD Layer 2\n    torch.manual_seed(10003)\n    # Scale to 1e6: sum of squares ~ 4096 * 1e12 ~ 4e15\n    # At this magnitude, fp32 precision (~7 digits) causes significant\n    # reduction ordering sensitivity, amplifying the sync removal effect\n    predictions = torch.randn(128, 4096, device=device, dtype=torch.float32) * 1e6\n    targets = torch.randn(128, 4096, device=device, dtype=torch.float32) * 1e6\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 533.69
+}

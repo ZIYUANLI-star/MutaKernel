@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P41__mask_boundary__1",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8436,
+        "completion_tokens": 3836,
+        "total_tokens": 12272,
+        "reasoning_tokens": 1334
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "For col=N-1, the condition 'col < N-1' evaluates to false while 'col < N' evaluates to true. This causes tile_b to be filled with zeros instead of weight values for the last output column. The GEMM result for column N-1 is therefore 0 instead of the correct dot product.",
+      "survival_reason": "The mutation was detected as divergent by Layer 2 testing with seed 10000, confirming it produces different numerical results. The last column of the GEMM output matrix receives zero weight contribution instead of the actual matrix multiplication result, which propagates through BatchNorm, GELU, GroupNorm, Mean, and ReLU to produce a different final output.",
+      "killable": true,
+      "kill_strategy": "Use large uniform input values (all ones or large constants) to maximize the GEMM difference. The original computes the sum of all weights for the last column multiplied by input values, while the mutant computes zero. This difference is large enough to exceed the tolerance after propagating through all layers.",
+      "recommendations": "Boundary condition mutations in tile-loading loops are particularly dangerous as they can silently corrupt entire rows or columns of matrix results. Testing should include verification that all output positions receive correct values, especially boundary columns and rows.",
+      "suggested_code": "def generate_inputs(device):\n    # Large uniform values maximize the GEMM output for the last column\n    # Original: last col gets sum(weight[N-1,:] * input[row,:]) \n    # Mutant: last col gets 0 (weight contribution missing)\n    x = torch.ones(128, 512, dtype=torch.float32, device=device) * 5.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8299,
+        "completion_tokens": 4334,
+        "total_tokens": 12633,
+        "reasoning_tokens": 1823
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutant sets tile_b=0 for col=N-1. With input x[:,0]=1000, x[:,else]=0: Original last col = 1000*weight[N-1,0]+bias[N-1]. Mutant last col = bias[N-1]. Diff ≈ 1000*0.077 = 77. After Mean over N channels: diff ≈ 77/N ≈ 0.3 >> 0.01 tolerance.",
+      "survival_reason": "The uniform input strategy failed because the sum of weights is ~0 due to symmetric initialization, making original and mutant nearly equal. A sparse input with a single large value creates a non-canceling dot product. With x[:,0]=1000.0, the original computes 1000*weight[N-1,0] for the last column while the mutant gets 0, creating a ~77 magnitude difference that survives through GroupNorm and Mean operations.",
+      "killable": true,
+      "kill_strategy": "Use sparse input with a single column of large values (1000.0) to create a non-canceling dot product that exposes the missing weight contribution in the last column.",
+      "recommendations": "Boundary guard mutations in tiled GEMM kernels require non-symmetric sparse inputs to test edge columns; uniform inputs tend to cancel out randomly-initialized weights and mask column-specific errors.",
+      "suggested_code": "def generate_inputs(device):\n    # Sparse input: only first column has large values\n    # Original: last col = 1000 * weight[N-1, 0] + bias\n    # Mutant: last col = 0 + bias (tile_b not loaded)\n    # Difference is ~1000 * weight value, which is significant\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    x[:, 0] = 1000.0  # Large value only in first feature\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8523,
+        "completion_tokens": 4423,
+        "total_tokens": 12946,
+        "reasoning_tokens": 2053
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With input=1e4, GEMM for col N-1 differs by ~1e4*sum(weight[N-1,:])≈1e4*sqrt(512)*0.044≈1e5. This outlier changes group mean/var for group containing N-1, affecting normalization of all ~(N/num_groups) channels in that group, creating cumulative difference > 0.01 in final mean.",
+      "survival_reason": "Previous attempts failed because the difference in a single column got diluted when averaged across N channels, and ReLU clipped near-zero means to 0. The key insight is that the mutation changes the GROUP STATISTICS (mean and variance) for the group containing the last column. This affects normalization of ALL channels in that group, not just the last column. Using extreme input values (1e4 instead of 5 or 1000) creates a massive outlier that dramatically shifts group statistics, compounding the difference across multiple channels. The statistical shift should be large enough to produce a non-zero difference that survives ReLU.",
+      "killable": true,
+      "kill_strategy": "Use extreme magnitude inputs (1e4) to maximize the GEMM output difference in the last column, creating a statistical outlier that significantly changes the GroupNorm mean/variance for its entire group, causing measurable differences in multiple output channels.",
+      "recommendations": "When testing kernels with downstream normalization layers, consider how local errors propagate through statistical computations (mean/variance) and affect multiple outputs, not just the directly mutated element.",
+      "suggested_code": "def generate_inputs(device):\n    # Use extreme values to create large GEMM difference in last column\n    # This creates an outlier that shifts group statistics significantly\n    # affecting normalization of entire group, not just one column\n    x = torch.full((128, 512), 1e4, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8711,
+        "completion_tokens": 4895,
+        "total_tokens": 13606,
+        "reasoning_tokens": 2189
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation causes tile_b to load 0 instead of weight values for col=N-1. With uniform inputs, dot product = input_val * sum(weights), but Kaiming-initialized weights are centered around 0, so sum(weights) ≈ 0 causing minimal difference. GroupNorm further absorbs differences by normalizing within groups. Random inputs break the cancellation: each weight gets multiplied by independent random values, making E[|dot|] = σ_input * sqrt(K) * σ_weight ≈ 1000 * sqrt(512) * 0.044 ≈ 995 - a significant non-canceling difference.",
+      "survival_reason": "Previous attempts used uniform inputs (all same value), causing systematic cancellation when multiplied with centered weights. Round 1 (5.0) and Round 3 (1e4) both produce dot = constant * sum(weights) ≈ 0 because Kaiming weights sum to ~0. Round 2 (sparse single column) relied on a single weight value which is small (~0.04). The fundamental issue is that uniform patterns cancel with centered weight distributions. Random inputs with high variance create large non-canceling dot products because each weight is multiplied by an independent random value, preventing systematic cancellation and ensuring the missing weight contribution in the mutant's last column produces a measurable ~1000-magnitude difference that propagates through GELU (which preserves large positive values) and survives GroupNorm averaging.",
+      "killable": true,
+      "kill_strategy": "Use random normal inputs with large standard deviation (1000). This creates non-canceling dot products where each weight element is multiplied by an independent random value, producing expected |dot| ≈ 1000 * sqrt(512) * weight_std ≈ 995. This large difference in the last column survives GELU and GroupNorm averaging.",
+      "recommendations": "When testing tiled GEMM kernels with boundary mutations, use random (non-uniform) inputs with large magnitude to prevent dot-product cancellation with centered weight initializations. Uniform inputs are poor test vectors for linear layers with zero-mean weights.",
+      "suggested_code": "def generate_inputs(device):\n    # Use seeded random inputs with large magnitude\n    # Random values prevent systematic cancellation with centered weights\n    # Large magnitude (std=1000) ensures difference exceeds tolerance after averaging\n    torch.manual_seed(42)  # Fixed seed for reproducibility\n    x = torch.randn(128, 512, dtype=torch.float32, device=device) * 1000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8945,
+        "completion_tokens": 4973,
+        "total_tokens": 13918,
+        "reasoning_tokens": 2403
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutant zeros last column's GEMM (D≈10-100 with right inputs). With N channels, mean diff = D/N. If N=256, need D>3 to exceed 0.01 tolerance. By using patterned inputs that create non-canceling dot products specifically for the last column's weight pattern, D can exceed this threshold.",
+      "survival_reason": "Previous attempts used symmetric inputs (uniform/random) that averaged out with zero-centered weights. The final mean operation dilutes single-column differences by factor N. GroupNorm further normalizes values. To kill, we need inputs that create asymmetric large positive GEMM values specifically in the last column while keeping other columns near zero, maximizing relative contribution to mean.",
+      "killable": true,
+      "kill_strategy": "Use patterned inputs with alternating sign structure and varying magnitudes that statistically favor non-canceling dot products. Different random seeds may align better with the last column's weight structure.",
+      "recommendations": "When testing boundary mutations in tiled kernels, use patterned inputs that create asymmetric behavior across tile boundaries rather than uniform or purely random values. The edge column behavior specifically requires inputs that don't cancel under symmetric weight distributions.",
+      "suggested_code": "def generate_inputs(device):\n    # Create patterned input that breaks symmetry\n    # Alternating signs with increasing magnitude prevents cancellation\n    # with zero-centered weight distributions\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    for i in range(512):\n        sign = 1 if i % 2 == 0 else -1\n        x[:, i] = sign * (i + 1) * 10.0  # Range: ±10 to ±5120\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 930.02
+}

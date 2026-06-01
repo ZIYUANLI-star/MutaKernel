@@ -1,0 +1,134 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs mean reduction over a specific dimension.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension. The shape of the output is the same as the input except for the reduced dimension which is removed.
+        """
+        return torch.mean(x, dim=self.dim)
+
+batch_size = 128
+dim1 = 4096
+dim2 = 4095
+
+def get_inputs():
+    x = torch.rand(batch_size, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [1]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs mean reduction using PyTorch's optimized operations.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    @torch.compile(backend='inductor', options={'max_autotune': True, 'coordinate_descent_tuning': True})
+    def _optimized_reduction(self, x):
+        """
+        Optimized mean reduction along dim=1.
+        """
+        # Reshape to (128, 4096, 4095) to ensure correct shape
+        x_reshaped = x.reshape(128, 4096, 4095)
+        
+        # Use PyTorch's built-in sum which is highly optimized
+        sum_val = x_reshaped.sum(dim=1, dtype=torch.float32)
+        
+        # Calculate mean by multiplying with reciprocal
+        return sum_val * 0.000244140625  # 1/4096 = 0.000244140625
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along dim=1 by taking the mean.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (128, 4096, 4095).
+
+        Returns:
+            torch.Tensor: Output tensor with shape (128, 4095).
+        """
+        # Enable TF32 for this operation
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        result = self._optimized_reduction(x)
+        
+        # Disable TF32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return result
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 4
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (2 failures)
+  - [near_overflow seed=50002] max_diff=9.444733e+21, mean_diff=1.015255e+21, ref_range=[-7.2431e+28,7.2601e+28], orig_range=[-7.2431e+28,7.2601e+28]
+  - [near_overflow seed=50003] max_diff=9.444733e+21, mean_diff=1.016647e+21, ref_range=[-7.5385e+28,6.9663e+28], orig_range=[-7.5385e+28,6.9663e+28]
+
+### training_stress (2 failures)
+  - [near_overflow seed=70002] max_diff=9.444733e+21, mean_diff=1.016200e+21, ref_range=[-7.3818e+28,7.3096e+28], orig_range=[-7.3818e+28,7.3096e+28]
+  - [near_overflow seed=70003] max_diff=9.444733e+21, mean_diff=1.014717e+21, ref_range=[-7.9038e+28,7.5745e+28], orig_range=[-7.9038e+28,7.5745e+28]
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

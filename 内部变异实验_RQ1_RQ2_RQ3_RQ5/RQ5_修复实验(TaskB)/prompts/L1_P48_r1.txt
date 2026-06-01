@@ -1,0 +1,264 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs mean reduction over a specific dimension.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension. The shape of the output is the same as the input except for the reduced dimension which is removed.
+        """
+        return torch.mean(x, dim=self.dim)
+
+batch_size = 16
+dim1 = 256
+dim2 = 256
+
+def get_inputs():
+    x = torch.randn(batch_size, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [1]
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized mean reduction
+mean_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename T>
+__global__ void mean_reduction_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const int reduction_dim_size,
+    const int outer_size,
+    const int inner_size
+) {
+    // Each thread block handles one output position
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    
+    // Calculate which output position this block handles
+    const int outer_idx = bid / inner_size;
+    const int inner_idx = bid % inner_size;
+    
+    // Shared memory for block reduction
+    __shared__ T shared_sums[256];
+    
+    // Each thread accumulates its portion
+    T sum = static_cast<T>(0);
+    for (int i = tid; i < reduction_dim_size; i += blockDim.x) {
+        int idx = (outer_idx * reduction_dim_size + i) * inner_size + inner_idx;
+        sum += input[idx];
+    }
+    
+    shared_sums[tid] = sum;
+    __syncthreads();
+    
+    // Parallel reduction within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sums[tid] += shared_sums[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Write final result
+    if (tid == 0) {
+        output[bid] = shared_sums[0] / static_cast<T>(reduction_dim_size);
+    }
+}
+
+torch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim) {
+    auto input_sizes = input.sizes().vec();
+    
+    // Handle negative dimension
+    if (dim < 0) {
+        dim = input.dim() + dim;
+    }
+    
+    // Calculate output shape
+    std::vector<int64_t> output_sizes;
+    for (int64_t i = 0; i < input.dim(); i++) {
+        if (i != dim) {
+            output_sizes.push_back(input_sizes[i]);
+        }
+    }
+    
+    auto output = torch::empty(output_sizes, input.options());
+    
+    // Handle scalar case
+    if (output_sizes.empty()) {
+        output = output.view({1});
+    }
+    
+    // Calculate dimensions for kernel
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; i++) {
+        outer_size *= input_sizes[i];
+    }
+    
+    int64_t reduction_dim_size = input_sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); i++) {
+        inner_size *= input_sizes[i];
+    }
+    
+    int64_t total_positions = outer_size * inner_size;
+    
+    // Configure kernel launch
+    const int block_size = 256;
+    int grid_size = total_positions;
+    
+    AT_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(),
+        "mean_reduction",
+        [&] {
+            mean_reduction_kernel<scalar_t><<<grid_size, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                reduction_dim_size,
+                outer_size,
+                inner_size
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+mean_reduction_cpp_source = """
+torch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+mean_reduction_module = load_inline(
+    name="mean_reduction",
+    cpp_sources=mean_reduction_cpp_source,
+    cuda_sources=mean_reduction_source,
+    functions=["mean_reduction_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs mean reduction over a specific dimension
+    using custom CUDA kernels with improved memory access patterns.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.mean_reduction = mean_reduction_module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean
+        using optimized CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension.
+        """
+        # Use CUDA kernel if tensor is on GPU
+        if x.is_cuda:
+            return self.mean_reduction.mean_reduction_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch for CPU tensors
+            return torch.mean(x, dim=self.dim)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 1)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=near_overflow, seed=348, mode=train_value:
+      max_diff=2.833420e+22, mean_diff=5.539211e+21, ref_range=[-2.1997e+29,2.4073e+29], orig_range=[-2.1997e+29,2.4073e+29]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

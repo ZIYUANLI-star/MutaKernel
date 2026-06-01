@@ -1,0 +1,142 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed convolution, applies Mish activation, adds a value, 
+    applies Hardtanh activation, and scales the output.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.add_value = add_value
+        self.scale = scale
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = torch.nn.functional.mish(x) # Mish activation
+        x = x + self.add_value
+        x = torch.nn.functional.hardtanh(x, min_val=-1, max_val=1) # Hardtanh activation
+        x = x * self.scale # Scaling
+        return x
+
+batch_size = 128
+in_channels  = 64  
+out_channels = 64  
+height = width = 128  
+kernel_size  = 3
+stride       = 2  
+padding      = 1
+output_padding = 1
+add_value = 0.5
+scale = 2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using PyTorch's operations fused and compiled with mixed precision
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, add_value, scale):
+        super(ModelNew, self).__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride, padding, output_padding)
+        self.add_value = add_value
+        self.scale = scale
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    @torch.autocast(device_type='cuda', dtype=torch.float16)
+    def forward(self, x):
+        # Enable TF32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.enabled = True
+        
+        # Use PyTorch's transposed convolution (uses Tensor Cores)
+        x = torch.conv_transpose2d(
+            x, 
+            self.conv_transpose.weight, 
+            self.conv_transpose.bias, 
+            self.conv_transpose.stride, 
+            self.conv_transpose.padding, 
+            self.conv_transpose.output_padding, 
+            self.conv_transpose.groups
+        )
+        
+        # Fuse Mish, add, Hardtanh, and scale
+        # Mish: y = x * tanh(log(1 + exp(x)))
+        exp_val = torch.exp(torch.clamp(x, -60.0, 60.0))  # Prevent overflow
+        log_val = torch.log1p(exp_val)
+        tanh_val = torch.tanh(log_val)
+        x = x * tanh_val
+        
+        x += self.add_value
+        x = torch.clamp(x, -1.0, 1.0)
+        x *= self.scale
+        
+        # Disable TF32 to restore default behavior
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.enabled = False
+        
+        return x.to(torch.float32)
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 11
+Failing dimensions: value_stress, training_stress, repeated_run, config_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (4 failures)
+  - [near_overflow seed=50002] max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,2.0000e+00], orig_range=[nan,nan]
+  - [near_overflow seed=50003] max_diff=nan, mean_diff=nan, ref_range=[1.0000e+00,2.0000e+00], orig_range=[nan,nan]
+  - [extreme_magnitude seed=50030] max_diff=nan, mean_diff=nan, ref_range=[3.8231e-01,2.0000e+00], orig_range=[nan,nan]
+  - [extreme_magnitude seed=50031] max_diff=nan, mean_diff=nan, ref_range=[3.8231e-01,2.0000e+00], orig_range=[nan,nan]
+
+### training_stress (4 failures)
+  - [near_overflow seed=70002] max_diff=nan, mean_diff=nan, ref_range=[9.5243e-01,2.0000e+00], orig_range=[nan,nan]
+  - [near_overflow seed=70003] max_diff=nan, mean_diff=nan, ref_range=[9.7390e-01,2.0000e+00], orig_range=[nan,nan]
+  - [extreme_magnitude seed=70030] max_diff=nan, mean_diff=nan, ref_range=[3.8231e-01,2.0000e+00], orig_range=[nan,nan]
+  - [extreme_magnitude seed=70031] max_diff=nan, mean_diff=nan, ref_range=[3.8231e-01,2.0000e+00], orig_range=[nan,nan]
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+### config_stress (1 failures)
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

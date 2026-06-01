@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P33__mask_boundary__2",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P33",
+  "tier": 3,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9843,
+        "completion_tokens": 4504,
+        "total_tokens": 14347,
+        "reasoning_tokens": 1542
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation is in compute_mean_var_kernel, only called when training=True. At stride=1: original has 'tid<1' (thread 0 executes), mutant has 'tid<0' (no threads execute). This skips the final reduction step, losing ~50% of the sum (all odd-indexed partial sums). Testing skipped training mode entirely.",
+      "survival_reason": "The mutation affects only the training code path in compute_mean_var_kernel. The test framework apparently ran all tests in evaluation mode (training=False), where the inference kernel uses precomputed running_mean/running_var and never calls the mutated kernel. The 'Training Mode (.train())' test was marked 'SKIPPED: operator_not_applicable' despite this kernel clearly having training-specific behavior. Since the mutated code path was never executed, bitwise equivalence was observed.",
+      "killable": true,
+      "kill_strategy": "Put the model in training mode using model.train() before the forward pass. Any non-trivial input values will expose the ~50% error in mean/variance calculation due to the skipped final reduction step.",
+      "recommendations": "Test frameworks for batch normalization kernels must explicitly test both training mode (.train()) and evaluation mode (.eval()) since these use completely different CUDA kernels. The 'operator_not_applicable' skip logic should be reviewed - any kernel with a 'training' parameter clearly has applicable training-mode behavior.",
+      "suggested_code": "def generate_inputs(device):\n    # Use uniform positive values so the missing ~50% of sum is clearly visible\n    # Each element = 1.0 means mean should be 1.0, but mutant will compute ~0.5\n    x = torch.ones(16, 64, 256, 256, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9351,
+        "completion_tokens": 5187,
+        "total_tokens": 14538,
+        "reasoning_tokens": 2089
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "Mutation is in compute_mean_var_kernel (line 80), only called when training=True. CUDA dispatch: if(!training) uses unmutated batchnorm2d_forward_inference_kernel, else uses mutated compute_mean_var_kernel. Test evidence shows bitwise identical results and 'Training Mode: SKIPPED', proving eval mode execution where mutation is unreachable.",
+      "survival_reason": "The mutation affects only the training-mode code path in compute_mean_var_kernel. The test framework runs models in eval mode by default, where batchnorm2d_forward_inference_kernel is used instead - this kernel has no mutation. The generate_inputs() function can only control tensor values, not model state like training/eval mode. Therefore, no input tensor can trigger the mutated code path. The 3.125% sum error from the broken reduction would be easily detectable IF the training path were exercised.",
+      "killable": false,
+      "kill_strategy": "This mutation requires calling model.train() before forward pass to trigger the mutated compute_mean_var_kernel. Since generate_inputs() cannot modify model state and the test framework defaults to eval mode, the mutation is unreachable through value-only testing. A configuration change (explicitly setting training=True during test) is required.",
+      "recommendations": "Mutation testing frameworks should test both training and eval modes separately when kernels have mode-dependent code paths. The test harness should explicitly test with model.train() AND model.eval() to ensure complete coverage of CUDA kernels that branch on training state.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 2
+  },
+  "elapsed_sec": 188.09
+}

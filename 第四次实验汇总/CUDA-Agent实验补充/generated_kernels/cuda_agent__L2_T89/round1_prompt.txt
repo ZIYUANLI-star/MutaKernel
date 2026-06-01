@@ -1,0 +1,197 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a matrix multiplication, divides by a scalar, and applies GELU activation.
+    """
+    def __init__(self, input_size, output_size, divisor):
+        super(Model, self).__init__()
+        self.linear = nn.Linear(input_size, output_size)
+        self.divisor = divisor
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, input_size).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, output_size).
+        """
+        x = self.linear(x)
+        x = x / self.divisor
+        x = torch.nn.functional.gelu(x)
+        return x
+
+batch_size = 1024
+input_size = 8192
+output_size = 8192
+divisor = 10.0
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, output_size, divisor]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_div_gelu.cu ===
+
+#include <cuda_runtime.h>
+
+// Gelu activation function
+__device__ __forceinline__ float gelu_activation(float x) {
+    float cdf = 0.5f * (1.0f + erf(x / 1.41421356237309504880f));
+    return x * cdf;
+}
+
+__global__ void fused_div_gelu_kernel(float* output, const float* input) {
+    int idx = blockIdx.x * 64 + threadIdx.x;
+    int total_elements = 1024 * 8192;
+
+    while (idx < total_elements) {
+        float val = input[idx] / 10.0f;
+        output[idx] = gelu_activation(val);
+        idx += gridDim.x * 64;
+    }
+}
+
+extern "C" void fused_div_gelu_launcher(float* output, const float* input, cudaStream_t stream) {
+    int blocks = (1024 * 8192 + 64 - 1) / 64;
+    fused_div_gelu_kernel<<<blocks, 64, 0, stream>>>(output, input);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_div_gelu_binding.cpp ===
+
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_div_gelu_launcher(float* output, const float* input, cudaStream_t stream);
+
+torch::Tensor fused_div_gelu_forward(torch::Tensor input) {
+    // Input validation
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+
+    auto output = torch::empty_like(input);
+
+    // Get current CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    // Call CUDA launcher
+    fused_div_gelu_launcher(
+        output.data_ptr<float>(),
+        input.data_ptr<float>(),
+        stream
+    );
+
+    return output;
+}
+
+void register_fused_div_gelu(pybind11::module& m) {
+    m.def("fused_div_gelu_forward", &fused_div_gelu_forward,
+          "Fused division + Gelu forward",
+          py::arg("input"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_div_gelu_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, output_size, divisor):
+        super().__init__()
+        self.linear = nn.Module()
+        self.linear.weight = nn.Parameter(torch.randn(output_size, input_size))
+        self.linear.bias = nn.Parameter(torch.zeros(output_size))
+        self.divisor = divisor
+
+    def forward(self, x):
+        # Enable Tensor Cores for matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Use cuBLAS for matrix multiplication with bias
+        matmul_out = torch.addmm(self.linear.bias, x, self.linear.weight.T)
+        
+        # Disable Tensor Cores for other operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # Use fused kernel for division + gelu
+        x = cuda_extension.fused_div_gelu_forward(matmul_out)
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 32
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (16 failures)
+  - [large_magnitude seed=50000] max_diff=9.034920e-02, mean_diff=6.953103e-03, ref_range=[-1.6997e-01,3.1126e+02], orig_range=[-1.6997e-01,3.1125e+02]
+  - [large_magnitude seed=50001] max_diff=9.250641e-02, mean_diff=6.962366e-03, ref_range=[-1.6997e-01,3.1917e+02], orig_range=[-1.6997e-01,3.1917e+02]
+  - [near_overflow seed=50002] max_diff=9.486423e+25, mean_diff=6.919639e+24, ref_range=[-0.0000e+00,3.0890e+29], orig_range=[-0.0000e+00,3.0890e+29]
+  - [near_overflow seed=50003] max_diff=9.054665e+25, mean_diff=6.910117e+24, ref_range=[-0.0000e+00,3.0624e+29], orig_range=[-0.0000e+00,3.0624e+29]
+  - [mixed_extremes seed=50012] max_diff=6.248779e-01, mean_diff=4.896078e-02, ref_range=[-1.6997e-01,2.0477e+03], orig_range=[-1.6997e-01,2.0477e+03]
+  - [mixed_extremes seed=50013] max_diff=6.217041e-01, mean_diff=4.901062e-02, ref_range=[-1.6997e-01,2.1480e+03], orig_range=[-1.6997e-01,2.1477e+03]
+  - [head_heavy seed=50024] max_diff=8.421631e-01, mean_diff=1.734103e-02, ref_range=[-1.6997e-01,3.0094e+03], orig_range=[-1.6997e-01,3.0094e+03]
+  - [head_heavy seed=50025] max_diff=8.589478e-01, mean_diff=1.731000e-02, ref_range=[-1.6997e-01,2.9534e+03], orig_range=[-1.6997e-01,2.9534e+03]
+  ... and 8 more failures
+
+### training_stress (16 failures)
+  - [large_magnitude seed=70000] max_diff=9.276009e-02, mean_diff=6.955293e-03, ref_range=[-1.6997e-01,3.3046e+02], orig_range=[-1.6997e-01,3.3043e+02]
+  - [large_magnitude seed=70001] max_diff=8.765984e-02, mean_diff=6.956159e-03, ref_range=[-1.6997e-01,3.2841e+02], orig_range=[-1.6997e-01,3.2843e+02]
+  - [near_overflow seed=70002] max_diff=8.967184e+25, mean_diff=6.914318e+24, ref_range=[-0.0000e+00,3.1567e+29], orig_range=[-0.0000e+00,3.1567e+29]
+  - [near_overflow seed=70003] max_diff=8.663299e+25, mean_diff=6.911241e+24, ref_range=[-0.0000e+00,3.0498e+29], orig_range=[-0.0000e+00,3.0500e+29]
+  - [mixed_extremes seed=70012] max_diff=6.337585e-01, mean_diff=4.900875e-02, ref_range=[-1.6997e-01,2.0758e+03], orig_range=[-1.6997e-01,2.0758e+03]
+  - [mixed_extremes seed=70013] max_diff=6.336670e-01, mean_diff=4.892052e-02, ref_range=[-1.6997e-01,2.1285e+03], orig_range=[-1.6997e-01,2.1286e+03]
+  - [head_heavy seed=70024] max_diff=8.337250e-01, mean_diff=1.733703e-02, ref_range=[-1.6997e-01,2.7926e+03], orig_range=[-1.6997e-01,2.7925e+03]
+  - [head_heavy seed=70025] max_diff=8.349304e-01, mean_diff=1.733765e-02, ref_range=[-1.6997e-01,3.0591e+03], orig_range=[-1.6997e-01,3.0590e+03]
+  ... and 8 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

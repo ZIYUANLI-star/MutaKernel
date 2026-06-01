@@ -1,0 +1,89 @@
+{
+  "mutant_id": "L1_P95__relop_replace__5",
+  "operator_name": "relop_replace",
+  "kernel_name": "L1_P95",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4632,
+        "completion_tokens": 4963,
+        "total_tokens": 9595,
+        "reasoning_tokens": 1696
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Loop changed from i<num_classes to i<=num_classes. With num_classes=10, the mutant iterates i=0..10 instead of i=0..9. At i=10, row_logits[10] reads out-of-bounds: for rows 0-4094 it reads next row's first element, for row 4095 it reads past tensor (index 40960 of 40960-element tensor). This is undefined behavior.",
+      "survival_reason": "The mutation causes an out-of-bounds memory access on every kernel invocation. For 4095 of 4096 rows, it reads data from the next row (wrong but defined). For the last row, it reads past the tensor boundary into undefined memory. Even though negative_weight=0.0 with default label_smoothing, IEEE 754 dictates 0.0*NaN=NaN, so if the OOB memory contains NaN/Inf (common in uninitialized CUDA memory), the result becomes NaN. The EMD Layer 2 crash/timeout confirms the mutant exhibits problematic behavior.",
+      "killable": true,
+      "kill_strategy": "Use standard random inputs. The out-of-bounds memory access for row 4095 reads undefined memory past the tensor boundary. This will either cause NaN propagation (if memory contains NaN/Inf), produce wrong results (if memory contains arbitrary floats), or trigger a CUDA memory error.",
+      "recommendations": "Loop bounds mutations (< to <=) that cause out-of-bounds array access should be caught by memory sanitizers (cuda-memcheck) or assertion-based bounds checking in debug builds. Consider adding explicit bounds validation in kernel code.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    # Standard random logits - the mutation will read out-of-bounds at row_logits[10]\n    predictions = torch.randn(4096, 10, device=device, dtype=torch.float32)\n    targets = torch.randint(0, 10, (4096,), device=device, dtype=torch.int64)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4502,
+        "completion_tokens": 3527,
+        "total_tokens": 8029,
+        "reasoning_tokens": 1310
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With label_smoothing=0.0, negative_weight=0.0. The mutant's extra iteration (i=10) takes the else branch for normal targets [0-9], contributing 0*log_prob=0. To expose the bug, set target=10 so i==target_idx at i=10, triggering positive_weight=1.0 branch. Original never matches (loop ends at i=9), giving loss=0. Mutant reads out-of-bounds and computes non-zero loss.",
+      "survival_reason": "Previous attempt failed because label_smoothing=0.0 makes negative_weight=0. When targets are in [0,9], the extra iteration i=10 always takes the else branch (i != target_idx), multiplying the garbage read by 0, making the contribution invisible. The mutation only becomes observable when either (a) label_smoothing>0 (config change) or (b) target_idx=10 so the extra iteration takes the positive_weight branch with weight 1.0. Setting targets=10 (out of valid range) forces the mutant to use positive_weight on the garbage memory read while original produces loss=0 since target is never matched.",
+      "killable": true,
+      "kill_strategy": "Set all targets to 10 (num_classes, outside valid [0,9] range). Original kernel loops i=0..9, never matches target=10, uses only negative_weight=0 terms, yielding loss=0. Mutant loops i=0..10, at i=10 matches target=10, uses positive_weight=1.0 on out-of-bounds read, yielding non-zero loss ~2.3 per sample.",
+      "recommendations": "When testing cross-entropy kernels, include out-of-range target indices to verify bounds checking and expose off-by-one loop errors that may be masked by zero-weight contributions under default label smoothing settings.",
+      "suggested_code": "def generate_inputs(device):\n    # Uniform logits: max_val=1, sum_exp=10, log_sum_exp=ln(10)+1≈3.303\n    predictions = torch.ones(4096, 10, device=device, dtype=torch.float32)\n    # Target=10 is outside valid range [0,9]\n    # Original: i goes 0-9, never matches 10, all else branches with weight=0, loss=0\n    # Mutant: i goes 0-10, at i=10 matches target, uses weight=1.0, reads OOB, loss≈2.3\n    targets = torch.full((4096,), 10, device=device, dtype=torch.int64)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "WorkerCrash: CUDA error: device-side assert triggered\nCUDA kernel errors might be asynchronously reported at some other API call, so the stacktrace below might be incorrect.\nFor debugging consider passing CUDA_LAUNCH_BLOCKING=1\nCompile with `TORCH_USE_CUDA_DSA` to enable device-side assertions.\n"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4927,
+        "completion_tokens": 6013,
+        "total_tokens": 10940,
+        "reasoning_tokens": 2492
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "With label_smoothing=0 (fixed): negative_weight=0.0/10=0. Extra iteration (i=10) contribution = negative_weight*(OOB-log_sum_exp) = 0*anything = 0. No value change can make negative_weight non-zero.",
+      "survival_reason": "Round 1 failed because the extra loop iteration multiplies by negative_weight=0, yielding zero contribution regardless of OOB memory content. Round 2 failed because invalid targets crash the reference implementation before comparison. The mutation adds an iteration that reads out-of-bounds memory, but with label_smoothing=0 hardcoded in the model, this access is always multiplied by zero. Using Inf/NaN values doesn't help because they propagate through both kernels equally (affecting the row that contains them), and NaN-aware comparison treats NaN==NaN as equal. The only way to expose this bug is to use label_smoothing>0, which is a configuration parameter we cannot modify through input values.",
+      "killable": false,
+      "kill_strategy": "Unkillable with value-only changes. Requires instantiating ModelNew with label_smoothing>0 (e.g., ModelNew(label_smoothing=0.1)) to make negative_weight non-zero, so the OOB read in the extra iteration would contribute a detectable difference.",
+      "recommendations": "Mutation testing for CUDA kernels should include configuration parameter variations (like label_smoothing) as part of the test matrix, not just input value variations. This mutation is a classic example of a bug that only manifests under specific configurations.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 321.95
+}

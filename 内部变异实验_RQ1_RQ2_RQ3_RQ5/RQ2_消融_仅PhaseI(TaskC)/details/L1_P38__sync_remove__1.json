@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P38__sync_remove__1",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P38",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5164,
+        "completion_tokens": 3337,
+        "total_tokens": 8501,
+        "reasoning_tokens": 1098
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "With block_size=256, we have 8 warps. After warp 0 writes final sum to warp_sums[0] at line 68, all 8 warps read it at line 75. The removed __syncthreads() at line 72 was required to ensure warps 1-7 see the write from warp 0. Without it, warps 1-7 may read stale data (warp 0's partial sum from line 53), causing incorrect normalization.",
+      "survival_reason": "This is a shared memory race condition. Warp 0 computes the final reduction and writes to warp_sums[0]. The other 7 warps need this value to compute inv_batch_sum for normalization. Without the sync barrier, warps 1-7 may proceed to read warp_sums[0] before warp 0's write is visible, using the stale partial sum instead of the total sum. This causes those warps to normalize their elements by the wrong factor, producing significantly incorrect output values.",
+      "killable": true,
+      "kill_strategy": "Use large magnitude values to amplify the numerical difference between correct normalization (dividing by total sum) and incorrect normalization (dividing by ~1/8 of total sum). The race condition is inherently non-deterministic but highly likely with 8 warps contending.",
+      "recommendations": "Always verify that __syncthreads() barriers protecting shared memory reads from prior writes are present. Race conditions may not manifest on every run but will cause intermittent failures. Consider using static analysis tools that detect missing synchronization in producer-consumer patterns.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(12345)\n    # Large values make sum computation errors very visible\n    # If warps 1-7 read stale partial sum (~1/8 of total), outputs differ by ~8x\n    x = torch.randn(16, 16384, device=device, dtype=torch.float32) * 1000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5021,
+        "completion_tokens": 5993,
+        "total_tokens": 11014,
+        "reasoning_tokens": 2406
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Warp 0 processes elements 0-127,1024-1151,... If all zeros in warp 0's domain, warp_sums[0] after partial = 0. After reduction = 128. If warps 1-7 read stale 0, they use inv_batch_sum=1.0. Output diff = |1.0 - 0.0078125| = 0.99 >> 0.01 tolerance.",
+      "survival_reason": "Previous attempt used random values where warp 0's partial sum was ~1/8 of total, making the error only ~8x magnitude change which might not always trigger or be detectable due to race timing. The new strategy places ALL non-zero values outside warp 0's processing domain, making warp 0's partial sum exactly 0, while total sum is 128. This creates a binary distinguishing case: either output is normalized (divide by 128) or unchanged (multiply by 1.0), with 0.99 absolute difference far exceeding the 0.01 tolerance.",
+      "killable": true,
+      "kill_strategy": "Place non-zero values exclusively in positions NOT processed by warp 0 (positions 128-255), zeros elsewhere. This forces warp 0's partial sum to 0 while total sum is non-zero, maximizing divergence when the race condition triggers.",
+      "recommendations": "When testing GPU kernels with synchronization primitives, design inputs that create maximum divergence between partial reductions and final results. Specifically, concentrate values in specific thread/warp domains to make race condition effects deterministic and maximally visible.",
+      "suggested_code": "def generate_inputs(device):\n    # Create zeros everywhere\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    \n    # Put non-zero values ONLY in positions handled by warp 1, NOT warp 0\n    # Warp 0 (threads 0-31) handles positions 0-127 in first stride iteration\n    # Position 128-255 is handled by warp 1 (threads 32-63)\n    x[:, 128:256] = 1.0\n    \n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=9.921875e-01, mean_diff=7.751465e-03, ref_range=[0.0000e+00,7.8125e-03], mut_range=[0.0000e+00,1.0000e+00]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Place non-zero values exclusively in positions NOT processed by warp 0 (positions 128-255), zeros elsewhere. This forces warp 0's partial sum to 0 while total sum is non-zero, maximizing divergence when the race condition triggers.",
+    "suggested_code": "def generate_inputs(device):\n    # Create zeros everywhere\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    \n    # Put non-zero values ONLY in positions handled by warp 1, NOT warp 0\n    # Warp 0 (threads 0-31) handles positions 0-127 in first stride iteration\n    # Position 128-255 is handled by warp 1 (threads 32-63)\n    x[:, 128:256] = 1.0\n    \n    return [x]"
+  },
+  "elapsed_sec": 193.55
+}

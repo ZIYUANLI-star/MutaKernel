@@ -1,0 +1,40 @@
+{
+  "mutant_id": "L1_P100__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P100",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5143,
+        "completion_tokens": 3579,
+        "total_tokens": 8722,
+        "reasoning_tokens": 1840
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "With input shape [128,1], size=128, block_size=256, num_blocks=1. Only 1 block is launched. Threads 128-255 are 'padding' threads that simply write thread_loss=0.0f to shared_mem (they skip the if-block). Threads 0-127 do computation then write. In the reduction's first iteration (stride=128), threads 0-127 read shared_mem[128-255]. The padding threads 128-255 have LESS work than data threads 0-127, so they naturally complete their writes before data threads start the reduction loop. The removed __syncthreads() provided synchronization that occurs naturally due to workload structure.",
+      "survival_reason": "The mutation removes __syncthreads() after shared memory writes but before the reduction loop. However, with the fixed input shape of 128 elements, exactly 1 block of 256 threads is launched. Threads 128-255 have no actual data (idx >= size) and only write 0.0f to shared_mem - this is faster than threads 0-127 which must compute margin and conditionally set thread_loss. Since all threads are in the same block with no inter-block synchronization needed, and padding threads naturally complete before data threads reach the reduction reads, the missing barrier doesn't cause any observable race condition. The workload asymmetry (padding threads have less work) creates implicit synchronization.",
+      "killable": false,
+      "kill_strategy": "Unkillable under fixed-shape contract. The race condition requires thread timing variations that don't manifest with this specific 128-element, single-block configuration. Values cannot influence thread scheduling - only shape changes (multiple blocks with unbalanced workloads) could potentially expose the race.",
+      "recommendations": "For race condition mutations in reduction kernels, mutation testing should vary input sizes to test multiple blocks with partial occupancy. A size like 257 would create 2 blocks where the second block has only 1 active thread, potentially exposing timing-dependent races. Fixed-shape contracts make such synchronization bugs nearly impossible to detect when the shape happens to create favorable timing conditions.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 2
+  },
+  "elapsed_sec": 62.97
+}

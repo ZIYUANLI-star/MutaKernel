@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P19__mask_boundary__0",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P19",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 2804,
+        "completion_tokens": 2341,
+        "total_tokens": 5145,
+        "reasoning_tokens": 843
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Input shape [16, 16384] → size = 262144 elements. Original: processes idx ∈ [0, 262143]. Mutant: processes idx ∈ [0, 262142], skipping the LAST element (idx=262143). The output at index 262143 is uninitialized garbage from torch::empty_like().",
+      "survival_reason": "The mutation changes the boundary condition from 'idx < size' to 'idx < size - 1', which means the very last element of the flattened tensor (index 262143, corresponding to position [15, 16383] in the 2D tensor) is never processed. The output at this position contains uninitialized memory from torch::empty_like(). Any test that examines the last element will detect this difference since uninitialized memory values are essentially random and won't match the expected ReLU output.",
+      "killable": true,
+      "kill_strategy": "Use a tensor filled with negative values (e.g., -1000.0). The correct ReLU output should be all zeros. The mutant will have all zeros EXCEPT the last element which will be uninitialized garbage. Since the tolerance for comparing against 0 is only atol=0.01, any garbage value outside [-0.01, 0.01] will be detected as a failure.",
+      "recommendations": "Off-by-one errors in CUDA kernel bounds (idx < size vs idx < size - 1) are critical bugs that affect the last element. Mutation testing should include boundary-focused tests that specifically verify the first and last elements are correctly processed, using values that produce easily-verified outputs (like negative inputs for ReLU which should yield exactly 0.0).",
+      "suggested_code": "def generate_inputs(device):\n    # All negative values → ReLU should produce all zeros\n    # Mutant skips last element, leaving uninitialized garbage\n    x = torch.full((16, 16384), -1000.0, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 2668,
+        "completion_tokens": 3575,
+        "total_tokens": 6243,
+        "reasoning_tokens": 1498
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutant skips idx=262143 (last element). With input=-1000, ref output[last]=0. Uninitialized CUDA memory often defaults to 0 (driver zero-initialization or recent allocation patterns), falling within atol=0.01 tolerance. With input=+100, ref output[last]=100.0, tolerance band=[98.99,101.01]. Uninitialized memory landing in this narrow band is extremely unlikely.",
+      "survival_reason": "Round 1 used negative inputs expecting ReLU output of zeros. The mutant's uninitialized last element likely contained a value near 0 (common for fresh GPU allocations or recently zeroed memory), passing within atol=0.01. The fundamentally different approach is using POSITIVE input values, so the expected ReLU output is a specific non-zero value (100.0). Uninitialized memory is extremely unlikely to be within 1% of 100.0. This shifts from 'expecting 0 and getting ~0' to 'expecting 100 and getting random garbage'.",
+      "killable": true,
+      "kill_strategy": "Use positive input values (e.g., 100.0) so the expected ReLU output is 100.0 for all elements including the last. The mutant leaves the last element uninitialized, which is virtually guaranteed to be outside the tolerance band [98.99, 101.01] around 100.0.",
+      "recommendations": "When testing boundary mutations that skip elements, test with both negative inputs (where output is zero and may match uninitialized memory) AND positive inputs (where output is non-zero and highly unlikely to match uninitialized memory). GPU memory zero-initialization can mask bugs when expected outputs are zero.",
+      "suggested_code": "def generate_inputs(device):\n    # All positive values → ReLU should output same values\n    # Reference: all elements = 100.0\n    # Mutant: last element uninitialized, unlikely to be ~100.0\n    # Tolerance at 100.0 is 0.01 + 0.01*100 = 1.01\n    # Uninitialized memory must be in [98.99, 101.01] to pass - very unlikely\n    x = torch.full((16, 16384), 100.0, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 2939,
+        "completion_tokens": 4630,
+        "total_tokens": 7569,
+        "reasoning_tokens": 2121
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutant skips last element (idx=262143). For ref=0.314159 at last position, tolerance=0.01+0.01*0.314159≈0.0131. Garbage must be in [0.301, 0.327] to pass - a 0.026-wide band out of float32 range.",
+      "survival_reason": "Previous attempts used uniform values. With all -1000.0, ref output is all zeros, and if garbage happens to be ~0 (common in GPU memory), it passes. With all 100.0, the tolerance band is 1.01-wide, potentially wide enough for some garbage values. The key insight is that the mutant ONLY affects the last element, so we need to: (1) ensure only the last element has a distinctive positive output, and (2) use a small positive value to minimize tolerance. By using -100.0 everywhere except 0.314159 at index [-1], the expected output is zeros everywhere except 0.314159 at the last position. The tolerance for 0.314159 is only ~0.013, making it nearly impossible for uninitialized garbage to fall within this narrow band around an arbitrary value like 0.314159.",
+      "killable": true,
+      "kill_strategy": "Set all elements to negative values (producing zero output) except the LAST element which gets a small positive value (0.314159). This isolates the mutation's effect to exactly one element with a tight tolerance band that garbage is extremely unlikely to match.",
+      "recommendations": "When testing boundary mutations that skip specific indices, design inputs that make ONLY those indices produce distinctive non-zero outputs with small magnitudes (for tight tolerance), rather than using uniform fills that might coincidentally match uninitialized memory patterns.",
+      "suggested_code": "def generate_inputs(device):\n    # All negative -> ReLU produces zeros\n    # Last element small positive -> ReLU produces same value\n    # Tolerance for 0.314159 is only ~0.013 - very tight band\n    x = torch.full((16, 16384), -100.0, device=device, dtype=torch.float32)\n    x.view(-1)[-1] = 0.314159  # Last element: pi/10, arbitrary small positive\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3163,
+        "completion_tokens": 4060,
+        "total_tokens": 7223,
+        "reasoning_tokens": 2094
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutant skips processing index size-1 (the last element, index 262143). Output uses torch::empty_like which yields uninitialized memory. If uninitialized memory happens to be 0.0 (common on CUDA allocators that zero memory), then: Round 1 all-negative→expected zeros→match. Rounds 2&3 expected non-zero but somehow passed—suggesting memory reuse or allocator behavior. Using float('inf') exploits torch.allclose's special handling: inf is only close to inf, never to any finite value, regardless of tolerance.",
+      "survival_reason": "Previous attempts failed because CUDA memory allocators often zero-initialize memory or reuse recently-freed blocks. Round 1 (all -1000.0) expected zeros—if empty_like gave zeros, it matched. Rounds 2-3 expected finite non-zero values at the last position; the mutant surviving suggests the uninitialized memory coincidentally matched within tolerance (possibly from memory reuse patterns). Using positive infinity is fundamentally different: torch.allclose treats inf specially—only inf equals inf. Uninitialized memory being exactly inf bit-pattern (0x7F800000) is extremely unlikely. This bypasses tolerance-band issues entirely since inf comparison is exact, not approximate.",
+      "killable": true,
+      "kill_strategy": "Set the last tensor element to positive infinity. ReLU preserves inf (since inf > 0). The mutant leaves this element uninitialized. torch.allclose always returns False when comparing inf to any finite value, regardless of tolerance settings. Uninitialized memory being exactly the inf bit-pattern is astronomically unlikely.",
+      "recommendations": "When testing boundary mutations that skip elements, use special floating-point values (inf, -inf, NaN) that have exact comparison semantics in allclose, bypassing tolerance-based comparisons that can be fooled by coincidental memory values.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.ones((16, 16384), device=device, dtype=torch.float32)\n    # Set last element to positive infinity\n    # ReLU(inf) = inf since inf > 0\n    # Mutant skips last element → uninitialized (finite) ≠ inf\n    # allclose(inf, finite) = False always, regardless of tolerance\n    x.view(-1)[-1] = float('inf')\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3424,
+        "completion_tokens": 4177,
+        "total_tokens": 7601,
+        "reasoning_tokens": 1913
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "For ref=1e7, tolerance=0.01+0.01*1e7≈1e5. Passing range is [9.9e6, 1.01e7]. The probability of uninitialized float32 bits landing in this specific narrow exponential range is ~0.001%. Previous small values (0, 100, 0.314) had proportionally larger tolerance bands or zeros matched uninitialized zeros.",
+      "survival_reason": "Previous attempts failed because: (1) All-negative inputs expect zero output, and uninitialized CUDA memory often contains zeros or near-zeros from previous deallocations or memory pool zeroing. (2) Small positive values like 0.314 have tolerance of ~0.013, which uninitialized memory near zero could satisfy. (3) Value 100.0 has tolerance ~1.0, still matchable by cached memory. (4) Infinity caused reference failures. The new strategy uses a LARGE positive value (1e7) where the absolute tolerance (1e5) is still very narrow relative to the full float32 range, making random/cached memory extremely unlikely to match.",
+      "killable": true,
+      "kill_strategy": "Set the last tensor element to a large positive value (1e7) so ReLU output is 1e7. The tolerance band [9.9e6, 1.01e7] is astronomically unlikely for uninitialized memory to match, while previous attempts used values where tolerance bands included common uninitialized patterns (zeros, small values).",
+      "recommendations": "When testing boundary mutations in kernels, use large-magnitude positive values at boundary positions rather than small values or zeros, because relative tolerance (rtol) makes the absolute tolerance grow with magnitude but remains narrow relative to float32's dynamic range.",
+      "suggested_code": "def generate_inputs(device):\n    # Negative values produce zeros; last element is large positive\n    # ReLU(1e7) = 1e7, tolerance band is [9.9e6, 1.01e7]\n    # Uninitialized memory virtually cannot land in this narrow band\n    x = torch.full((16, 16384), -1.0, device=device, dtype=torch.float32)\n    x.view(-1)[-1] = 1e7  # Large positive, tight relative tolerance\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 374.3
+}

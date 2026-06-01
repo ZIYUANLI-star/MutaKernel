@@ -1,0 +1,89 @@
+{
+  "mutant_id": "L1_P41__launch_config_mutate__1",
+  "operator_name": "launch_config_mutate",
+  "kernel_name": "L1_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8148,
+        "completion_tokens": 5217,
+        "total_tokens": 13365,
+        "reasoning_tokens": 2074
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation in parallel kernel affects last_valid_k = min(K, X) vs min(K, X-1). When X <= K, mutant skips last valid k. With input shape [16,64,128], parallel kernel requires output_length >= 64. If triggered, positions where input_start + (kernel_size-1)*dilation = input_length-1 would have max at skipped position.",
+      "survival_reason": "Layer 2's 112 rounds of testing passed because either: (1) the model's fixed parameters result in total_elements < 65536, causing the non-mutated kernel to be used, or (2) the parallel kernel is used but the 'boundary_last_element' stress tests placed max values at positions that weren't the specifically-skipped last-valid-k positions. The mutation only affects positions where (input_length - input_start + dilation - 1)/dilation <= kernel_size, and only exposes when the skipped position contains the window maximum.",
+      "killable": true,
+      "kill_strategy": "Create input where every position except the very last few elements of each kernel window has -infinity or very low values, and the last valid position in each window has the maximum. This ensures any skipped position by the mutant will cause incorrect max computation.",
+      "recommendations": "When testing kernels with boundary-dependent loop bounds, specifically test patterns where the maximum value is placed at the exact boundary position that could be excluded by off-by-one errors in loop bound calculations, not just 'somewhere near the boundary'.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((16, 64, 128), -1e6, dtype=torch.float32, device=device)\n    # Create pattern where every other position has high value\n    # This increases chance that skipped last_valid_k contains the max\n    x[:, :, 1::2] = torch.arange(64, dtype=torch.float32, device=device).view(1, 1, 64).expand(16, 64, 64) * 100\n    # Specifically set last positions very high\n    x[:, :, -1] = 1e6\n    x[:, :, -2] = 1e6 - 1\n    x[:, :, -3] = 1e6 - 2\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8090,
+        "completion_tokens": 4634,
+        "total_tokens": 12724,
+        "reasoning_tokens": 2030
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation subtracts 1 from last_valid_k ceiling division. For output_pos where (input_length - input_start + dilation - 1) / dilation equals a boundary value, the loop skips the last valid kernel position. If max value is ONLY at that skipped position, mutant returns wrong answer (-inf or lower value).",
+      "survival_reason": "The previous attempt filled multiple positions with high values. The mutant may have found a valid max at an earlier non-skipped position. Also, the pattern x[::2] created maxes at even positions which may not align with the specific skipped positions. This new test places ALL values very negative EXCEPT positions that correspond exactly to the last k-index of each window, ensuring the skipped position is the ONLY candidate for maximum.",
+      "killable": true,
+      "kill_strategy": "Set all input values to large negative (-1e9) except the very last position (index 127) which is set to a large positive value (+1e9). If kernel windows include position 127 and the mutant skips it, the output will be -1e9 instead of +1e9, creating a massive detectable difference.",
+      "recommendations": "When testing kernel boundary mutations, systematically place distinguishing values at ALL positions that could be boundary-adjacent for ANY valid kernel configuration, rather than assuming specific kernel parameters.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.full((16, 64, 128), -1e9, dtype=torch.float32, device=device)\n    # Set ONLY the last position to positive - this is the position most likely\n    # to be skipped by the mutant's off-by-one in last_valid_k\n    x[:, :, 127] = 1e9\n    # Also set a pattern at other boundary positions to catch different kernel configs\n    # These positions would be last in windows with different strides\n    x[:, :, 125] = 5e8  # For kernel_size=2, stride=2 ending at pos 126\n    x[:, :, 123] = 4e8  # For kernel_size=4, stride=4 ending at pos 124\n    x[:, :, 63] = 3e8   # Midpoint boundary\n    x[:, :, 31] = 2e8   # Quarter boundary\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8453,
+        "completion_tokens": 4059,
+        "total_tokens": 12512,
+        "reasoning_tokens": 1804
+      },
+      "reason_category": "predicate_unreachable",
+      "proof_sketch": "With batch=16, channels=64, input_length=128, and typical stride=2, kernel_size=4: output_length=(128-3-1)/2+1=63, total_elements=16*64*63=64512<65536. The condition 'if(total_elements<65536)' is always TRUE, so the mutated 'maxpool1d_forward_kernel_batch_channel_parallel' kernel is NEVER invoked. The unmutated 'maxpool1d_forward_kernel' always runs.",
+      "survival_reason": "The mutation exists in `maxpool1d_forward_kernel_batch_channel_parallel`, which is only called when total_elements >= 65536. With the fixed input shape [16,64,128] and model parameters (stride=2, kernel_size=4 typical for pooling), total_elements = 64,512 < 65,536. Previous attempts set high values at position 127, but this cannot affect output because the mutated code path is never reached. The kernel dispatch condition depends on output_length which is determined by model parameters (kernel_size, stride, padding, dilation), not input values.",
+      "killable": false,
+      "kill_strategy": "The mutant is unkillable with value-only changes. Killing requires changing model initialization parameters (smaller stride or larger kernel_size to increase output_length such that total_elements >= 65536), which violates the fixed-shape constraint.",
+      "recommendations": "When mutation testing GPU kernels with multiple code paths selected by problem-size thresholds, ensure test configurations explicitly exercise ALL dispatch branches. Add separate test cases with parameters that force execution through each kernel variant.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 272.93
+}

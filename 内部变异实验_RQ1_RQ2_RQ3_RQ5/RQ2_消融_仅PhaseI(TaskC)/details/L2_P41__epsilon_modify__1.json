@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P41__epsilon_modify__1",
+  "operator_name": "epsilon_modify",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8461,
+        "completion_tokens": 4320,
+        "total_tokens": 12781,
+        "reasoning_tokens": 1668
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "eps=0 vs eps=1e-5 in rsqrtf(var + eps) for GroupNorm. When var ≈ 0: original gives ~316.23, mutant gives +inf or very large. With input=zeros, GEMM output is constant per column across batch, and GroupNorm variance within groups can approach zero depending on how similar the GELU(bias) values are within each group.",
+      "survival_reason": "With random inputs, the variance in GroupNorm is typically O(1), making the eps difference negligible. However, with constant input (e.g., zeros), the first kernel produces identical rows, and within GroupNorm groups, if bias values are similar, variance approaches zero. At variance ≈ 1e-10, rsqrtf(1e-10) ≈ 100000 vs rsqrtf(1e-5) ≈ 316, a 300x difference that propagates through the normalization step.",
+      "killable": true,
+      "kill_strategy": "Use all-zeros input to create constant rows after GEMM. This maximizes the chance of low variance within GroupNorm groups, causing the inv_std computation to diverge significantly between eps=0 and eps=1e-5.",
+      "recommendations": "Epsilon values in numerical stability guards should be tested with edge cases that minimize variance or create near-singular situations, not just typical random data.",
+      "suggested_code": "def generate_inputs(device):\n    # All zeros - GEMM output will be just bias, creating constant rows\n    # GroupNorm variance within groups approaches zero for similar values\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8281,
+        "completion_tokens": 6729,
+        "total_tokens": 15010,
+        "reasoning_tokens": 3109
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With GELU outputs ≈ 0 (from negative saturation), GroupNorm variance ≈ machine_eps. rsqrt(~0 + 0) = inf, rsqrt(~0 + 1e-5) ≈ 316. After multiplying, produces inf/NaN vs finite values, failing allclose.",
+      "survival_reason": "The previous all-zeros attempt created non-zero variance because the bias values (random init) differ across channels. This gave finite GroupNorm variance, making eps irrelevant (variance >> eps). The new strategy uses large negative inputs to saturate GELU to near-zero for ALL channels, creating variance at machine-epsilon level where eps=0 causes division by ~0 producing inf/NaN.",
+      "killable": true,
+      "kill_strategy": "Use large negative constant input (-100) to push GEMM outputs negative, saturating GELU to near-zero. This makes GroupNorm groups have variance approaching machine epsilon, where rsqrt(eps) diverges dramatically between eps=0 (inf) and eps=1e-5 (316).",
+      "recommendations": "Epsilon guards in normalization layers should be tested with inputs that create near-zero variance scenarios - either constant inputs or inputs designed to saturate activation functions to produce uniform outputs.",
+      "suggested_code": "def generate_inputs(device):\n    # Large negative values saturate GELU to near-zero\n    # Creating near-zero variance in GroupNorm groups\n    # eps=0: rsqrt(~0) = inf, eps=1e-5: rsqrt(1e-5) = 316\n    x = torch.full((128, 512), -100.0, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8506,
+        "completion_tokens": 4591,
+        "total_tokens": 13097,
+        "reasoning_tokens": 2232
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation eps=0 vs eps=1e-5 affects rsqrt(var+eps) in GroupNorm. When variance=0: rsqrt(1e-5)≈316 vs rsqrt(0)=inf. With input=-1e6, GEMM outputs ~-9e5 (large negative), GELU saturates all outputs to ~0, making GroupNorm variance=0. Then (0-0)*inf=NaN for mutant, but (0-0)*316=0 for original. Final ReLU(mean) differs: NaN vs 0.",
+      "survival_reason": "Round 1 (zeros) failed because GEMM output equals bias, which varies by column, creating non-zero variance in GroupNorm groups. Round 2 (-100) failed because the magnitude wasn't extreme enough - with kaiming_uniform weights (σ≈0.04) and K=512, GEMM outputs had magnitude ~100*sqrt(512)*0.04≈90, some columns still produced positive values after BatchNorm, preventing complete GELU saturation. The new strategy uses -1e6, ensuring GEMM outputs have magnitude ~9e5, pushing ALL values deep into GELU's negative saturation region where output≈0 regardless of weight variations, guaranteeing near-zero GroupNorm variance.",
+      "killable": true,
+      "kill_strategy": "Use extreme negative input (-1e6) to force ALL GELU outputs to zero via deep saturation, creating zero variance in all GroupNorm groups. This causes rsqrt(0) = inf in mutant vs rsqrt(1e-5) = 316 in original, producing NaN outputs for mutant.",
+      "recommendations": "Numerical stability guards (eps) should be tested with inputs that drive intermediate computations to edge cases like zero variance, requiring extreme value ranges that saturate nonlinear activations uniformly.",
+      "suggested_code": "def generate_inputs(device):\n    # Extreme negative input saturates GELU to ~0 for all elements\n    # GEMM output magnitude: 1e6 * sqrt(512) * 0.04 ≈ 9e5 (extremely negative)\n    # GELU(-9e5) ≈ 0, so all GroupNorm group elements are ~0\n    # Variance = 0: original rsqrt(1e-5)=316, mutant rsqrt(0)=inf\n    # (0-0)*inf = NaN for mutant, (0-0)*316 = 0 for original\n    x = torch.full((128, 512), -1e6, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8817,
+        "completion_tokens": 6466,
+        "total_tokens": 15283,
+        "reasoning_tokens": 3049
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With input ~1e4, GEMM output ~1.4e4 per element. GroupNorm variance = (sqsum/32) - mean². With values ~1e4, sqsum ~32*(1.4e4)² ~6.3e9, mean ~1.4e4, mean² ~2e8. Due to floating-point precision in 32-bit, the difference can be inaccurate. When variance ≈ small positive or negative value, rsqrt(var+0) vs rsqrt(var+1e-5) diverges dramatically. For var=1e-6: rsqrt(1e-6)≈1000 vs rsqrt(1.1e-5)≈302.",
+      "survival_reason": "Previous attempts used constant or extreme negative inputs expecting GELU saturation to create zero variance. However, with Kaiming-initialized weights (mean ~0), constant input yields GEMM output ≈ bias (small), not producing the intended uniformity. The actual variance in GroupNorm remained ~1e-3, far from the 1e-5 threshold where eps matters. This new approach uses large positive values to exploit floating-point catastrophic cancellation in variance computation, potentially yielding near-zero or even negative computed variance where eps=0 vs eps=1e-5 creates dramatic rsqrt differences.",
+      "killable": true,
+      "kill_strategy": "Use large positive input values (~1e4) that create large GEMM outputs, pushing GELU into its linear region. This creates GroupNorm inputs with large magnitudes where variance calculation suffers floating-point precision loss through catastrophic cancellation, yielding tiny variance values where the epsilon difference becomes significant.",
+      "recommendations": "When using epsilon values for numerical stability, test with inputs that create variance calculations susceptible to floating-point catastrophic cancellation - large magnitude values where sqsum/n ≈ mean² can expose epsilon sensitivity.",
+      "suggested_code": "def generate_inputs(device):\n    # Large positive values ~1e4 create GEMM outputs ~1.4e4\n    # GroupNorm variance calculation: (sqsum/n) - mean² suffers\n    # catastrophic cancellation with large nearly-equal values\n    # Resulting tiny variance makes eps=0 vs eps=1e-5 significant\n    x = torch.full((128, 512), 1e4, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9052,
+        "completion_tokens": 6578,
+        "total_tokens": 15630,
+        "reasoning_tokens": 2717
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With input ~1e-38: GEMM≈0, GELU(0)≈0, GroupNorm variance≈(1e-39)²≈1e-78. Original: rsqrt(1e-78+1e-5)≈rsqrt(1e-5)=316. Mutant: rsqrt(1e-78)≈1e39 (overflow to inf). Normalized values: 0*316=0 vs 0*inf=NaN. Mean of NaN=NaN, differs from valid output.",
+      "survival_reason": "Previous attempts failed because large-magnitude inputs still produced significant variance in GroupNorm due to random weight variation across columns. The BatchNorm eps change was irrelevant since running_var=1. The fundamental issue was that GroupNorm variance never approached the critical threshold where eps=0 vs eps=1e-5 matters. By using denormalized tiny inputs (~1e-38), we force ALL values through the computation to be near-zero, creating variance ~1e-76 where rsqrt diverges dramatically between the two eps values.",
+      "killable": true,
+      "kill_strategy": "Use denormalized/tiny float32 inputs (~1e-38) to force near-zero GEMM outputs, resulting in near-zero GroupNorm variance where rsqrt(~0) vs rsqrt(~0 + 1e-5) produces inf vs 316, causing NaN propagation in mutant.",
+      "recommendations": "Add explicit tests with denormalized/subnormal floating-point inputs to verify numerical stability guards (epsilon values) are effective across the full float32 range, not just typical value magnitudes.",
+      "suggested_code": "def generate_inputs(device):\n    # Tiny input values near smallest positive float32\n    # GEMM output ≈ 0, GELU ≈ 0, GroupNorm variance ≈ 1e-76\n    # Mutant: rsqrt(~0) overflows, produces inf/NaN\n    # Original: rsqrt(~0 + 1e-5) ≈ 316, produces valid output\n    x = torch.full((128, 512), 1e-38, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 1036.81
+}

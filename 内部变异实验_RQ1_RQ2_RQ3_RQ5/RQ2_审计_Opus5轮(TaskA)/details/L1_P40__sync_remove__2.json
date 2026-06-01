@@ -1,0 +1,40 @@
+{
+  "mutant_id": "L1_P40__sync_remove__2",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P40",
+  "tier": 3,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7435,
+        "completion_tokens": 2907,
+        "total_tokens": 10342,
+        "reasoning_tokens": 1094
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The removed __syncthreads() at line 68 separates reading shared_mem[0] (for mean) from writing shared_mem[tid] (for variance). With feature_size=65536 and block_size=256, each thread iterates 256 times through global memory reads in the variance loop. Timeline: All 256 threads read shared_mem[0] (~1 cycle per warp, 8 warps total). Then ALL threads must complete 256 global memory reads (~100+ cycles each) before ANY thread writes to shared_mem. The global memory work creates an implicit barrier of thousands of cycles between the shared memory read and write. Thread 0 cannot overwrite shared_mem[0] before all other threads have read it because thread 0 must also complete the same 256 iterations of global memory work.",
+      "survival_reason": "The mutation removes a __syncthreads() between reading shared_mem[0] for mean computation and writing to shared_mem[tid] for variance partial sums. While this creates a theoretical WAR (Write After Read) race condition, the race window is practically impossible to trigger due to kernel structure. After reading shared_mem[0], every thread (including thread 0) must complete 256 iterations of global memory reads before any thread can write to shared memory. Global memory accesses take ~100+ cycles each, meaning each thread spends thousands of cycles between the shared memory read and write. This creates a massive implicit synchronization gap - by the time any thread reaches the write, all threads have long since completed the read. The timing dependency cannot be manipulated through input values; it's determined by the kernel's algorithmic structure. With identical workloads per thread and symmetric access patterns, the removed synchronization is operationally redundant.",
+      "killable": false,
+      "kill_strategy": "Unkillable under fixed configuration. The mutation's observability depends on warp-level timing, not input values. The kernel's structure (256 global memory reads per thread between shared memory read and write) provides implicit synchronization that makes the explicit barrier redundant. No value pattern can alter warp scheduling to trigger the race.",
+      "recommendations": "This mutation highlights that some __syncthreads() removals are unkillable due to algorithmic structure providing implicit synchronization. Mutation testing frameworks should analyze data-dependency distances and memory access patterns to predict whether sync-removal mutations are practically distinguishable. Consider flagging sync barriers that have heavy computation between dependent accesses as lower-priority mutation targets.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 52.66
+}

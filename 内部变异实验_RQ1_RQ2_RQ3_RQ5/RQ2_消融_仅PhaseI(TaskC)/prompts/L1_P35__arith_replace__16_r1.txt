@@ -1,0 +1,646 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+
+A mutation testing tool applied a mutation to a GPU kernel. The 4-layer
+Equivalence-Mutant Detection (EMD) pipeline ran on this mutant:
+- Layer 0 — source-code normalization
+- Layer 1 — static equivalence rules
+- Layer 2 — multi-seed differential testing (0 total rounds, including baseline)
+- Layer 3 — LLM-based equivalence reasoning (if executed)
+
+EMD concluded this mutant is **possibly killable** (or has not been definitively
+declared equivalent). **NO downstream deterministic stress testing has been
+applied.** Your task is to either:
+1. Confirm the mutant is unkillable under the fixed-shape contract, OR
+2. Construct a value-level test input that exposes its behavioral difference.
+
+## Testing Contract (fixed-shape, variable-value)
+
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`** (NaN-aware: if
+   reference produces NaN/Inf, mutant must produce matching NaN/Inf at the
+   same positions). To kill the mutant, your input must produce a result
+   whose **maximum absolute element-wise difference vs reference exceeds
+   `atol + rtol * |ref|`** (with `atol=rtol=1e-2`). Differences below this
+   threshold will NOT count as a kill — design inputs with clear, large
+   divergences, not minimal ones.
+4. **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for Group Normalization
+group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename T>
+__device__ __forceinline__ float to_float(T val) {
+    return static_cast<float>(val);
+}
+
+template<>
+__device__ __forceinline__ float to_float<half>(half val) {
+    return __half2float(val);
+}
+
+template<typename T>
+__device__ __forceinline__ T from_float(float val) {
+    return static_cast<T>(val);
+}
+
+template<>
+__device__ __forceinline__ half from_float<half>(float val) {
+    return __float2half(val);
+}
+
+template<typename T>
+__global__ void group_norm_forward_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const int batch_size,
+    const int num_channels,
+    const int num_groups,
+    const int channels_per_group,
+    const int spatial_size,
+    const float eps
+) {
+    // Each block handles one group in one sample
+    const int group_idx = blockIdx.x % num_groups;
+    const int sample_idx = blockIdx.x / num_groups;
+    
+    if (sample_idx >= batch_size || group_idx >= num_groups) return;
+    
+    const int group_start = group_idx * channels_per_group;
+    const int group_elements = channels_per_group * spatial_size;
+    
+    // Shared memory for reductions
+    __shared__ float shared_data[256];
+    
+    // First pass: compute mean
+    float thread_sum = 0.0f;
+    for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+        int c = group_start + (idx / spatial_size);
+        int s = idx % spatial_size;
+        int input_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+        thread_sum += to_float(input[input_idx]);
+    }
+    
+    // Block reduction for sum
+    shared_data[threadIdx.x] = thread_sum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float mean = 0.0f;
+    if (threadIdx.x == 0) {
+        mean = shared_data[0] / group_elements;
+        shared_data[0] = mean;
+    }
+    __syncthreads();
+    
+    mean = shared_data[0];
+    
+    // Second pass: compute variance
+    float thread_sqsum = 0.0f;
+    for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+        int c = group_start + (idx / spatial_size);
+        int s = idx % spatial_size;
+        int input_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+        float val = to_float(input[input_idx]);
+        float diff = val - mean;
+        thread_sqsum += diff * diff;
+    }
+    
+    // Block reduction for variance
+    shared_data[threadIdx.x] = thread_sqsum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float inv_std = 0.0f;
+    if (threadIdx.x == 0) {
+        float var = shared_data[0] / group_elements;
+        inv_std = rsqrtf(var + eps);
+        shared_data[0] = inv_std;
+    }
+    __syncthreads();
+    
+    inv_std = shared_data[0];
+    
+    // Apply normalization with affine transformation
+    for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+        int c = group_start + (idx / spatial_size);
+        int s = idx % spatial_size;
+        int output_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+        
+        float val = to_float(input[output_idx]);
+        float normalized = (val - mean) * inv_std;
+        
+        if (weight && bias) {
+            normalized = normalized * weight[c] + bias[c];
+        }
+        
+        output[output_idx] = from_float<T>(normalized);
+    }
+}
+
+torch::Tensor group_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int num_groups,
+    float eps
+) {
+    auto batch_size = input.size(0);
+    auto num_channels = input.size(1);
+    
+    // Calculate spatial size
+    int spatial_size = 1;
+    for (int i = 2; i < input.dim(); ++i) {
+        spatial_size *= input.size(i);
+    }
+    
+    auto channels_per_group = num_channels / num_groups;
+    auto output = torch::empty_like(input);
+    
+    // Configure kernel launch
+    const int threads_per_block = 256;
+    dim3 blocks(batch_size * num_groups);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(),
+        "group_norm_forward_cuda",
+        ([&] {
+            group_norm_forward_kernel<scalar_t><<<blocks, threads_per_block>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                weight.defined() ? weight.data_ptr<float>() : nullptr,
+                bias.defined() ? bias.data_ptr<float>() : nullptr,
+                batch_size,
+                num_channels,
+                num_groups,
+                channels_per_group,
+                spatial_size,
+                eps
+            );
+        })
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    return output;
+}
+"""
+
+group_norm_cpp_source = """
+torch::Tensor group_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int num_groups,
+    float eps
+);
+"""
+
+# Compile the inline CUDA code
+group_norm_cuda = load_inline(
+    name="group_norm_cuda",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Group Normalization with custom CUDA kernel.
+    """
+    def __init__(self, num_features: int, num_groups: int):
+        """
+        Initializes the optimized GroupNorm layer.
+
+        Args:
+            num_features (int): Number of features in the input tensor.
+            num_groups (int): Number of groups to divide the channels into.
+        """
+        super(ModelNew, self).__init__()
+        self.num_groups = num_groups
+        self.num_features = num_features
+        
+        # Learnable parameters
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        
+        # Small epsilon for numerical stability
+        self.eps = 1e-5
+        
+        # CUDA kernel
+        self.group_norm_kernel = group_norm_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Group Normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, *).
+
+        Returns:
+            torch.Tensor: Output tensor with Group Normalization applied, same shape as input.
+        """
+        # Validate input
+        if x.dim() < 2:
+            raise ValueError(f"Expected at least 2D input (got {x.dim()}D input)")
+        
+        if x.size(1) != self.num_features:
+            raise ValueError(
+                f"Expected input channels {self.num_features}, got {x.size(1)} channels"
+            )
+        
+        if self.num_features % self.num_groups != 0:
+            raise ValueError(
+                f"Number of channels ({self.num_features}) must be divisible by number of groups ({self.num_groups})"
+            )
+        
+        # Use custom CUDA kernel
+        return self.group_norm_kernel.group_norm_forward_cuda(
+            x,
+            self.weight,
+            self.bias,
+            self.num_groups,
+            self.eps
+        )
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for Group Normalization
+group_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename T>
+__device__ __forceinline__ float to_float(T val) {
+    return static_cast<float>(val);
+}
+
+template<>
+__device__ __forceinline__ float to_float<half>(half val) {
+    return __half2float(val);
+}
+
+template<typename T>
+__device__ __forceinline__ T from_float(float val) {
+    return static_cast<T>(val);
+}
+
+template<>
+__device__ __forceinline__ half from_float<half>(float val) {
+    return __float2half(val);
+}
+
+template<typename T>
+__global__ void group_norm_forward_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const float* __restrict__ weight,
+    const float* __restrict__ bias,
+    const int batch_size,
+    const int num_channels,
+    const int num_groups,
+    const int channels_per_group,
+    const int spatial_size,
+    const float eps
+) {
+    // Each block handles one group in one sample
+    const int group_idx = blockIdx.x % num_groups;
+    const int sample_idx = blockIdx.x / num_groups;
+    
+    if (sample_idx >= batch_size || group_idx >= num_groups) return;
+    
+    const int group_start = group_idx * channels_per_group;
+    const int group_elements = channels_per_group * spatial_size;
+    
+    // Shared memory for reductions
+    __shared__ float shared_data[256];
+    
+    // First pass: compute mean
+    float thread_sum = 0.0f;
+    for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+        int c = group_start + (idx / spatial_size);
+        int s = idx % spatial_size;
+        int input_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+        thread_sum += to_float(input[input_idx]);
+    }
+    
+    // Block reduction for sum
+    shared_data[threadIdx.x] = thread_sum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float mean = 0.0f;
+    if (threadIdx.x == 0) {
+        mean = shared_data[0] / group_elements;
+        shared_data[0] = mean;
+    }
+    __syncthreads();
+    
+    mean = shared_data[0];
+    
+    // Second pass: compute variance
+    float thread_sqsum = 0.0f;
+    for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+        int c = group_start + (idx / spatial_size);
+        int s = idx % spatial_size;
+        int input_idx = ((sample_idx / num_channels + c) * spatial_size + s);
+        float val = to_float(input[input_idx]);
+        float diff = val - mean;
+        thread_sqsum += diff * diff;
+    }
+    
+    // Block reduction for variance
+    shared_data[threadIdx.x] = thread_sqsum;
+    __syncthreads();
+    
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            shared_data[threadIdx.x] += shared_data[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    
+    float inv_std = 0.0f;
+    if (threadIdx.x == 0) {
+        float var = shared_data[0] / group_elements;
+        inv_std = rsqrtf(var + eps);
+        shared_data[0] = inv_std;
+    }
+    __syncthreads();
+    
+    inv_std = shared_data[0];
+    
+    // Apply normalization with affine transformation
+    for (int idx = threadIdx.x; idx < group_elements; idx += blockDim.x) {
+        int c = group_start + (idx / spatial_size);
+        int s = idx % spatial_size;
+        int output_idx = ((sample_idx * num_channels + c) * spatial_size + s);
+        
+        float val = to_float(input[output_idx]);
+        float normalized = (val - mean) * inv_std;
+        
+        if (weight && bias) {
+            normalized = normalized * weight[c] + bias[c];
+        }
+        
+        output[output_idx] = from_float<T>(normalized);
+    }
+}
+
+torch::Tensor group_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int num_groups,
+    float eps
+) {
+    auto batch_size = input.size(0);
+    auto num_channels = input.size(1);
+    
+    // Calculate spatial size
+    int spatial_size = 1;
+    for (int i = 2; i < input.dim(); ++i) {
+        spatial_size *= input.size(i);
+    }
+    
+    auto channels_per_group = num_channels / num_groups;
+    auto output = torch::empty_like(input);
+    
+    // Configure kernel launch
+    const int threads_per_block = 256;
+    dim3 blocks(batch_size * num_groups);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(),
+        "group_norm_forward_cuda",
+        ([&] {
+            group_norm_forward_kernel<scalar_t><<<blocks, threads_per_block>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                weight.defined() ? weight.data_ptr<float>() : nullptr,
+                bias.defined() ? bias.data_ptr<float>() : nullptr,
+                batch_size,
+                num_channels,
+                num_groups,
+                channels_per_group,
+                spatial_size,
+                eps
+            );
+        })
+    );
+    
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    return output;
+}
+"""
+
+group_norm_cpp_source = """
+torch::Tensor group_norm_forward_cuda(
+    torch::Tensor input,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    int num_groups,
+    float eps
+);
+"""
+
+# Compile the inline CUDA code
+group_norm_cuda = load_inline(
+    name="group_norm_cuda",
+    cpp_sources=group_norm_cpp_source,
+    cuda_sources=group_norm_source,
+    functions=["group_norm_forward_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Group Normalization with custom CUDA kernel.
+    """
+    def __init__(self, num_features: int, num_groups: int):
+        """
+        Initializes the optimized GroupNorm layer.
+
+        Args:
+            num_features (int): Number of features in the input tensor.
+            num_groups (int): Number of groups to divide the channels into.
+        """
+        super(ModelNew, self).__init__()
+        self.num_groups = num_groups
+        self.num_features = num_features
+        
+        # Learnable parameters
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias = nn.Parameter(torch.zeros(num_features))
+        
+        # Small epsilon for numerical stability
+        self.eps = 1e-5
+        
+        # CUDA kernel
+        self.group_norm_kernel = group_norm_cuda
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Group Normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features, *).
+
+        Returns:
+            torch.Tensor: Output tensor with Group Normalization applied, same shape as input.
+        """
+        # Validate input
+        if x.dim() < 2:
+            raise ValueError(f"Expected at least 2D input (got {x.dim()}D input)")
+        
+        if x.size(1) != self.num_features:
+            raise ValueError(
+                f"Expected input channels {self.num_features}, got {x.size(1)} channels"
+            )
+        
+        if self.num_features % self.num_groups != 0:
+            raise ValueError(
+                f"Number of channels ({self.num_features}) must be divisible by number of groups ({self.num_groups})"
+            )
+        
+        # Use custom CUDA kernel
+        return self.group_norm_kernel.group_norm_forward_cuda(
+            x,
+            self.weight,
+            self.bias,
+            self.num_groups,
+            self.eps
+        )
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 91
+- Original fragment: `*`
+- node_type: cuda_Mult
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 64, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain mathematical
+errors. Reason independently from the source code — do not blindly trust
+prior reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 91
+- Original fragment: `*`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Error: worker_timeout_or_crash
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Value-pattern construction**: If a difference IS reachable,
+construct one concrete numerical pattern (e.g., one specific tensor value
+distribution) that triggers the divergence within the fixed shapes.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P95__sync_remove__1",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P95",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4667,
+        "completion_tokens": 3546,
+        "total_tokens": 8213,
+        "reasoning_tokens": 1777
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Reduction loop has 8 iterations (stride=128,64,32,16,8,4,2,1). Without __syncthreads(), threads in iteration N+1 may read shared[tid+stride] before threads from iteration N have written to those locations. With 16 blocks × 256 threads, race conditions cause incorrect partial sums propagating to final atomicAdd.",
+      "survival_reason": "The mutant cannot survive because __syncthreads() inside a parallel reduction loop is essential for correctness. Each reduction iteration depends on the results of the previous iteration being fully written to shared memory. Without the barrier, warp scheduling determines whether reads happen before or after writes, leading to non-deterministic corruption of the sum. Layer 2 testing already found divergence with seed 10002.",
+      "killable": true,
+      "kill_strategy": "Use diverse random logits with moderate magnitudes to ensure per-sample losses vary, maximizing the impact of incorrect partial sums during the racy reduction. The seed 10002 already demonstrated divergence.",
+      "recommendations": "Always include __syncthreads() inside reduction loops when threads depend on results written by other threads in previous iterations. Mutation testing should flag any removal of synchronization primitives inside loops over shared memory as high-priority kills.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # Use the seed that showed divergence in EMD Layer 2\n    torch.manual_seed(10002)\n    \n    # Create diverse logits with moderate magnitudes\n    # This ensures varied per-sample losses, making reduction errors visible\n    logits = torch.randn((batch_size, num_classes), dtype=torch.float32, device=device) * 5.0\n    \n    # Random targets spread across all classes\n    targets = torch.randint(0, num_classes, (batch_size,), dtype=torch.int64, device=device)\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4579,
+        "completion_tokens": 4565,
+        "total_tokens": 9144,
+        "reasoning_tokens": 2032
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() inside the reduction loop causes race conditions where threads read stale values from shared memory. With typical cross-entropy loss ~2.0 per sample, missing one sample creates error ~2.0/4096=0.0005, below the 0.01+0.01*2=0.03 tolerance. By maximizing per-sample loss to ~60+, each missed sample creates error ~60/4096≈0.015, and multiple misses exceed tolerance.",
+      "survival_reason": "The previous attempt used random logits with moderate magnitudes (~randn*5.0), producing per-sample losses around 2-5. Even when race conditions caused incorrect reductions, the error per missed sample (loss_value/batch_size) was too small relative to the tolerance threshold. The race condition is real but its numerical effect was masked by the averaging over 4096 samples. We need to amplify per-sample loss values so that even a single reduction error produces a detectable difference in the final mean loss.",
+      "killable": true,
+      "kill_strategy": "Create inputs where every sample has extremely high cross-entropy loss (~60) by making the target class logit very negative while other logits are high. This maximizes the numerical impact of any reduction race condition - missing even 1-2 samples during reduction will cause error > tolerance.",
+      "recommendations": "Parallel reductions with missing __syncthreads() should be tested with high-magnitude values that amplify any numerical errors from race conditions. Standard random inputs often produce values too small to exceed tolerance thresholds when divided by batch size.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # All logits start high (10.0) for all classes\n    logits = torch.full((batch_size, num_classes), 10.0, dtype=torch.float32, device=device)\n    \n    # Target class 0 has very low logit, creating high loss per sample\n    # Loss ≈ -log(softmax[target]) ≈ -(-50 - log(exp(-50) + 9*exp(10))) ≈ 60+\n    logits[:, 0] = -50.0\n    \n    # All samples target class 0\n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4891,
+        "completion_tokens": 4651,
+        "total_tokens": 9542,
+        "reasoning_tokens": 2114
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The missing __syncthreads() in the reduction loop causes a race condition where threads may read stale shared memory values. At stride=128, thread 0 reads shared[128] which should contain the sum of positions 128+256 from previous stride, but may still contain just per_sample_loss[128]. With loss ≈ 300 per sample and potential for 3-5% of reduction contributions being stale/missed, error could reach 9-15 > threshold of ~4.",
+      "survival_reason": "Previous attempts failed because: (1) Round 1 with random values had losses ~2-5 where race errors averaging ~0.05-0.1 were below tolerance 0.03-0.07; (2) Round 2 with loss ~60 still had errors within rtol=1% range. The race condition in parallel reduction is non-deterministic but more likely to manifest with larger accumulated sums. By creating MUCH larger per-sample losses (~300), even a small percentage of values being lost/duplicated in reduction produces absolute errors exceeding the tolerance. Additionally, using a specific pattern where each sample has identical very high loss amplifies any systematic counting error from the race.",
+      "killable": true,
+      "kill_strategy": "Create extremely large uniform per-sample losses (~300 each) so that any reduction race condition causing even 1-2% of partial sums to be lost exceeds the tolerance threshold. With ref ≈ 300, threshold = 0.01 + 0.01*300 = 3.01. If race misses 4096*0.01 = 41 samples worth of contribution, error = 41*300/4096 ≈ 3.0. Need slightly more aggressive values or multiple runs to trigger race.",
+      "recommendations": "Parallel reduction kernels should ALWAYS have __syncthreads() inside the reduction loop when stride > warpSize. Consider using warp-level primitives like __shfl_down_sync for final 32 elements to avoid shared memory races entirely.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # Create extreme loss scenario: target logit = -300, others = 50\n    # loss ≈ -log(exp(-300-LSE)) where LSE ≈ 50 + log(9) ≈ 52.2\n    # loss ≈ -(-300 - 52.2) = 352.2 per sample\n    logits = torch.full((batch_size, num_classes), 50.0, dtype=torch.float32, device=device)\n    logits[:, 0] = -300.0  # Target class gets extreme negative logit\n    \n    # All samples target class 0\n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5277,
+        "completion_tokens": 4793,
+        "total_tokens": 10070,
+        "reasoning_tokens": 2187
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The missing __syncthreads() inside the reduction loop causes a race between warps: threads in one warp may read shared memory before threads in another warp complete their writes. With uniform values, the race rarely produces visible differences because all partial sums are multiples of the same value. With monotonically increasing losses (sample i has loss ≈ 0.1*i), any missed partial sums cause noticeable error. Expected ref ≈ 204.75, threshold = 0.01 + 0.01*204.75 ≈ 2.06. Missing just 1% of sum (~2.05) approaches threshold; missing 2% (~4.1) exceeds it.",
+      "survival_reason": "Previous attempts used uniform loss values (all samples identical). When all values are the same, even with race conditions between warps in the block reduction, intermediate results often converge to the same answer because X+X=2X regardless of timing for uniform X. The race condition manifests when different threads at different reduction stages hold genuinely different values. Random values (Round 1) were tried but the magnitude was too small and the specific distribution didn't expose enough variance in the partial sums. The new strategy uses monotonically increasing losses (loss[i] ≈ 0.1*i) so that every sample contributes a unique amount to the final sum. Any warp-level race that causes partial sums to be lost will produce a measurably different result because the contributions are all different.",
+      "killable": true,
+      "kill_strategy": "Use monotonically increasing per-sample losses (sample i has loss ≈ 0.1*i, ranging from 0 to ~409.5). This ensures that any warp-level race during block reduction that causes partial sums to be missed will result in a measurably smaller final sum. The large range and variance in values maximizes the chance that racing threads read stale data containing significantly different intermediate results.",
+      "recommendations": "When testing parallel reduction kernels for race conditions, avoid uniform input values since races between warps may not produce distinguishable outputs. Instead, use monotonically varying or highly diverse values where each thread's contribution is unique, ensuring any synchronization failure results in measurably different partial sums.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # Create logits where sample i has loss approximately i * 0.1\n    # loss = log(sum(exp(x_j))) - x_target\n    # If x_target = -K and others = 0: loss = log(9 + exp(K)) + K ≈ K for modest K\n    \n    logits = torch.zeros((batch_size, num_classes), dtype=torch.float32, device=device)\n    \n    for i in range(batch_size):\n        K = i * 0.1  # Creates loss ≈ K for sample i\n        logits[i, :] = 0.0  # Non-target classes at 0\n        logits[i, 0] = -K   # Target class at -K\n    \n    # All samples target class 0\n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5673,
+        "completion_tokens": 5773,
+        "total_tokens": 11446,
+        "reasoning_tokens": 2593
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The missing __syncthreads() in the reduction loop can cause threads to read stale values from shared memory at specific positions (e.g., position 192 within each 256-thread block). At stride=128→stride=64 transition, thread 0 may read shared[64] before thread 64 has added shared[192] to it, causing loss[192] to be missed. With 16 blocks, position 192+256*k are all vulnerable. If we make ONLY these positions have high loss (~500) while others have normal loss (~2.3): expected mean≈4.25, if 1 position missed: mean≈4.13, difference=0.12 > threshold(0.0525).",
+      "survival_reason": "Previous attempts used uniform random values, uniform extreme values, or monotonically increasing patterns. None specifically targeted the EXACT array positions that are vulnerable to the race condition in the reduction tree. Position 192 within each 256-thread block (i.e., indices 192, 448, 704, 960, ...) can be missed when stride=64 iteration reads shared[64] before thread 64's stride=128 write propagates. By concentrating extreme loss values ONLY at these vulnerable positions and keeping others minimal, any race condition that causes even one position to be skipped will create a measurable discrepancy exceeding the tolerance.",
+      "killable": true,
+      "kill_strategy": "Place extreme loss values (~500) ONLY at reduction-vulnerable positions (192+256*k for k=0..15) where race conditions in the stride=128→stride=64 transition can skip contributions. All other positions have minimal loss (~2.3). Missing even 1 of 16 vulnerable positions causes error of ~0.12, exceeding threshold ~0.05.",
+      "recommendations": "When testing parallel reduction kernels, design inputs that concentrate critical values at positions vulnerable to race conditions in the reduction tree structure, rather than using uniform or smoothly varying distributions.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # Base logits: all zeros -> loss = log(10) ~ 2.3 per sample\n    logits = torch.zeros((batch_size, num_classes), dtype=torch.float32, device=device)\n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    # Vulnerable positions in reduction: position 192 within each 256-thread block\n    # These can be missed when stride=64 reads shared[64] before stride=128 updates it\n    # Also include other vulnerable positions from later reduction stages\n    vulnerable_offsets = [192, 96, 48, 24, 12, 6, 3]\n    \n    for k in range(16):  # 16 blocks\n        for offset in vulnerable_offsets:\n            idx = k * 256 + offset\n            if idx < batch_size:\n                # Make target logit very negative -> very high loss (~500)\n                logits[idx, 0] = -500.0\n    \n    # Expected: ~4.25 mean loss\n    # If even 1 position missed: ~4.13 mean loss  \n    # Difference 0.12 > threshold 0.05\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 447.45
+}

@@ -1,0 +1,46 @@
+{
+  "mutant_id": "L1_P37__index_replace__11",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P37",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4103,
+        "completion_tokens": 5672,
+        "total_tokens": 9775,
+        "reasoning_tokens": 2133
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With 1D kernel launch, gridDim.z=1 vs gridDim.x=1024. Stride changes from 1,048,576 to 1024. Elements at index j≥1024 are overcounted by factor min(j//1024+1, 1024). For j≥1023*1024, overcounting=1024×, making norm 32× too large, outputs 32× too small.",
+      "survival_reason": "The mutation substitutes gridDim.z (which equals 1 for 1D launch) for gridDim.x (which equals 1024). This reduces the stride from 1,048,576 to 1024, causing high-index elements to be processed by multiple blocks during the reduction phase. The overcounting inflates the squared sum, leading to an incorrect (too large) Frobenius norm, and consequently, normalized outputs that are too small. With uniform dense inputs, the normalized values are already ~0.000122, and 32× reduction still falls under atol=0.01. However, sparse inputs with non-zero values at high indices produce reference outputs near ±1.0, and the mutant produces values near ±0.03, creating a large detectable difference.",
+      "killable": true,
+      "kill_strategy": "Use a sparse input tensor where a single element at a high index (near the end of flattened array) has a non-zero value. This element will be overcounted by all 1024 blocks, inflating the norm by factor of 32, causing output to be 32× smaller than expected, creating a ~0.97 absolute difference.",
+      "recommendations": "When testing CUDA kernels with dimension index substitutions (x↔y↔z), always test with sparse inputs where non-zero values are placed at various positions (beginning, middle, end) to detect stride calculation errors that cause overcounting or undercounting.",
+      "suggested_code": "def generate_inputs(device):\n    # Create sparse tensor with single element at high index\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    # Last element at flattened index 67,108,863 will be counted 1024 times\n    x[15, 63, 255, 255] = 1.0\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=9.687500e-01, mean_diff=1.443550e-08, ref_range=[0.0000e+00,1.0000e+00], mut_range=[0.0000e+00,3.1250e-02]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 1,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Use a sparse input tensor where a single element at a high index (near the end of flattened array) has a non-zero value. This element will be overcounted by all 1024 blocks, inflating the norm by factor of 32, causing output to be 32× smaller than expected, creating a ~0.97 absolute difference.",
+    "suggested_code": "def generate_inputs(device):\n    # Create sparse tensor with single element at high index\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    # Last element at flattened index 67,108,863 will be counted 1024 times\n    x[15, 63, 255, 255] = 1.0\n    return [x]"
+  },
+  "elapsed_sec": 129.78
+}

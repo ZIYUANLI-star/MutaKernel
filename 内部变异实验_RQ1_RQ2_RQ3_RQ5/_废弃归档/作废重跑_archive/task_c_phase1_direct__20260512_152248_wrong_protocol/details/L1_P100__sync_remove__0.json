@@ -1,0 +1,48 @@
+{
+  "mutant_id": "L1_P100__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P100",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4228,
+        "completion_tokens": 3518,
+        "total_tokens": 7746,
+        "reasoning_tokens": 1379
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Input size=128, block_size=256, num_blocks=1. Threads 0-127 compute valid hinge loss values; threads 128-255 write 0.0f (since idx >= size). First reduction iteration (stride=128): threads 0-127 read shared_mem[tid+128], i.e., positions 128-255. Without the removed __syncthreads(), threads 0-127 might read shared_mem[128-255] before threads 128-255 have written 0.0f, potentially reading uninitialized garbage. This is a classic producer-consumer race condition.",
+      "survival_reason": "The removed __syncthreads() creates a race condition between threads writing to shared memory and threads reading during the first reduction iteration. However, this race is timing-dependent, not value-dependent. Threads 128-255 always write 0.0f regardless of input values. The race manifests only if thread scheduling causes reads before writes complete across different warps. Modern GPU warp schedulers often execute instructions in a consistent order for small kernels, which likely explains why 112 differential tests passed. The bug is theoretically killable but requires specific hardware timing conditions that cannot be controlled through input values alone.",
+      "killable": true,
+      "kill_strategy": "Design inputs where threads 0-127 compute large, distinctive hinge loss values. If the race condition triggers and garbage is read from uninitialized shared_mem[128-255], the sum will differ noticeably from the expected result. Run the test multiple times since race conditions are non-deterministic. Use extreme values to maximize the observable error if garbage is read.",
+      "recommendations": "Race condition bugs from missing __syncthreads() are notoriously difficult to catch through value-level testing alone since they depend on hardware scheduling. Mutation testing frameworks should consider: (1) static analysis to flag missing synchronization barriers in producer-consumer patterns, (2) running suspected race condition tests hundreds of times with slight kernel modifications (extra computation) to perturb timing, (3) using CUDA race detection tools like compute-sanitizer with --tool racecheck.",
+      "suggested_code": "def generate_inputs(device):\n    # predictions * targets = -10.0, so margin = 1 - (-10) = 11.0\n    # All 128 threads write 11.0 to shared_mem[0-127]\n    # Threads 128-255 should write 0.0 to shared_mem[128-255]\n    # If race triggers, garbage read from [128-255] would cause large error\n    predictions = torch.full((128, 1), 10.0, dtype=torch.float32, device=device)\n    targets = torch.full((128, 1), -1.0, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "error": "Bedrock invoke_model failed in 309430 ms: Read timeout on endpoint URL: \"https://bedrock-runtime.us-west-2.amazonaws.com/model/us.anthropic.claude-opus-4-5-20251101-v1%3A0/invoke\"",
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 446.3
+}

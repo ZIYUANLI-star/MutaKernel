@@ -1,0 +1,143 @@
+{
+  "mutant_id": "L2_P41__const_perturb__6",
+  "operator_name": "const_perturb",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8426,
+        "completion_tokens": 4073,
+        "total_tokens": 12499,
+        "reasoning_tokens": 1510
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "GELU coefficient changed from 0.044715 to 0.44716 (10x increase). For x=1: original GELU≈0.8415, mutated GELU≈0.9095, difference≈0.068. Tolerance at ref=0.84 is atol+rtol*|ref|≈0.018. Difference (0.068) >> threshold (0.018).",
+      "survival_reason": "The mutation was not detected in earlier layers because Layer 2 only ran 1 round with seed 10000 and EMD found divergence but marked as 'possibly killable'. The 10x coefficient change systematically affects all GELU computations. Even after GroupNorm normalization and mean reduction, the accumulated differences from the incorrect GELU approximation will propagate to the final output exceeding the tolerance threshold.",
+      "killable": true,
+      "kill_strategy": "Use input values that produce moderate GEMM outputs (magnitude ~1-3) where GELU coefficient difference has maximum impact. Uniform positive inputs will create systematic GELU differences that accumulate through GroupNorm and mean operations.",
+      "recommendations": "When mutating floating-point constants in activation functions, even small changes can cause significant divergence. Mutation testing should include numerical analysis of the expected output difference magnitude versus tolerance thresholds to prioritize killable mutants.",
+      "suggested_code": "def generate_inputs(device):\n    # Uniform inputs with magnitude ~1 to produce GEMM outputs where GELU difference is significant\n    # Using positive values for consistency through the network\n    x = torch.ones(128, 512, device=device) * 1.5\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8245,
+        "completion_tokens": 4586,
+        "total_tokens": 12831,
+        "reasoning_tokens": 1961
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes GELU coefficient from 0.044715 to 0.44716 (10x). For x=1, GELU difference ≈0.068. For x=-1, difference ≈0.068 but in opposite direction. With uniform inputs, GEMM produces similar-magnitude outputs, GroupNorm normalizes within groups, masking systematic shifts. Need varied-sign inputs to create non-canceling GELU errors that survive GroupNorm.",
+      "survival_reason": "Previous attempt used uniform positive inputs (all 1.5), which creates GEMM outputs with random distribution. However, the GELU errors for similar-magnitude values are systematic across all channels. GroupNorm normalizes within each group, removing this systematic shift since (val - mean)/std preserves relationships when all values shift similarly. After GroupNorm with default weight=1, bias=0, channel means approach 0. The new strategy uses high-variance inputs with alternating positive/negative patterns to create GELU inputs spanning positive and negative ranges, where GELU(x) and GELU(-x) have different error characteristics that don't cancel under normalization.",
+      "killable": true,
+      "kill_strategy": "Use alternating high-magnitude positive/negative input values to create varied GELU input magnitudes and signs. GELU error for positive x and negative x have different relationships to the output value, so GroupNorm cannot normalize away the changed distribution shape, causing detectable mean difference after ReLU.",
+      "recommendations": "When testing GELU or other nonlinear activation mutations, ensure test inputs span both positive and negative ranges with significant variance, as normalization layers can mask systematic shifts but struggle to hide distribution shape changes caused by asymmetric error patterns.",
+      "suggested_code": "def generate_inputs(device):\n    # Alternating positive/negative values create varied GELU inputs\n    # GELU(+x) and GELU(-x) have different error characteristics under the mutation\n    # This prevents GroupNorm from canceling out errors uniformly\n    x = torch.zeros(128, 512, device=device)\n    x[:, ::2] = 2.0    # Even indices: positive\n    x[:, 1::2] = -2.0  # Odd indices: negative\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8486,
+        "completion_tokens": 7260,
+        "total_tokens": 15746,
+        "reasoning_tokens": 3205
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "At x=1.5: original GELU≈1.40, mutant≈1.49 (diff=0.09). At x=2: original≈1.95, mutant≈2.0. The 10x coefficient change causes mutant to saturate earlier. Variance differences within GroupNorm groups cannot be fully normalized away, propagating to final mean differences.",
+      "survival_reason": "Previous attempts used uniform or symmetric alternating patterns that produced near-zero mean GEMM outputs. After GroupNorm (which normalizes to mean 0 per group), the channel mean approached 0 for both versions, giving ReLU(0)=0. Random inputs with appropriate magnitude create varied GELU inputs where coefficient difference causes variance distortion. Different random values across channels hit different points on the GELU curve, and the distorted variance from the mutant's earlier saturation behavior creates normalized values that don't perfectly cancel to zero mean.",
+      "killable": true,
+      "kill_strategy": "Use seeded random inputs with magnitude ~2-3 to create diverse GELU inputs where coefficient difference maximizes variance distortion across group channels, preventing complete cancellation through GroupNorm normalization.",
+      "recommendations": "When testing GELU implementations, focus on inputs in the range [1, 3] where the tanh component transitions from linear to saturated behavior - this is where coefficient changes have maximum impact on output values.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(98765)\n    # Random values with std ~2.5 to produce varied GELU inputs\n    # targeting the regime where original is not saturated but mutant is\n    x = torch.randn(128, 512, device=device) * 2.5\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8662,
+        "completion_tokens": 6145,
+        "total_tokens": 14807,
+        "reasoning_tokens": 2756
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The GELU coefficient mutation (0.044715 → 0.44716) changes outputs in the [-2,2] input range, but GroupNorm with default weight=1,bias=0 normalizes each group to mean=0. The subsequent mean across ALL channels thus approaches 0, and ReLU(~0)=0 for both kernels. The mutation's effect is erased by GroupNorm's zero-centering before it can propagate to detectable output differences.",
+      "survival_reason": "Previous attempts failed because GroupNorm with default parameters (weight_gn=1, bias_gn=0) forces each group's output to have zero mean. When we then compute the mean across all 256 channels, we get approximately 0 regardless of the GELU transformation applied. Round 1 (uniform inputs), Round 2 (alternating pattern), and Round 3 (random inputs) all produced post-GroupNorm outputs with ~zero mean, causing ReLU to output ~0 for both original and mutant. The mutation's effect on GELU's nonlinearity is completely neutralized by GroupNorm's normalization. To kill this mutant, we need inputs that create numerical instability or extreme variance ratios between groups that GroupNorm amplifies through the rsqrtf operation.",
+      "killable": true,
+      "kill_strategy": "Create inputs where some GELU outputs produce near-zero variance within a group (forcing rsqrtf to amplify tiny differences), while others have moderate variance. Use very small magnitude inputs (~0.001) mixed with moderate inputs (~1.0) in patterns that align with group boundaries, causing different numerical precision behavior in the inv_std calculation between original and mutant.",
+      "recommendations": "When testing kernels with normalization layers (GroupNorm, LayerNorm, BatchNorm) followed by mean reduction, verify that the test framework modifies normalization parameters (weights/biases) to non-default values, preventing zero-centered outputs that mask upstream computation differences.",
+      "suggested_code": "def generate_inputs(device):\n    # Create pattern where groups have vastly different variances\n    # Near-zero inputs produce GELU outputs close to 0\n    # Moderate inputs produce GELU outputs where mutation matters\n    x = torch.zeros(128, 512, device=device)\n    \n    # Seed for reproducibility\n    torch.manual_seed(42424)\n    \n    # Create bimodal pattern: small values and moderate values\n    # Small values (~0) after GEMM produce GELU ~0 (low variance)\n    # This creates near-singular GroupNorm situations\n    for i in range(128):\n        # Alternate rows: some with near-zero, some with moderate\n        if i % 4 == 0:\n            x[i, :] = 0.0001  # Near zero - creates low variance GELU outputs\n        elif i % 4 == 1:\n            x[i, :] = torch.randn(512, device=device) * 0.001  # Tiny noise\n        elif i % 4 == 2:\n            x[i, :] = 1.2  # Moderate positive - in GELU transition zone\n        else:\n            x[i, :] = -1.2  # Moderate negative - different GELU regime\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9109,
+        "completion_tokens": 6372,
+        "total_tokens": 15481,
+        "reasoning_tokens": 2865
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "GroupNorm normalizes each group to mean=0. Sum of (x_i - mean)/std over any group = 0. Total channel sum = 0. Mean = 0. ReLU(0) = 0. Output identical regardless of GELU coefficient. Float precision errors ~1e-7 << atol 1e-2.",
+      "survival_reason": "Previous attempts used various input magnitudes (constant, alternating, random) hoping to create detectable GELU differences. All failed because the GroupNorm mathematically guarantees each group sums to exactly 0 after normalization. With weight_gn=1, bias_gn=0 (fixed initialization), the mean across all channels is identically 0. ReLU(0)=0 for both original and mutant. The 10x GELU coefficient change creates real intermediate differences, but these are completely annihilated by the normalization architecture before reaching the output. No value-only input can circumvent this mathematical property.",
+      "killable": false,
+      "kill_strategy": "Unkillable with value-only changes. The GroupNorm + Mean architecture mathematically normalizes away any GELU differences. Would require modifying model parameters (weight_gn or bias_gn to non-uniform values) or architecture changes to expose the GELU difference at the output.",
+      "recommendations": "When testing activation function mutations, ensure the downstream architecture doesn't contain normalization layers that could mathematically cancel the infected values. GroupNorm followed by mean reduction is particularly problematic as it guarantees zero output regardless of activation differences. Consider testing intermediate outputs or using architectures where activation differences propagate to final output.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 732.33
+}

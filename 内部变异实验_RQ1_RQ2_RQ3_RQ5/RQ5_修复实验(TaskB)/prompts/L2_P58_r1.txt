@@ -1,0 +1,289 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D transposed convolution, LogSumExp, HardSwish, subtraction, clamp, and maximum operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = torch.logsumexp(x, dim=1, keepdim=True)
+        x = x * torch.sigmoid(x + 3) / 6
+        x = x - self.bias
+        x = torch.clamp(x, min=-1, max=1)
+        x = torch.max(x, dim=1, keepdim=True)[0]
+        return x
+
+batch_size = 128
+in_channels = 3
+out_channels = 16
+depth, height, width = 16, 32, 32
+kernel_size = 3
+stride = 2
+padding = 1
+bias_shape = (out_channels, 1, 1, 1)
+
+def get_inputs():
+    return [torch.randn(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, bias_shape]
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define fused kernel for LogSumExp + HardSwish + bias subtraction + clamp + max reduction
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__device__ __forceinline__ T sigmoid_approx(T x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+
+__global__ void fused_ops_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width,
+    int spatial_size
+) {
+    // Each thread handles one spatial position across all channels
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (spatial_idx >= spatial_size) return;
+    
+    int batch_idx = blockIdx.y;
+    int total_spatial = depth * height * width;
+    
+    // Calculate base indices
+    int base_input_idx = (batch_idx * channels) * spatial_size + spatial_idx;
+    int base_output_idx = batch_idx * spatial_size + spatial_idx;
+    
+    // Shared memory for reduction
+    extern __shared__ float shared_mem[];
+    float* channel_vals = shared_mem;
+    
+    // Load all channel values for this spatial position
+    for (int c = threadIdx.y; c < channels; c += blockDim.y) {
+        if (spatial_idx < spatial_size) {
+            int input_idx = base_input_idx + c * spatial_size;
+            channel_vals[c] = input[input_idx];
+        }
+    }
+    __syncthreads();
+    
+    // Thread 0 of each warp performs LogSumExp reduction
+    if (threadIdx.y == 0) {
+        // Find max value
+        float max_val = -INFINITY;
+        for (int c = 0; c < channels; c++) {
+            if (channel_vals[c] > max_val) {
+                max_val = channel_vals[c];
+            }
+        }
+        
+        // Sum exponentials
+        float sum_exp = 0.0f;
+        for (int c = 0; c < channels; c++) {
+            sum_exp += __expf(channel_vals[c] - max_val);
+        }
+        
+        float logsumexp_result = __logf(sum_exp) + max_val;
+        
+        // HardSwish: x * sigmoid(x + 3) / 6
+        float swish_input = logsumexp_result + 3.0f;
+        float sigmoid_val = sigmoid_approx(swish_input);
+        float hardswish_result = logsumexp_result * sigmoid_val / 6.0f;
+        
+        // Subtract bias (using first channel's bias since we're reducing across channels)
+        float biased_result = hardswish_result - bias[0];
+        
+        // Clamp between -1 and 1
+        float clamped_result = fminf(fmaxf(biased_result, -1.0f), 1.0f);
+        
+        // Find max across channels for final output
+        float max_final = -INFINITY;
+        for (int c = 0; c < channels; c++) {
+            // Apply same operations to each channel for max reduction
+            float channel_val = channel_vals[c];
+            float swish_channel = channel_val + 3.0f;
+            float sigmoid_channel = sigmoid_approx(swish_channel);
+            float hardswish_channel = channel_val * sigmoid_channel / 6.0f;
+            float biased_channel = hardswish_channel - bias[c];
+            float clamped_channel = fminf(fmaxf(biased_channel, -1.0f), 1.0f);
+            
+            if (clamped_channel > max_final) {
+                max_final = clamped_channel;
+            }
+        }
+        
+        output[base_output_idx] = max_final;
+    }
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias) {
+    auto sizes = input.sizes();
+    int batch_size = sizes[0];
+    int channels = sizes[1];
+    int depth = sizes[2];
+    int height = sizes[3];
+    int width = sizes[4];
+    int spatial_size = depth * height * width;
+    
+    // Output tensor: [batch_size, 1, depth, height, width]
+    auto output = torch::empty({batch_size, 1, depth, height, width}, 
+                               torch::device(torch::kCUDA).dtype(torch::kFloat32));
+    
+    // Optimized thread block configuration
+    dim3 block_size(256, 1);  // x: spatial, y: channels
+    dim3 grid_size((spatial_size + block_size.x - 1) / block_size.x, batch_size);
+    
+    // Calculate shared memory size
+    int shared_mem_size = channels * sizeof(float);
+    
+    fused_ops_kernel<<<grid_size, block_size, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        depth,
+        height,
+        width,
+        spatial_size
+    );
+    
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias);"
+
+# Compile the fused CUDA kernel
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-ffast-math"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fully fused CUDA kernel for all operations after conv transpose.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_ops.fused_ops_cuda(x, self.bias)
+        return x
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 15)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=mixed_extremes, seed=42, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[2] policy=mixed_extremes, seed=44, mode=eval_value:
+      max_diff=1.764920e-01, mean_diff=1.314658e-06, ref_range=[8.2351e-01,1.0000e+00], orig_range=[9.2272e-01,1.0000e+00]
+[3] policy=near_overflow, seed=50, mode=eval_value:
+      max_diff=1.218604e-01, mean_diff=3.559325e-07, ref_range=[8.7814e-01,1.0000e+00], orig_range=[1.0000e+00,1.0000e+00]
+[4] policy=alternating_sign, seed=57, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[5] policy=mixed_extremes, seed=46, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[6] policy=dense_nonzero, seed=49, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[7] policy=denormals, seed=57, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[8] policy=mixed_extremes, seed=57, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[9] policy=all_negative, seed=42, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[10] policy=sparse_extreme, seed=42, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[11] policy=all_positive, seed=49, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[12] policy=uniform_constant, seed=57, mode=eval_value:
+      (no diff_summary captured; the kernel deviated from the reference by more than atol/rtol)
+[13] policy=tail_heavy, seed=65, mode=eval_value:
+      max_diff=9.855336e-02, mean_diff=7.338414e-02, ref_range=[9.0365e-01,1.0000e+00], orig_range=[9.0145e-01,1.0000e+00]
+[14] policy=large_magnitude, seed=342, mode=train_value:
+      max_diff=3.404173e-01, mean_diff=5.496665e-06, ref_range=[6.5958e-01,1.0000e+00], orig_range=[8.8217e-01,1.0000e+00]
+[15] policy=all_negative, seed=342, mode=train_value:
+      max_diff=3.773149e-01, mean_diff=3.613600e-03, ref_range=[7.6434e-01,1.0000e+00], orig_range=[6.2269e-01,1.0000e+00]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

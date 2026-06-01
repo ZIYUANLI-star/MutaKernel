@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P97__sync_remove__1",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P97",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5532,
+        "completion_tokens": 4225,
+        "total_tokens": 9757,
+        "reasoning_tokens": 1654
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Reduction loop iterates stride={128,64,32}. Thread 64 writes to shared_dot[64] at stride=128. Thread 0 reads shared_dot[64] at stride=64. Without __syncthreads(), thread 0 may read before thread 64's write completes, missing data from threads 64-127's contributions (which include data from threads 128-255).",
+      "survival_reason": "The mutant removes synchronization inside the parallel reduction loop. This creates a race condition where threads reading shared memory in iteration N may see stale values from iteration N-1. Specifically, when stride=64, threads 0-63 need the updated values from threads 64-127's writes in the stride=128 iteration. Without the barrier, the read-after-write dependency is violated, causing partial sums to be lost. The error compounds through the reduction, producing incorrect dot products and norms.",
+      "killable": true,
+      "kill_strategy": "Use random values with seed 10000 (already shown to cause divergence in Layer 2). Random values ensure different threads have different partial sums, making any reduction ordering bug produce noticeably wrong results. The race condition causes non-deterministic but consistently wrong final values.",
+      "recommendations": "Always include __syncthreads() inside parallel reduction loops when different iterations have read-after-write dependencies on shared memory. Mutation testing should flag any synchronization removal in reduction patterns as high-priority killable mutations.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10000)\n    predictions = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5368,
+        "completion_tokens": 4893,
+        "total_tokens": 10261,
+        "reasoning_tokens": 2196
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() inside the reduction loop (strides 128→64→32) creates a race where thread i might read shared_dot[i+stride] before the thread that updates it (in the previous iteration) has finished. With random values, partial errors may average out within the 1% tolerance across 128 batch elements. With structured sparse inputs where only threads 128-255 have non-zero contributions (positions 512-1023), a race at stride=128 or 64 would cause thread 0 to miss entire contributions, yielding loss≈1.0 vs expected loss≈0.0.",
+      "survival_reason": "The random input test failed because: (1) race conditions are timing-dependent and may not manifest every run, (2) with Gaussian random values, partial reduction errors get diluted when summed across 4096 features and averaged over 128 batches, keeping the final error within 1% tolerance. The structured approach concentrates ALL signal in positions processed by threads 128-255 (indices 512-1023), meaning if the race causes thread 0 to read stale zeros instead of accumulated sums from threads 128-255, the entire dot product/norms will be wrong, producing loss=1.0 instead of loss≈0.0—a 100% error that cannot be within tolerance.",
+      "killable": true,
+      "kill_strategy": "Create sparse inputs where ONLY positions 512-1023 (processed by threads 128-255 in first iteration) have non-zero values. This maximizes the race impact: correct reduction yields dot_product=large, cosine=1.0, loss=0.0; buggy reduction missing threads 128-255 contributions yields dot_product≈0, loss≈1.0. The difference is ~1.0, far exceeding atol+rtol*|ref|≈0.01.",
+      "recommendations": "For parallel reduction kernels with shared memory, test with structured sparse inputs that isolate contributions to specific thread groups. This exposes inter-warp synchronization bugs that random inputs may miss due to error averaging and non-deterministic timing.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    # Concentrate all signal in positions 512-1023 (processed by threads 128-255)\n    # Use varying scales across batch to increase chance of race manifesting\n    for b in range(128):\n        scale = 5.0 + b * 0.1  # 5.0 to 17.7 - large enough to dominate\n        predictions[b, 512:1024] = scale\n        targets[b, 512:1024] = scale\n    \n    # Add tiny noise to positions 0-511 (threads 0-127) to avoid exact zero\n    # This ensures the race difference is the ONLY source of divergence\n    predictions[:, 0:512] = 1e-6\n    targets[:, 0:512] = 1e-6\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.052164e-01, mean_diff=1.052164e-01, ref_range=[1.7695e-08,1.7695e-08], mut_range=[-1.0522e-01,-1.0522e-01]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Create sparse inputs where ONLY positions 512-1023 (processed by threads 128-255 in first iteration) have non-zero values. This maximizes the race impact: correct reduction yields dot_product=large, cosine=1.0, loss=0.0; buggy reduction missing threads 128-255 contributions yields dot_product≈0, loss≈1.0. The difference is ~1.0, far exceeding atol+rtol*|ref|≈0.01.",
+    "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    # Concentrate all signal in positions 512-1023 (processed by threads 128-255)\n    # Use varying scales across batch to increase chance of race manifesting\n    for b in range(128):\n        scale = 5.0 + b * 0.1  # 5.0 to 17.7 - large enough to dominate\n        predictions[b, 512:1024] = scale\n        targets[b, 512:1024] = scale\n    \n    # Add tiny noise to positions 0-511 (threads 0-127) to avoid exact zero\n    # This ensures the race difference is the ONLY source of divergence\n    predictions[:, 0:512] = 1e-6\n    targets[:, 0:512] = 1e-6\n    \n    return [predictions, targets]"
+  },
+  "elapsed_sec": 193.57
+}

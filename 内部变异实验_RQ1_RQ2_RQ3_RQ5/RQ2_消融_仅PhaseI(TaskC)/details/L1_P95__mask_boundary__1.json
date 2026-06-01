@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P95__mask_boundary__1",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P95",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4685,
+        "completion_tokens": 3897,
+        "total_tokens": 8582,
+        "reasoning_tokens": 1505
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "batch_size=4096, threads_per_block=256, num_blocks=(4096+255)/256=17 (integer division: 4351/256=17). Total threads=17*256=4352, so idx ranges 0-4351. Original guard 'idx >= 4096' stops thread idx=4096. Mutated guard 'idx >= 4097' allows idx=4096 to execute, causing out-of-bounds access: targets[4096], logits[40960:40970], and write to loss[4096] (all beyond allocated memory).",
+      "survival_reason": "The mutation changes the boundary check from 'idx >= batch_size' to 'idx >= batch_size + 1'. With batch_size=4096 and the ceiling division formula for num_blocks, exactly 4352 threads are launched (indices 0-4351). The thread with idx=4096 is supposed to return early in the original code, but the mutated code allows it to proceed. This causes out-of-bounds reads from targets[4096] and logits[40960..40969], and an out-of-bounds write to loss[4096]. This memory corruption can affect the final_loss tensor if allocated adjacently, leading to incorrect results. The divergence is non-deterministic based on memory layout but reliably triggers on most runs.",
+      "killable": true,
+      "kill_strategy": "Use any valid input values - the bug is structural, not value-dependent. The off-by-one error causes thread idx=4096 to execute when it shouldn't, leading to out-of-bounds memory access. Using seed 10004 which EMD identified as divergent should reliably reproduce the issue.",
+      "recommendations": "When writing boundary guards for GPU kernels, always verify the guard condition against the actual thread count calculation (ceiling division). The pattern 'num_blocks = (N + threads - 1) / threads' produces ceil(N/threads) blocks, meaning up to 'threads-1' extra threads may be launched. Mutation testing should specifically target these off-by-one boundary conditions.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10004)  # Seed that found divergence in EMD\n    predictions = torch.randn(4096, 10, dtype=torch.float32, device=device)\n    targets = torch.randint(0, 10, (4096,), dtype=torch.int64, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4545,
+        "completion_tokens": 3829,
+        "total_tokens": 8374,
+        "reasoning_tokens": 1467
+      },
+      "reason_category": "predicate_unreachable",
+      "proof_sketch": "With batch_size=4096 and threads_per_block=256: num_blocks = ceil(4096/256) = 16 blocks. Total threads launched = 16 * 256 = 4096 threads with indices 0-4095. Thread idx=4096 is NEVER launched. The mutation changes guard from `idx >= 4096` to `idx >= 4097`, but since max idx is 4095, both guards evaluate to false for all launched threads. The mutated code path is unreachable.",
+      "survival_reason": "The previous attempt failed because it assumed thread idx=4096 would be launched and execute differently. However, the kernel launch configuration computes num_blocks = (4096 + 255) / 256 = 16 blocks, launching exactly 4096 threads (indices 0-4095). Since batch_size=4096 is exactly divisible by threads_per_block=256, no extra threads are launched beyond what's needed. The mutated guard `idx >= batch_size + 1` vs original `idx >= batch_size` only differs for thread idx=4096, which never exists. Both kernels process exactly threads 0-4095 identically, making the mutation semantically equivalent for this fixed input shape.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable with the fixed batch_size=4096. The mutation only affects thread idx=4096, but with batch_size being exactly divisible by threads_per_block (256), only threads 0-4095 are launched. To kill this mutant would require batch_size that is NOT a multiple of 256, which would launch extra threads where the boundary check matters. Since shape changes are forbidden, no value-level input can expose this mutation.",
+      "recommendations": "When testing boundary condition mutations in GPU kernels, verify that the mutated boundary is actually reachable given the thread launch configuration. For mutations affecting guards like `idx >= N`, ensure test cases include batch sizes that are NOT perfectly aligned with the block size, so extra threads are launched and the guard is actually exercised. Consider adding mutation-aware test cases with batch_size = 255, 257, 4095, 4097 etc.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 159.88
+}

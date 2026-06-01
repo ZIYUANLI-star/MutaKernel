@@ -1,0 +1,116 @@
+{
+  "mutant_id": "L1_P23__const_perturb__3",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P23",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4834,
+        "completion_tokens": 4256,
+        "total_tokens": 9090,
+        "reasoning_tokens": 1961
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Input has dim=2, so original takes custom CUDA kernel path (dim==2 is True), mutant takes PyTorch fallback (dim==1 is False). Different implementations produce different floating-point accumulation patterns in parallel reductions.",
+      "survival_reason": "The mutation changes the conditional from dim==2 to dim==1. Since the input tensor has shape [16, 16384] with dim=2, the original code executes the custom CUDA kernel while the mutant executes torch.softmax(). Both implementations compute valid softmax but use different parallel reduction strategies that accumulate floating-point errors differently, especially across 16384 features with 256 threads each handling 64 elements before reduction.",
+      "killable": true,
+      "kill_strategy": "Use random values with moderate magnitude and high variance to maximize accumulated floating-point differences between the custom CUDA kernel's parallel reduction and PyTorch's softmax implementation. The seed 10000 was already identified by EMD as producing divergence.",
+      "recommendations": "When testing code paths that switch between custom kernels and library implementations, use differential testing with various random seeds and value distributions to detect subtle numerical differences from different reduction orderings.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10000)\n    # Moderate magnitude random values to stress accumulation differences\n    x = torch.randn(16, 16384, device=device, dtype=torch.float32) * 5.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4653,
+        "completion_tokens": 4620,
+        "total_tokens": 9273,
+        "reasoning_tokens": 2225
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes `x.dim() == 2` to `x.dim() == 1`. For 2D input, original uses custom CUDA kernel while mutant uses PyTorch's torch.softmax(). Both implement the same softmax function correctly. With atol=1e-2, rtol=1e-2, allowed error is ~2% for outputs in [0,1]. Previous random values (scale=5.0) produced differences within tolerance.",
+      "survival_reason": "The previous attempt with scale=5.0 random values failed because both the custom CUDA kernel and PyTorch's native softmax implement numerically-stable softmax correctly, producing outputs that differ by less than the 2% tolerance threshold. The custom kernel uses the same max-subtraction trick for stability that PyTorch uses. Random values at moderate scale don't stress the implementations enough to produce divergent results. To kill this mutant, we need values that cause different numerical edge cases between the two implementations - specifically, extreme magnitudes that may cause overflow/underflow handled differently, or values that accumulate differently in parallel vs serial reduction.",
+      "killable": true,
+      "kill_strategy": "Use extreme magnitude values (scale ~500-1000) to create overflow conditions where exp() might produce inf in edge cases, or where the parallel reduction accumulation differs from serial accumulation due to catastrophic cancellation in intermediate sums. Values that span a huge range will stress numerical precision limits differently between implementations.",
+      "recommendations": "When testing softmax implementations for equivalence, include edge cases with extreme value ranges (causing underflow/overflow), structured patterns (like nearly-uniform distributions), and values that stress parallel reduction ordering. The loose tolerance of 1e-2 makes numerical equivalence testing challenging - consider tighter tolerances for critical numerical kernels.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    # Extreme magnitude to cause overflow/underflow edge cases\n    # This creates values in roughly [-1500, +1500] range\n    # After max subtraction, exp() of very negative values underflows differently\n    x = torch.randn(16, 16384, device=device, dtype=torch.float32) * 500.0\n    # Add some specific extreme values to stress edge cases\n    x[0, 0] = 1000.0  # Force a known max\n    x[0, 1] = -1000.0  # Force extreme underflow\n    x[0, 2] = 999.99  # Near-max value for precision stress\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4948,
+        "completion_tokens": 5005,
+        "total_tokens": 9953,
+        "reasoning_tokens": 2082
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation changes `x.dim() == 2` to `x.dim() == 1`. For 2D inputs (shape [16, 16384]), the original uses the custom CUDA kernel while the mutant falls back to `torch.softmax(x, dim=1)`. Both compute mathematically equivalent softmax with similar numerical stability, keeping differences well within atol=1e-2, rtol=1e-2 tolerance for normal inputs. However, NaN handling differs: CUDA's `fmaxf` ignores NaN in max reduction while PyTorch propagates NaN differently.",
+      "survival_reason": "Previous attempts used normal floating-point values (random with scale 5.0 and 500.0) where both implementations compute numerically stable softmax with differences only at float32 precision (~1e-7), far below the 1e-2 tolerance. The extreme magnitude test (scale 500.0) didn't help because the max-subtraction makes all exp() arguments reasonable. Neither test exploited the key behavioral difference: how NaN values are handled during the max-finding reduction. CUDA's `fmaxf(-INFINITY, NaN)` returns -INFINITY (ignores NaN), potentially computing a valid max from non-NaN elements, while PyTorch's softmax may propagate NaN differently through its max computation, causing divergent behavior in the output structure.",
+      "killable": true,
+      "kill_strategy": "Inject NaN values into the input tensor. The CUDA kernel's use of `fmaxf` will ignore NaN when finding the row maximum, while PyTorch's `torch.softmax` handles NaN differently. This can cause one implementation to produce valid outputs where the other produces NaN, or produce different NaN patterns that fail NaN-aware comparison.",
+      "recommendations": "When testing custom CUDA kernels against reference implementations, always include special floating-point values (NaN, +inf, -inf, denormals) as test inputs. CUDA intrinsics like fmaxf have specific NaN-handling semantics that may differ from PyTorch's behavior, creating subtle behavioral divergences that only manifest with special values.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(12345)\n    x = torch.randn(16, 16384, device=device, dtype=torch.float32)\n    # Insert NaN at specific positions across multiple batch elements\n    x[0, 0] = float('nan')\n    x[1, 100] = float('nan')\n    x[2, 8192] = float('nan')  # Mid-range position\n    # Also try positive infinity which causes inf - inf = nan behavior\n    x[3, 0] = float('inf')\n    x[4, 500] = float('inf')\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5253,
+        "completion_tokens": 4519,
+        "total_tokens": 9772,
+        "reasoning_tokens": 2162
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes `x.dim() == 2` to `x.dim() == 1` in the conditional. For 2D input [16, 16384], original uses custom CUDA kernel while mutant falls back to torch.softmax(x, dim=1). Both compute mathematically identical softmax operations. Floating-point differences from parallel reduction vs PyTorch's implementation are typically at machine epsilon level (~1e-7), far below the 1% tolerance threshold.",
+      "survival_reason": "Round 1 failed because moderate random values produce softmax outputs where both implementations agree within 1%. Round 2 failed because extreme magnitudes still yield well-conditioned softmax after max-subtraction normalization. Round 3 failed because NaN/Inf caused errors in both implementations. The fundamental issue is that both code paths compute identical mathematical operations (softmax along dim=1) with implementation differences only affecting floating-point rounding at ~1e-7 level, well below the atol=1e-2, rtol=1e-2 tolerance. The mutation is semantically equivalent for this input shape.",
+      "killable": false,
+      "kill_strategy": "This mutant appears unkillable with the given tolerance. The mutation causes the mutant to use torch.softmax instead of the custom CUDA kernel for 2D inputs, but both implement the same mathematical operation. Numerical differences from different reduction orders are at machine epsilon level (~1e-7 for float32), far below the 1% tolerance. No value pattern can cause >1% difference between two correct softmax implementations.",
+      "recommendations": "For mutation testing of conditional paths like `x.dim() == N`, consider using tighter numerical tolerances (e.g., atol=1e-5, rtol=1e-5) to catch implementation differences, or design tests specifically around the dimensional check by using tensors that could plausibly be either dimension (though this conflicts with fixed-shape testing).",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 373.06
+}

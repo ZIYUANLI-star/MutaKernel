@@ -1,0 +1,123 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a GEMM, Group Normalization, Minimum operation, and Bias addition.
+    """
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.group_norm = nn.GroupNorm(num_groups, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = self.group_norm(x)
+        x = torch.min(x, dim=1, keepdim=True)[0] 
+        x = x + self.bias
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+num_groups = 512
+bias_shape = (1, out_features, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, num_groups, bias_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_features, out_features, num_groups, bias_shape):
+        super().__init__()
+        # Use the same parameter names as original for state_dict compatibility
+        self.gemm = nn.Module()
+        self.gemm.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.gemm.bias = nn.Parameter(torch.randn(out_features))
+        
+        self.group_norm = nn.Module()
+        self.group_norm.weight = nn.Parameter(torch.randn(out_features))  # gamma in GroupNorm
+        self.group_norm.bias = nn.Parameter(torch.zeros(out_features))   # beta in GroupNorm
+        
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def fused_postprocess(self, x_gemm, gn_weight, gn_bias, bias):
+        # Step 1: GroupNorm
+        x_reshaped = x_gemm.view(1024, 512, 16)
+        mean = x_reshaped.mean(dim=-1, keepdim=True)
+        var = x_reshaped.var(dim=-1, keepdim=True, unbiased=False)
+        inv_std = torch.rsqrt(var + 1e-05)
+        gamma = gn_weight.view(1, 512, 16)
+        beta = gn_bias.view(1, 512, 16)
+        x_normalized = gamma * (x_reshaped - mean) * inv_std + beta
+        x_normalized = x_normalized.view(1024, 8192)
+        
+        # Step 2: Minimum value across dim=1
+        x_min = x_normalized.min(dim=1, keepdim=True)[0]
+        
+        # Step 3: Bias addition (broadcasting)
+        output = x_min + bias
+        
+        return output
+        
+    def forward(self, x):
+        # Enable TensorFloat32 for faster GEMM
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Step 1: GEMM using PyTorch's optimized implementation
+        x_gemm = torch.matmul(x, self.gemm.weight.t()) + self.gemm.bias
+        
+        # Step 2: Fused postprocessing using torch.compile
+        output = self.fused_postprocess(x_gemm, self.group_norm.weight, self.group_norm.bias, self.bias)
+        
+        # Disable TensorFloat32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return output
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 2
+Failing dimensions: dtype_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### dtype_stress (2 failures)
+  - [? seed=60000] 
+  - [? seed=60001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

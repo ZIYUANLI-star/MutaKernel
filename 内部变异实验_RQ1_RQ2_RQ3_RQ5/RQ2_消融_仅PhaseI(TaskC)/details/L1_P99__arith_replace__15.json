@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P99__arith_replace__15",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P99",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5158,
+        "completion_tokens": 4139,
+        "total_tokens": 9297,
+        "reasoning_tokens": 1207
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Original: lane_id < 8 means only lanes 0-7 read valid shared_neg[0-7], others use 0.0f. Mutated: lane_id < 8192 means all 32 lanes read shared_neg[lane_id], but indices 8-31 are uninitialized (never written). This adds garbage to final_neg during warp_reduce_sum, corrupting neg_sqrt and the final loss.",
+      "survival_reason": "The mutation changed the condition from lane_id < (blockDim.x / 32) = lane_id < 8 to lane_id < (blockDim.x * 32) = lane_id < 8192. Since lane_id only ranges 0-31, this causes all 32 lanes to read from shared_neg[lane_id]. However, only shared_neg[0-7] were written by the 8 warp leaders; indices 8-31 contain uninitialized memory. The warp reduction sums these garbage values into final_neg, producing incorrect neg_sqrt and thus incorrect loss values. This affects every batch element's computation.",
+      "killable": true,
+      "kill_strategy": "Use any non-trivial input values. The uninitialized shared memory reads will corrupt the negative distance calculation. Using values where the expected loss is clearly positive makes the corruption more measurable.",
+      "recommendations": "Always initialize shared memory explicitly before use, or ensure the condition guarding reads matches the condition guarding writes. Consider adding bounds checks or static analysis to detect potential uninitialized memory accesses in reduction patterns.",
+      "suggested_code": "def generate_inputs(device):\n    # Anchor at origin, positive far away, negative close\n    # This creates pos_sqrt > neg_sqrt, yielding positive loss\n    anchor = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # positive: distance = sqrt(4096 * 4) = 128\n    positive = torch.full((128, 4096), 2.0, dtype=torch.float32, device=device)\n    # negative: distance = sqrt(4096 * 0.25) = 32\n    negative = torch.full((128, 4096), 0.5, dtype=torch.float32, device=device)\n    # Expected loss = max(0, 128 - 32 + 1.0) = 97.0 per sample\n    # Mutant will have corrupted neg_sqrt due to garbage in shared_neg[8-31]\n    return [anchor, positive, negative]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5127,
+        "completion_tokens": 3717,
+        "total_tokens": 8844,
+        "reasoning_tokens": 1512
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes `blockDim.x / 32` to `blockDim.x * 32` in the condition for reading shared_neg. Original: lanes 0-7 read valid data, lanes 8-31 get 0.0f. Mutant: all lanes 0-31 read from shared_neg, but only indices 0-7 have valid data. shared_neg[8-31] are uninitialized. EMD found divergence at seed=10000, meaning the uninitialized memory was non-zero in that case. The previous constant-value test likely ran when shared memory happened to be zeroed.",
+      "survival_reason": "The previous attempt used constant tensors (zeros, 2.0, 0.5). This deterministic pattern may have coincided with a GPU state where shared memory was freshly allocated and zeroed, making shared_neg[8-31] all zeros. With zeros in uninitialized slots, the warp reduction produces the same result for both original and mutant. EMD explicitly found divergence with seed 10000 using random values, indicating that specific random initialization triggers non-zero garbage in shared memory that corrupts the neg_dist calculation. We need to use the exact seed that EMD found divergence with.",
+      "killable": true,
+      "kill_strategy": "Use the specific random seed (10000) that EMD detected divergence with. This seed produces random values that, when processed, leave the GPU's shared memory in a state where uninitialized values at shared_neg[8-31] are non-zero, causing the mutant's neg_sqrt to differ from the original.",
+      "recommendations": "When mutation testing detects that a mutant survives despite EMD finding divergence at a specific seed, always include that exact seed as a test case. Uninitialized shared memory behavior is undefined and environment-dependent; such mutations should be flagged as potentially equivalent in some environments but not others.",
+      "suggested_code": "def generate_inputs(device):\n    # Use the exact seed where EMD detected divergence\n    torch.manual_seed(10000)\n    torch.cuda.manual_seed(10000)\n    anchor = torch.randn(128, 4096, dtype=torch.float32, device=device)\n    positive = torch.randn(128, 4096, dtype=torch.float32, device=device)\n    negative = torch.randn(128, 4096, dtype=torch.float32, device=device)\n    return [anchor, positive, negative]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5381,
+        "completion_tokens": 3942,
+        "total_tokens": 9323,
+        "reasoning_tokens": 1614
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation changes condition from lane_id < 8 to lane_id < 8192, causing lanes 8-31 to read uninitialized shared_neg[8-31] instead of 0.0f. With neg_dist=0 (anchor==negative), original neg_sqrt=0. Any non-zero garbage in shared_neg[8-31] changes neg_sqrt. For loss ~65, tolerance ~0.66, so garbage sum >0.43 (giving neg_sqrt>0.66) kills the mutant.",
+      "survival_reason": "Previous attempts used non-zero neg_dist values, which diluted the impact of garbage in shared_neg[8-31]. When neg_dist has a large correct value (from actual anchor-negative differences), the garbage contribution becomes a small fraction. Round 1's constant values and Round 2's random values both had substantial neg_dist. The key insight is that making neg_dist EXACTLY ZERO maximizes sensitivity to uninitialized memory—any garbage becomes 100% of the signal rather than a small perturbation. The EMD detected bitwise divergence but previous tests had enough correct neg_dist to absorb small garbage within tolerance.",
+      "killable": true,
+      "kill_strategy": "Set anchor == negative exactly to make neg_dist = 0, making the mutant's neg_sqrt entirely dependent on garbage in shared_neg[8-31]. Set positive = anchor + constant to ensure pos_sqrt is predictable and non-zero. Any non-zero garbage will change neg_sqrt from 0, directly affecting the loss.",
+      "recommendations": "Always explicitly initialize shared memory arrays to known values (e.g., 0.0f) before any conditional reads, even if you believe only a subset of indices will be accessed. This prevents undefined behavior from uninitialized memory when conditions are accidentally broadened by bugs or mutations.",
+      "suggested_code": "def generate_inputs(device):\n    # Create anchor with varied values to potentially leave interesting patterns\n    torch.manual_seed(42)\n    anchor = torch.randn(128, 4096, dtype=torch.float32, device=device)\n    # positive differs by constant 1.0: pos_dist = 4096, pos_sqrt = 64\n    positive = anchor + 1.0\n    # negative IDENTICAL to anchor: neg_dist = 0, neg_sqrt should be 0\n    # Mutant reads garbage from shared_neg[8-31], corrupting neg_sqrt\n    negative = anchor.clone()\n    # Original: loss = max(0, 64 - 0 + 1) = 65 per sample\n    # Mutant: loss = max(0, 64 - sqrt(garbage) + 1) != 65\n    return [anchor, positive, negative]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5717,
+        "completion_tokens": 4492,
+        "total_tokens": 10209,
+        "reasoning_tokens": 1738
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes `blockDim.x / 32` to `blockDim.x * 32` in the condition for final_neg, causing lanes 8-31 to read uninitialized shared_neg[8..31] instead of 0. With 256 threads, original reads 8 values (lanes 0-7), mutant reads all 32. Uninitialized memory may be zero in test environment, masking the bug. To kill: make legitimate neg_dist extremely small so any garbage in shared_neg[8..31] dominates the sqrt computation.",
+      "survival_reason": "Previous attempts failed because: (1) Round 1 used constant values but uninitialized shared memory was likely zero; (2) Round 2 used random values but garbage contribution was within 1%+1e-2 tolerance relative to large distances; (3) Round 3 set neg_dist=0 but garbage was still zero. The key insight is that we need to make the RATIO of garbage to legitimate neg_dist extreme. If legitimate neg_dist is effectively zero (all warps compute nearly zero), then even small non-zero garbage in shared_neg[8..31] will dominate. We should use anchor≈positive to get small pos_dist AND anchor≈negative to get small neg_dist, but with positive SLIGHTLY different to ensure loss is non-zero and propagates.",
+      "killable": true,
+      "kill_strategy": "Create inputs where legitimate neg_dist summed across 8 warps is tiny (near-epsilon), so any non-zero uninitialized values in shared_neg[8..31] dominate the sum. Use anchor≈negative (tiny difference), anchor far from positive (large pos_sqrt), giving expected loss = pos_sqrt - ~0 + margin. If garbage adds even 1e-4 to neg_dist, neg_sqrt changes from ~0 to ~0.01, potentially detectable.",
+      "recommendations": "Always explicitly zero-initialize shared memory arrays when size exceeds the number of writers, or use explicit bounds to prevent reading uninitialized indices. The condition `lane_id < num_warps` should be computed correctly and validated.",
+      "suggested_code": "def generate_inputs(device):\n    # anchor is non-trivial to leave interesting memory state\n    torch.manual_seed(12345)\n    anchor = torch.randn(128, 4096, dtype=torch.float32, device=device)\n    \n    # positive is far from anchor: large pos_dist\n    # diff per element = 1.0, so pos_dist = 4096, pos_sqrt = 64\n    positive = anchor + 1.0\n    \n    # negative nearly identical to anchor: tiny neg_dist\n    # diff per element = 1e-5, so neg_dist = 4096 * (1e-5)^2 = 4.096e-7\n    # neg_sqrt ≈ 6.4e-4 (essentially zero)\n    negative = anchor + 1e-5\n    \n    # Expected loss = max(0, 64 - 0.00064 + 1.0) ≈ 65\n    # If shared_neg[8..31] contain ANY non-zero garbage (say total 0.01),\n    # mutant neg_sqrt = sqrt(4.096e-7 + 0.01) ≈ 0.1, changing loss by ~0.1\n    return [anchor, positive, negative]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6189,
+        "completion_tokens": 4810,
+        "total_tokens": 10999,
+        "reasoning_tokens": 1884
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes `blockDim.x / 32` (=8) to `blockDim.x * 32` (=8192) on line 77. With lane_id in [0,31], the mutant's condition is always true, causing lanes 8-31 to read uninitialized shared_neg[8..31] instead of 0.0f. However, CUDA shared memory in this test environment appears to be consistently zero-initialized (or contains zeros), making shared_neg[8..31]=0, which equals the original's explicit 0.0f. The infection (garbage values) doesn't manifest because the shared memory isn't actually garbage in practice.",
+      "survival_reason": "All previous attempts correctly targeted the semantic difference (reading uninitialized vs zero), but failed because the CUDA test environment consistently provides zero-valued shared memory. Rounds 1-2 used non-zero neg_dist values where garbage would be additive noise. Rounds 3-4 used near-zero neg_dist hoping garbage would dominate, but shared_neg[8..31] were zero. The EMD divergence at seed 10000 may have been due to transient GPU state not reproducible via input values alone. A fundamentally different approach is to try extreme floating-point values (inf/nan boundaries) that might interact differently with the uninitialized memory reads or expose compiler-level differences in handling undefined behavior.",
+      "killable": true,
+      "kill_strategy": "Use inputs where the computation produces inf or triggers edge cases in sqrtf. If pos_dist or neg_dist overflow to inf, the behavior of reading uninitialized memory vs explicit 0.0f might differ due to inf arithmetic. Specifically, inf + garbage vs inf + 0 could differ if garbage is negative or NaN.",
+      "recommendations": "Mutation testing for GPU kernels reading uninitialized shared memory should verify the shared memory state is truly non-deterministic in the test environment. Consider adding a kernel warmup phase that writes known non-zero patterns to shared memory regions beyond active warp count to ensure uninitialized reads are detectable.",
+      "suggested_code": "def generate_inputs(device):\n    # Create values that cause very large squared differences\n    # Each element diff^2 = (1e19)^2 = 1e38, sum of 4096 = 4.096e41 (overflow to inf)\n    anchor = torch.full((128, 4096), 1e19, dtype=torch.float32, device=device)\n    positive = torch.full((128, 4096), -1e19, dtype=torch.float32, device=device)\n    # negative identical to anchor: neg_dist = 0\n    # But pos_dist overflows to inf\n    # Original: final_neg = sum of shared_neg[0..7] + zeros = 0\n    # Mutant: final_neg = sum of shared_neg[0..31] including garbage\n    # sqrtf(inf) = inf, sqrtf(0 or garbage) differs\n    # loss = max(0, inf - sqrt(garbage) + margin) behavior may differ\n    negative = anchor.clone()\n    return [anchor, positive, negative]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 375.35
+}

@@ -1,0 +1,46 @@
+{
+  "mutant_id": "L1_P35__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P35",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6329,
+        "completion_tokens": 3879,
+        "total_tokens": 10208,
+        "reasoning_tokens": 1473
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The missing __syncthreads() between shared_data writes and the reduction loop creates a race condition. Thread i writes to shared_data[i], then thread j (j < 128) reads shared_data[j+128]. Without sync, thread j may read before thread j+128 writes. With 256 threads processing 65536 spatial elements per channel, column index w determines thread assignment (thread i handles column i). Setting columns 128-255 to 10000 and columns 0-127 to 0 creates maximum divergence when race occurs.",
+      "survival_reason": "The mutant survives because the race condition is non-deterministic — it depends on actual GPU thread scheduling. However, with 256 concurrent threads and the stark contrast between partial sums (0 vs millions), the probability of the race manifesting and producing detectably wrong results is very high. The corruption in mean calculation propagates to variance and final output, creating errors that exceed the 1e-2 tolerance.",
+      "killable": true,
+      "kill_strategy": "Create input where threads 128-255 compute very large partial sums (by setting columns 128-255 to large values like 10000) while threads 0-127 compute zero partial sums (columns 0-127 = 0). If the race condition fires, the mean will be computed incorrectly, causing normalization errors exceeding tolerance.",
+      "recommendations": "Always verify synchronization barriers in parallel reduction patterns with differential testing using inputs that create maximum contrast between thread workloads. Missing __syncthreads() bugs are classic GPU race conditions that may pass simple tests but fail under adversarial value distributions.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256] - FIXED\n    # Thread i processes column w=i (since spatial idx % 256 = w)\n    # Create contrast: threads 128-255 get large partial sums, threads 0-127 get zero\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    x[:, :, :, 128:] = 10000.0  # Columns 128-255: large values\n    # Columns 0-127 remain zero\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.723897e-01, mean_diff=3.801695e-03, ref_range=[-1.0000e+00,1.0000e+00], mut_range=[-9.9999e-01,1.2127e+00]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 1,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Create input where threads 128-255 compute very large partial sums (by setting columns 128-255 to large values like 10000) while threads 0-127 compute zero partial sums (columns 0-127 = 0). If the race condition fires, the mean will be computed incorrectly, causing normalization errors exceeding tolerance.",
+    "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256] - FIXED\n    # Thread i processes column w=i (since spatial idx % 256 = w)\n    # Create contrast: threads 128-255 get large partial sums, threads 0-127 get zero\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    x[:, :, :, 128:] = 10000.0  # Columns 128-255: large values\n    # Columns 0-127 remain zero\n    return [x]"
+  },
+  "elapsed_sec": 105.01
+}

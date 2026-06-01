@@ -1,0 +1,116 @@
+{
+  "mutant_id": "L2_P41__epsilon_modify__0",
+  "operator_name": "epsilon_modify",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8467,
+        "completion_tokens": 4718,
+        "total_tokens": 13185,
+        "reasoning_tokens": 1785
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With var≈0 in GroupNorm: original inv_std=1/sqrt(1e-5)≈316.2, mutant inv_std=1/sqrt(1e-2)=10. This 31.6x difference far exceeds the 1% rtol tolerance. Zero/constant input creates identical batch rows → low within-group variance in GroupNorm intermediate tensor.",
+      "survival_reason": "The BatchNorm alone has only ~0.5% difference (below rtol), but GroupNorm computes variance from intermediate values. With carefully chosen inputs that create near-constant values within groups (like all-zeros), the computed variance approaches zero. When var≈0, the eps difference causes inv_std to differ by a factor of 31.6x, which propagates through the normalized values, scaling, and final mean computation.",
+      "killable": true,
+      "kill_strategy": "Use constant input (e.g., all zeros) across the batch dimension. This creates identical intermediate values per feature after GEMM, and within GroupNorm groups the variance becomes very small. The massive difference in 1/sqrt(var+eps) when var≈0 (316 vs 10) will cause easily detectable output differences.",
+      "recommendations": "Test epsilon parameters with edge-case inputs that minimize computed variances (constant or near-constant values), as this is where numerical stability guards have maximum impact.",
+      "suggested_code": "def generate_inputs(device):\n    # All zeros create identical rows in intermediate tensor after GEMM\n    # Within GroupNorm groups, variance becomes very small\n    # This maximally exposes the eps difference: 1/sqrt(1e-5) vs 1/sqrt(1e-2)\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8339,
+        "completion_tokens": 4871,
+        "total_tokens": 13210,
+        "reasoning_tokens": 2091
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With default weight_gn=1 and bias_gn=0, GroupNorm outputs have mean=0 per group by construction. Sum across all channels = sum of (inv_std_g * Σ(x-mean_g)) = 0 since Σ(x-mean_g)=0 for each group. Hence final mean≈0 → ReLU(0)=0 regardless of eps. To break this, need numerical instability in the GroupNorm variance computation where inv_std differs significantly: at var=1e-3, original gives rsqrt(1.001e-3)≈31.6, mutant gives rsqrt(1.1e-2)≈9.5, a 3x scale difference that can leak through floating-point errors in the reduction.",
+      "survival_reason": "The zero-input strategy failed because (1) while different eps values produce different inv_std scaling in GroupNorm, the mathematical property that GroupNorm outputs sum to zero within each group means the total channel sum is zero regardless of scaling, and (2) ReLU(0)=0 produces identical outputs. The previous attempt didn't account for GroupNorm's mean-centering property making the output invariant to inv_std scaling. To kill the mutant, we need inputs that create asymmetric floating-point rounding in the reduction, where the scaled values' sum deviates from theoretical zero differently for different eps values.",
+      "killable": true,
+      "kill_strategy": "Use large magnitude inputs (order 1e4) that create large intermediate values in GEMM. After BatchNorm, these become extreme values that push GELU into saturation asymmetrically. This creates groups where floating-point accumulation errors in the channel_sum reduction differ significantly between the two eps values, breaking the theoretical zero-sum property.",
+      "recommendations": "When testing epsilon mutations in normalization layers, verify that the downstream reduction operations (like mean) don't mathematically cancel out the scaling differences. Consider adding bias_gn != 0 test cases to break the zero-mean invariant.",
+      "suggested_code": "def generate_inputs(device):\n    # Large values that create extreme intermediate results\n    # Different rows have different patterns to maximize numerical spread\n    torch.manual_seed(42)\n    # Mix of large positive values to push GELU saturation\n    x = torch.empty(128, 512, dtype=torch.float32, device=device)\n    # Create structured large values - alternating pattern per row\n    for i in range(128):\n        scale = 100.0 + i * 10.0  # 100 to 1370\n        x[i, :256] = scale\n        x[i, 256:] = -scale * 0.1  # Asymmetric to break symmetry\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8636,
+        "completion_tokens": 4964,
+        "total_tokens": 13600,
+        "reasoning_tokens": 2629
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With running_var=1, BatchNorm eps difference gives ~0.5% multiplicative change (sqrt(1.00001)/sqrt(1.01)≈1.005). GroupNorm variance computed from data; when GELU outputs are near-zero (from large negative BN inputs), GroupNorm variance becomes small (say ~1e-4), causing inv_std ratio of 1/sqrt(1e-4+1e-5) vs 1/sqrt(1e-4+1e-2) ≈ 95.4 vs 9.95 = 9.6x difference in normalization scale.",
+      "survival_reason": "Round 1 (zeros) failed because GEMM output = bias only, which after BN/GELU produces varied GroupNorm inputs with significant variance, masking eps difference. Round 2 (large positive) failed because large positive values pass through GELU nearly linearly (GELU(x)≈x for large x), maintaining variance. The key insight is that large NEGATIVE inputs push GELU into its near-zero left tail (GELU(-5)≈-0.003), creating GroupNorm inputs with extremely small variance where the eps=1e-5 vs eps=1e-2 difference becomes dominant. This fundamentally different approach exploits GELU's asymmetric saturation behavior.",
+      "killable": true,
+      "kill_strategy": "Use large negative input values that push intermediate BatchNorm outputs into GELU's negative saturation region. GELU(x) → 0 for x << 0, so all GroupNorm inputs become near-zero with tiny variance. This makes the eps difference (1e-5 vs 1e-2) dominate the inv_std calculation, creating ~10x difference in GroupNorm scaling that propagates to output.",
+      "recommendations": "When testing epsilon modifications in numerical stability guards, specifically target computational paths where variance approaches zero - test with inputs that exploit activation function saturation regions (like GELU's negative tail) to minimize intermediate variance and expose epsilon sensitivity.",
+      "suggested_code": "def generate_inputs(device):\n    # Large negative values push BatchNorm output through GELU's left tail\n    # GELU(-5) ≈ -0.003, GELU(-10) ≈ 0 (effectively)\n    # This creates near-zero GroupNorm input with tiny variance\n    # inv_std = 1/sqrt(var + eps) diverges hugely: 316 vs 10 for var≈0\n    x = torch.full((128, 512), -50.0, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8924,
+        "completion_tokens": 5508,
+        "total_tokens": 14432,
+        "reasoning_tokens": 2481
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "GroupNorm computes normalized = (x - group_mean) * inv_std for each group. By definition, sum(x - group_mean) = 0 within each group. Thus sum(normalized) = 0 / sqrt(var+eps) = 0 for any eps. With weight_gn=1, bias_gn=0 (defaults), the channel mean after GroupNorm is exactly 0. ReLU(0) = 0 for both eps=1e-5 and eps=1e-2. The infection from changed inv_std cannot propagate through the zero-sum property.",
+      "survival_reason": "All three previous attempts failed because GroupNorm's centering property (subtracting group mean) guarantees that the sum of normalized values within each group is mathematically zero, regardless of inv_std. Round 1 (zeros) produced GELU(bias)→GroupNorm→mean=0. Round 2 (large values) and Round 3 (large negative) both suffer the same fate: no matter what values enter GroupNorm, the normalized output has zero mean by construction. The eps difference affects inv_std magnitude, but multiplying zero by any inv_std yields zero. With bias_gn=0, the mean across channels is always 0, and ReLU(0)=0 for both versions.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable because the eps parameter only affects inv_std in GroupNorm, but the mathematical centering property ensures sum((x-mean)*inv_std) = 0*inv_std = 0 for any inv_std. With default bias_gn=0, the channel mean is always exactly 0, and ReLU(0)=0 regardless of eps. The BatchNorm eps difference is negligible since running_var=1.0. No input values can break this mathematical invariant.",
+      "recommendations": "This mutation survives due to a mathematical invariant (GroupNorm centering → zero mean → ReLU clips to 0). To make such epsilon mutations detectable, either: (1) initialize bias_gn to non-zero values so the channel mean isn't always zero, or (2) test the intermediate outputs before the final ReLU to observe the inv_std differences, or (3) add test cases that verify BatchNorm's eps parameter independently by using running_var values near zero.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 975.95
+}

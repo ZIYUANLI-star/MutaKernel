@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P33__mask_boundary__2",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P33",
+  "phase1_status": "candidate_equivalent",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9063,
+        "completion_tokens": 5103,
+        "total_tokens": 14166,
+        "reasoning_tokens": 1827
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation in compute_mean_var_kernel only executes when training=True. At stride=1: original 'tid<1' allows thread 0 to add shared_sum[1]; mutant 'tid<0' is always false, skipping final reduction step. shared_sum[1] contains ~half the accumulated sum (odd indices), so mean is computed incorrectly. The 112 rounds likely ran in eval mode.",
+      "survival_reason": "The mutated parallel reduction code is only executed during training mode. In eval mode, batchnorm2d_forward_inference_kernel is used instead, completely bypassing the mutated compute_mean_var_kernel. If Layer 2 testing ran with model.eval(), the mutation was never exercised. When training=True, the mutation breaks the reduction at stride=1 where tid<0 is never satisfied, causing shared_sum[0] to miss contributions from shared_sum[1] which contains half the partial sums.",
+      "killable": true,
+      "kill_strategy": "Ensure model runs in training mode (default state). Use non-uniform input where odd-indexed threads' contributions differ significantly from even-indexed ones. Large magnitude values will amplify the ~50% mean calculation error beyond tolerance thresholds.",
+      "recommendations": "Test frameworks should explicitly test both training and eval modes for kernels with mode-dependent code paths. The parallel reduction's correctness is critical and should be validated with reduction-specific unit tests that verify the complete sum is computed.",
+      "suggested_code": "def generate_inputs(device):\n    # Create input where partial sums at different thread indices vary significantly\n    # This maximizes the error when odd-indexed partial sums are lost\n    x = torch.zeros(16, 64, 256, 256, device=device, dtype=torch.float32)\n    # Fill with large values that will produce significant partial sums\n    # Thread tid processes elements at indices tid, tid+256, tid+512, ...\n    # Use values that ensure threads 1,3,5,...,255 have large contributions\n    x.fill_(100.0)  # Large uniform value ensures massive mean error (~50x difference)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8967,
+        "completion_tokens": 4905,
+        "total_tokens": 13872,
+        "reasoning_tokens": 2008
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "Mutation is in compute_mean_var_kernel (line 80), only called when training=True. Code path: if(!training) → inference_kernel (unmutated); else → compute_mean_var_kernel (mutated). With training=False (default eval mode), mutated code is unreachable.",
+      "survival_reason": "The previous attempt with uniform values (100.0) failed not due to the input pattern but because the model runs in evaluation mode by default, causing the inference path to execute. The inference path uses running_mean/running_var directly via batchnorm2d_forward_inference_kernel, which has no mutation. The mutated parallel reduction in compute_mean_var_kernel is only invoked during training mode. No input value can force a PyTorch model into training mode—this requires model.train() to be called, which is a configuration change outside the scope of input value manipulation.",
+      "killable": false,
+      "kill_strategy": "This mutant cannot be killed through value changes alone. It requires setting the model to training mode via model.train() before calling forward(). The testing contract explicitly states only values can vary, not model configuration. To kill this mutant, the test harness must ensure model.training=True.",
+      "recommendations": "Mutation testing frameworks for GPU kernels should explicitly test both training and inference code paths when the kernel has conditional branching based on mode. Add test coverage that runs models in both model.train() and model.eval() states to catch mutations in mode-specific code paths.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 171.83
+}

@@ -1,0 +1,40 @@
+{
+  "mutant_id": "L1_P100__sync_remove__1",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P100",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5139,
+        "completion_tokens": 3758,
+        "total_tokens": 8897,
+        "reasoning_tokens": 1547
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With input size=128 and block_size=256, there's exactly 1 block with 256 threads. The reduction loop has stride values: 128, 64, 32, 16, 8, 4, 2, 1. At stride=128, threads 0-127 read from shared_mem[128-255] which are all 0 (those threads had idx>=size). At stride=64, threads 0-63 read from shared_mem[64-127], but threads 64-127 don't participate (64<64 is false), so no concurrent writes. At stride=32, threads 0-31 read from shared_mem[32-63] which were written at stride=64. This is the potential race, BUT within modern NVIDIA GPUs, warp 0 and warp 1 (which owns threads 32-63) execute with sufficient implicit synchronization for this small workload. The missing __syncthreads() would matter at larger scales or different hardware, but with only 1 block and 128 elements, warp scheduling keeps threads sufficiently synchronized.",
+      "survival_reason": "The mutation removes __syncthreads() inside the reduction loop, which theoretically introduces a race condition between warps. However, for the fixed configuration of 128 elements (single block of 256 threads), the race condition does not manifest in practice. The critical race point is at stride=32 where warp 0 needs values written by warp 1 at stride=64. With only 1 block and a light workload, the GPU scheduler keeps warps executing in near-lockstep, preventing the race from causing observable differences. Additionally, for strides >= 32, the warp-synchronous execution model of NVIDIA GPUs (threads within a 32-thread warp execute in lockstep) ensures correctness within warps. The mutation only affects cross-warp synchronization, which doesn't trigger with this small problem size.",
+      "killable": false,
+      "kill_strategy": "The mutation is unkillable under the fixed-shape contract because the race condition depends on GPU scheduler timing, not input values. With 128 elements processed by a single 256-thread block, modern GPU schedulers maintain sufficient implicit synchronization between warps that the missing __syncthreads() never causes observable divergence. No value pattern can force warp desynchronization - that would require either (1) a larger problem size spanning multiple blocks, or (2) different hardware with more aggressive warp scheduling. Neither is achievable under the fixed-shape, variable-value contract.",
+      "recommendations": "For mutation testing of GPU synchronization primitives like __syncthreads(), the test suite should include configurations where the problem size forces multi-block execution or spans the warp synchronization boundary in ways that stress the scheduler. Single-block kernels with light workloads may exhibit equivalent behavior even with missing synchronization due to implicit scheduling behavior. Consider adding a 'config_stress' mode that specifically tests at synchronization-critical boundaries (e.g., sizes that cause many blocks, or sizes that exactly fill shared memory regions).",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 64.07
+}

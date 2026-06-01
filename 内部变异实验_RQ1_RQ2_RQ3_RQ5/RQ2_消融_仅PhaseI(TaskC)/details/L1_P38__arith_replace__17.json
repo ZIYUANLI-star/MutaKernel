@@ -1,0 +1,116 @@
+{
+  "mutant_id": "L1_P38__arith_replace__17",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P38",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5140,
+        "completion_tokens": 5316,
+        "total_tokens": 10456,
+        "reasoning_tokens": 1568
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "batch_idx/dim=0 for all batches (0-15 < 16384), so mutant's Phase 1 always writes to batch 0's memory space. With batch 0 having large values (L1_norm=1.6M, inv_sum≈6e-7) and batch 1 having small values (L1_norm≈16, inv_sum≈0.06), batch 1 overwrites output[0] with 100*0.06≈6.1 instead of correct 100*6e-7≈6e-5. Difference ≈6.1 >> tolerance 0.01.",
+      "survival_reason": "The mutant initially appeared possibly equivalent because Phase 2 uses correct indexing. However, Phase 1 in the mutant causes batches 1-15 to write to batch 0's memory space, using batch 0's input values multiplied by the wrong batch's normalization factor. With carefully chosen input values creating vastly different L1 norms across batches, the corruption of batch 0's output becomes dramatically visible. The race condition between multiple batches writing to the same memory ensures corruption.",
+      "killable": true,
+      "kill_strategy": "Create input where batch 0 has large values (creating small inv_batch_sum) and other batches have small values (creating large inv_batch_sum). The mutant will overwrite batch 0's output with values scaled by the wrong normalization factor, producing outputs orders of magnitude different from expected.",
+      "recommendations": "When testing index calculations in CUDA kernels, always verify correctness across ALL blocks/batches, not just batch 0. Index mutations involving multiplication-to-division can appear correct for batch 0 but fail catastrophically for subsequent batches. Include test cases with distinct values per batch to expose cross-batch contamination bugs.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Batch 0: large values -> small inv_batch_sum\n    x[0, :] = 100.0\n    # Batches 1-15: small values -> large inv_batch_sum\n    for i in range(1, 16):\n        x[i, :] = 0.001\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5018,
+        "completion_tokens": 5429,
+        "total_tokens": 10447,
+        "reasoning_tokens": 2321
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "batch_idx/dim=0 for all batches. Mutant's vectorized loop writes to batch 0's indices with wrong inv_batch_sum. For batch 0 with all 1s: expected=1.0*6.1e-5≈6.1e-5. For batches 1-15 with all 0s: inv=1.0, corrupted value=1.0*1.0=1.0. Difference≈1.0 >> tolerance(0.01).",
+      "survival_reason": "Previous test used batch 0 with 100.0 and others with 0.001. Both had non-zero sums, so inv_batch_sum values were closer. Also, with uniform non-zero values, the race condition's final outcome may have been masked. By setting batches 1-15 to all zeros, their inv_batch_sum becomes exactly 1.0 (due to zero-protection), while batch 0 with all 1s has inv≈6.1e-5. The corrupted output would be 1.0 vs expected 6.1e-5, a 16000x difference that cannot pass tolerance checks.",
+      "killable": true,
+      "kill_strategy": "Set batch 0 to all 1.0 (creating small inv_batch_sum≈6.1e-5) and all other batches to all 0.0 (creating inv_batch_sum=1.0 via zero-protection). The mutant writes batch_0_input * other_inv = 1.0 * 1.0 = 1.0 to batch 0's region, instead of correct 6.1e-5.",
+      "recommendations": "When testing kernels with parallel block execution, create inputs where different blocks have maximally different normalization/scaling factors, especially when mutations could cause cross-block memory corruption via index calculation errors.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    x[0, :] = 1.0  # Batch 0: all ones -> inv_batch_sum ≈ 6.1e-5\n    # Batches 1-15: all zeros -> inv_batch_sum = 1.0 (zero-protected)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5284,
+        "completion_tokens": 5118,
+        "total_tokens": 10402,
+        "reasoning_tokens": 2348
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation `batch_idx * dim` → `batch_idx / dim` in the vectorized store loop causes batches 1-15 to write to batch 0's output region (since batch_idx/16384 = 0 for batch_idx < 16384). However, the 'remaining elements' loop always runs afterward and writes correct values. The race between batches determines final output. With inv_batch_sum ratios >10000x, corruption becomes detectable beyond tolerance.",
+      "survival_reason": "Previous attempts failed because: (1) With batch 0 = 100, others = 0.001, if GPU scheduling favors batch 0 running last, no corruption survives. (2) With batch 0 = 1.0, others = 0, the zero batches have inv=1 (protection), and 1.0 * 1.0 = 1.0 which actually equals the corrupted output. The key insight is that cross-batch corruption occurs when batch X's vectorized writes (to batch 0's region) complete AFTER batch 0's remaining writes. We need inv_batch_sum values differing by extreme factors (>10000x) so any corruption exceeds the 1e-2 tolerance threshold.",
+      "killable": true,
+      "kill_strategy": "Create inputs where batch 0 has sum≈16384 (inv≈6.1e-5) and all other batches have sum≈163840000 (inv≈6.1e-9), making a 10000x difference. If batch 1-15's vectorized stores corrupt batch 0's output, values will differ by factor of 10000, far exceeding atol+rtol tolerance. Use deterministic non-zero values in batch 0 to ensure measurable corruption.",
+      "recommendations": "When testing CUDA kernels with cross-block data dependencies or race conditions, design inputs that maximize the numerical difference between blocks' computed intermediate values (like normalization factors), making any cross-block data corruption exceed floating-point tolerances.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.empty(16, 16384, device=device, dtype=torch.float32)\n    x[0, :] = 1.0  # Batch 0: L1 sum = 16384, inv ≈ 6.1e-5\n    x[1:, :] = 10000.0  # Batches 1-15: L1 sum = 163840000, inv ≈ 6.1e-9\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5574,
+        "completion_tokens": 4154,
+        "total_tokens": 9728,
+        "reasoning_tokens": 1577
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes 'idx = batch_idx * dim + tid * 4' to 'idx = batch_idx / dim + tid * 4' on line 80. For batch_size=16 and dim=16384, batch_idx/dim = 0 for all batch_idx ∈ [0,15] (integer division). This causes the vectorized stores to write to wrong positions (always starting at tid*4 in batch 0's region). HOWEVER, the 'remaining elements' loop at lines 84-87 uses the CORRECT formula 'pos = batch_idx * dim + i' and iterates over ALL elements (i from tid to dim-1 in steps of blockDim.x=256), writing correct values to every output position. The remaining loop completely overwrites whatever the vectorized loop wrote.",
+      "survival_reason": "All previous attempts failed because the mutation's effect (incorrect vectorized writes) is completely overwritten by the subsequent 'remaining elements' loop. This loop uses the correct index formula 'batch_idx * dim + i' and iterates over ALL dim=16384 elements per batch (each of 256 threads handles 64 elements). Regardless of what values batch 0 has vs other batches, the remaining loop always writes 'input[pos] * inv_batch_sum' to every output position with the correct batch-specific pos and inv_batch_sum. The vectorized loop's incorrect writes are dead writes - they have no observable effect on the final output because they're immediately overwritten.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable because the mutation affects only the vectorized store loop (line 80), but its effects are completely overwritten by the 'remaining elements' loop (lines 84-87) which executes unconditionally and covers ALL output positions using the correct index formula. The mutation creates dead writes that have no observable effect on the final output. To kill this mutant would require changing kernel structure or shapes, which is not allowed.",
+      "recommendations": "The original kernel has a design issue: the 'remaining elements' loop writes to ALL positions, making the vectorized store loop completely redundant. To make the vectorized path testable, refactor so the remaining loop only handles elements NOT covered by the vectorized loop (e.g., when dim is not divisible by 4*blockDim.x). This would expose mutations in the vectorized path. Additionally, mutation testing should flag dead code paths like this vectorized loop.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 325.89
+}

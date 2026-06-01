@@ -1,0 +1,213 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        out = torch.nn.functional.scaled_dot_product_attention(Q, K, V)
+        return out
+
+batch_size = 32
+num_heads = 32
+sequence_length = 512
+embedding_dimension = 1024
+
+def get_inputs():
+    Q = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    K = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    V = torch.rand(batch_size, num_heads, sequence_length, embedding_dimension, device='cuda', dtype=torch.float16)
+    return [Q, K, V]
+
+def get_init_inputs():
+    return []
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        batch_size, num_heads, seq_len, d_k = Q.shape
+        
+        # Save original TF32 settings
+        orig_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        orig_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        try:
+            # Disable TF32 for numerical stability
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            
+            # Convert to float32 for numerical stability with extreme values
+            Q_fp32 = Q.float()
+            K_fp32 = K.float()
+            V_fp32 = V.float()
+            
+            # Step 1: Compute Q @ K.transpose(-2, -1) in float32
+            qk = Q_fp32 @ K_fp32.transpose(-1, -2)
+            
+            # Step 2: Scale by sqrt(d_k)
+            scale = 1.0 / (d_k ** 0.5)
+            qk = qk * scale
+            
+            # Step 3: Numerically stable softmax
+            # Subtract max for numerical stability before exp
+            qk_max = qk.max(dim=-1, keepdim=True).values
+            qk_stable = qk - qk_max
+            exp_qk = torch.exp(qk_stable)
+            softmax_qk = exp_qk / (exp_qk.sum(dim=-1, keepdim=True) + 1e-12)
+            
+            # Step 4: Compute output = softmax_qk @ V
+            output = softmax_qk @ V_fp32
+            
+            # Convert back to original dtype
+            output = output.to(Q.dtype)
+            
+        finally:
+            # Restore original TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = orig_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = orig_cudnn_tf32
+        
+        return output
+```
+
+## Test Failures (Round 2 input)
+Total discrepancies: 35
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (17 failures)
+  - [large_magnitude seed=50000] max_diff=3.183000e+03, mean_diff=3.134401e-03, ref_range=[-5.6640e+03,5.7560e+03], orig_range=[-5.6640e+03,5.7560e+03]
+  - [large_magnitude seed=50001] max_diff=3.470000e+03, mean_diff=5.507882e-03, ref_range=[-5.7400e+03,5.7000e+03], orig_range=[-5.7400e+03,5.7000e+03]
+  - [all_negative seed=50008] max_diff=3.300000e+01, mean_diff=1.912686e-03, ref_range=[-5.7450e+02,0.0000e+00], orig_range=[-5.7450e+02,0.0000e+00]
+  - [all_negative seed=50009] max_diff=3.725000e+01, mean_diff=1.871803e-03, ref_range=[-5.5500e+02,0.0000e+00], orig_range=[-5.5500e+02,0.0000e+00]
+  - [all_positive seed=50010] max_diff=3.400000e+01, mean_diff=2.028470e-03, ref_range=[0.0000e+00,5.6550e+02], orig_range=[0.0000e+00,5.6550e+02]
+  - [all_positive seed=50011] max_diff=3.675000e+01, mean_diff=1.810525e-03, ref_range=[0.0000e+00,5.6450e+02], orig_range=[0.0000e+00,5.6450e+02]
+  - [mixed_extremes seed=50012] max_diff=4.358400e+04, mean_diff=3.902312e-02, ref_range=[-5.6032e+04,5.6448e+04], orig_range=[-5.6032e+04,5.6448e+04]
+  - [mixed_extremes seed=50013] max_diff=3.200000e+01, mean_diff=4.055153e-06, ref_range=[-5.7664e+04,5.7024e+04], orig_range=[-5.7664e+04,5.7024e+04]
+  ... and 9 more failures
+
+### training_stress (18 failures)
+  - [large_magnitude seed=70000] max_diff=3.826000e+03, mean_diff=3.179483e-03, ref_range=[-5.7640e+03,5.6440e+03], orig_range=[-5.7640e+03,5.6440e+03]
+  - [large_magnitude seed=70001] max_diff=3.291250e+03, mean_diff=5.446048e-03, ref_range=[-5.7640e+03,5.7640e+03], orig_range=[-5.7640e+03,5.7640e+03]
+  - [all_negative seed=70008] max_diff=3.987500e+01, mean_diff=2.006472e-03, ref_range=[-5.7650e+02,0.0000e+00], orig_range=[-5.7650e+02,0.0000e+00]
+  - [all_negative seed=70009] max_diff=3.562500e+01, mean_diff=1.939783e-03, ref_range=[-5.7600e+02,0.0000e+00], orig_range=[-5.7600e+02,0.0000e+00]
+  - [all_positive seed=70010] max_diff=3.687500e+01, mean_diff=1.860122e-03, ref_range=[0.0000e+00,5.6400e+02], orig_range=[0.0000e+00,5.6400e+02]
+  - [all_positive seed=70011] max_diff=4.037500e+01, mean_diff=2.031327e-03, ref_range=[0.0000e+00,5.5950e+02], orig_range=[0.0000e+00,5.5950e+02]
+  - [mixed_extremes seed=70012] max_diff=5.169600e+04, mean_diff=3.323262e-02, ref_range=[-5.7376e+04,5.5392e+04], orig_range=[-5.7376e+04,5.5392e+04]
+  - [mixed_extremes seed=70013] max_diff=4.756800e+04, mean_diff=1.248605e-02, ref_range=[-5.4816e+04,5.7536e+04], orig_range=[-5.4816e+04,5.7536e+04]
+  ... and 10 more failures
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 35 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
+        batch_size, num_heads, seq_len, d_k = Q.shape
+        
+        # Save original TF32 settings
+        orig_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        orig_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        try:
+            # Disable TF32 for numerical stability
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            
+            # Convert to float32 for numerical stability with extreme values
+            Q_fp32 = Q.float()
+            K_fp32 = K.float()
+            V_fp32 = V.float()
+            
+            # Step 1: Compute Q @ K.transpose(-2, -1) in float32
+            qk = Q_fp32 @ K_fp32.transpose(-1, -2)
+            
+            # Step 2: Scale by sqrt(d_k)
+            scale = 1.0 / (d_k ** 0.5)
+            qk = qk * scale
+            
+            # Step 3: Numerically stable softmax
+            # Subtract max for numerical stability before exp
+            qk_max = qk.max(dim=-1, keepdim=True).values
+            qk_stable = qk - qk_max
+            exp_qk = torch.exp(qk_stable)
+            softmax_qk = exp_qk / (exp_qk.sum(dim=-1, keepdim=True) + 1e-12)
+            
+            # Step 4: Compute output = softmax_qk @ V
+            output = softmax_qk @ V_fp32
+            
+            # Convert back to original dtype
+            output = output.to(Q.dtype)
+            
+        finally:
+            # Restore original TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = orig_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = orig_cudnn_tf32
+        
+        return output
+```
+
+### What still failed after Round 1
+
+### value_stress (17 failures)
+  - [large_magnitude seed=50000] max_diff=3.183000e+03, mean_diff=3.134401e-03, ref_range=[-5.6640e+03,5.7560e+03], orig_range=[-5.6640e+03,5.7560e+03]
+  - [large_magnitude seed=50001] max_diff=3.470000e+03, mean_diff=5.507882e-03, ref_range=[-5.7400e+03,5.7000e+03], orig_range=[-5.7400e+03,5.7000e+03]
+  - [all_negative seed=50008] max_diff=3.300000e+01, mean_diff=1.912686e-03, ref_range=[-5.7450e+02,0.0000e+00], orig_range=[-5.7450e+02,0.0000e+00]
+  - [all_negative seed=50009] max_diff=3.725000e+01, mean_diff=1.871803e-03, ref_range=[-5.5500e+02,0.0000e+00], orig_range=[-5.5500e+02,0.0000e+00]
+  - [all_positive seed=50010] max_diff=3.400000e+01, mean_diff=2.028470e-03, ref_range=[0.0000e+00,5.6550e+02], orig_range=[0.0000e+00,5.6550e+02]
+  - [all_positive seed=50011] max_diff=3.675000e+01, mean_diff=1.810525e-03, ref_range=[0.0000e+00,5.6450e+02], orig_range=[0.0000e+00,5.6450e+02]
+  - [mixed_extremes seed=50012] max_diff=4.358400e+04, mean_diff=3.902312e-02, ref_range=[-5.6032e+04,5.6448e+04], orig_range=[-5.6032e+04,5.6448e+04]
+  - [mixed_extremes seed=50013] max_diff=3.200000e+01, mean_diff=4.055153e-06, ref_range=[-5.7664e+04,5.7024e+04], orig_range=[-5.7664e+04,5.7024e+04]
+  ... and 9 more failures
+
+### training_stress (18 failures)
+  - [large_magnitude seed=70000] max_diff=3.826000e+03, mean_diff=3.179483e-03, ref_range=[-5.7640e+03,5.6440e+03], orig_range=[-5.7640e+03,5.6440e+03]
+  - [large_magnitude seed=70001] max_diff=3.291250e+03, mean_diff=5.446048e-03, ref_range=[-5.7640e+03,5.7640e+03], orig_range=[-5.7640e+03,5.7640e+03]
+  - [all_negative seed=70008] max_diff=3.987500e+01, mean_diff=2.006472e-03, ref_range=[-5.7650e+02,0.0000e+00], orig_range=[-5.7650e+02,0.0000e+00]
+  - [all_negative seed=70009] max_diff=3.562500e+01, mean_diff=1.939783e-03, ref_range=[-5.7600e+02,0.0000e+00], orig_range=[-5.7600e+02,0.0000e+00]
+  - [all_positive seed=70010] max_diff=3.687500e+01, mean_diff=1.860122e-03, ref_range=[0.0000e+00,5.6400e+02], orig_range=[0.0000e+00,5.6400e+02]
+  - [all_positive seed=70011] max_diff=4.037500e+01, mean_diff=2.031327e-03, ref_range=[0.0000e+00,5.5950e+02], orig_range=[0.0000e+00,5.5950e+02]
+  - [mixed_extremes seed=70012] max_diff=5.169600e+04, mean_diff=3.323262e-02, ref_range=[-5.7376e+04,5.5392e+04], orig_range=[-5.7376e+04,5.5392e+04]
+  - [mixed_extremes seed=70013] max_diff=4.756800e+04, mean_diff=1.248605e-02, ref_range=[-5.4816e+04,5.7536e+04], orig_range=[-5.4816e+04,5.7536e+04]
+  ... and 10 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

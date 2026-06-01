@@ -1,0 +1,574 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (112 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for numerically stable softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__global__ void softmax_kernel(
+    const T* input,
+    T* output,
+    const int batch_size,
+    const int num_features
+) {
+    // Each block processes one batch element
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const T* batch_input = input + batch_idx * num_features;
+    T* batch_output = output + batch_idx * num_features;
+    
+    // Shared memory for max and sum reductions
+    extern __shared__ float shared_mem[];
+    float* shared_max = shared_mem;
+    float* shared_sum = shared_mem + blockDim.x;
+    
+    // First pass: find max value in the row
+    float thread_max = -INFINITY;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        thread_max = fmaxf(thread_max, val);
+    }
+    
+    // Parallel reduction for max
+    shared_max[tid] = thread_max;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+        }
+        __syncthreads();
+    }
+    
+    float row_max = shared_max[0];
+    
+    // Second pass: compute exponentials and sum
+    float thread_sum = 0.0f;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        float exp_val = expf(val - row_max);
+        batch_output[i] = static_cast<T>(exp_val);
+        thread_sum += exp_val;
+    }
+    
+    // Parallel reduction for sum
+    shared_sum[tid] = thread_sum;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    float row_sum = shared_sum[0];
+    
+    // Third pass: normalize by sum
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_output[i]);
+        batch_output[i] = static_cast<T>(val / row_sum);
+    }
+}
+
+torch::Tensor softmax_cuda(torch::Tensor input) {
+    auto sizes = input.sizes();
+    auto batch_size = sizes[0];
+    auto num_features = sizes[1];
+    
+    auto output = torch::empty_like(input);
+    
+    // Configure kernel launch parameters
+    const int threads_per_block = 256;
+    const int blocks_per_grid = batch_size;
+    
+    // Shared memory size: 2 * threads_per_block * sizeof(float)
+    size_t shared_mem_size = 2 * threads_per_block * sizeof(float);
+    
+    // Launch kernel based on data type
+    if (input.scalar_type() == torch::kFloat32) {
+        softmax_kernel<float><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kFloat16) {
+        softmax_kernel<at::Half><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::Half>(),
+            output.data_ptr<at::Half>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kBFloat16) {
+        softmax_kernel<at::BFloat16><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::BFloat16>(),
+            output.data_ptr<at::BFloat16>(),
+            batch_size,
+            num_features
+        );
+    }
+    
+    // Check for CUDA errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    // Synchronize to ensure kernel completes
+    cudaDeviceSynchronize();
+    
+    return output;
+}
+"""
+
+softmax_cpp_source = """
+torch::Tensor softmax_cuda(torch::Tensor input);
+"""
+
+# Compile the inline CUDA code
+softmax_module = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softmax activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softmax_cuda = softmax_module.softmax_cuda
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+            
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        # Use custom kernel for CUDA tensors with 2 dimensions
+        if x.is_cuda and x.dim() == 2:
+            return self.softmax_cuda(x)
+        else:
+            # Fallback to PyTorch's implementation for other cases
+            return torch.softmax(x, dim=1)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for numerically stable softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__global__ void softmax_kernel(
+    const T* input,
+    T* output,
+    const int batch_size,
+    const int num_features
+) {
+    // Each block processes one batch element
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const T* batch_input = input + batch_idx * num_features;
+    T* batch_output = output + batch_idx * num_features;
+    
+    // Shared memory for max and sum reductions
+    extern __shared__ float shared_mem[];
+    float* shared_max = shared_mem;
+    float* shared_sum = shared_mem + blockDim.x;
+    
+    // First pass: find max value in the row
+    float thread_max = -INFINITY;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        thread_max = fmaxf(thread_max, val);
+    }
+    
+    // Parallel reduction for max
+    shared_max[tid] = thread_max;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+        }
+    }
+    
+    float row_max = shared_max[0];
+    
+    // Second pass: compute exponentials and sum
+    float thread_sum = 0.0f;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        float exp_val = expf(val - row_max);
+        batch_output[i] = static_cast<T>(exp_val);
+        thread_sum += exp_val;
+    }
+    
+    // Parallel reduction for sum
+    shared_sum[tid] = thread_sum;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    float row_sum = shared_sum[0];
+    
+    // Third pass: normalize by sum
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_output[i]);
+        batch_output[i] = static_cast<T>(val / row_sum);
+    }
+}
+
+torch::Tensor softmax_cuda(torch::Tensor input) {
+    auto sizes = input.sizes();
+    auto batch_size = sizes[0];
+    auto num_features = sizes[1];
+    
+    auto output = torch::empty_like(input);
+    
+    // Configure kernel launch parameters
+    const int threads_per_block = 256;
+    const int blocks_per_grid = batch_size;
+    
+    // Shared memory size: 2 * threads_per_block * sizeof(float)
+    size_t shared_mem_size = 2 * threads_per_block * sizeof(float);
+    
+    // Launch kernel based on data type
+    if (input.scalar_type() == torch::kFloat32) {
+        softmax_kernel<float><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kFloat16) {
+        softmax_kernel<at::Half><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::Half>(),
+            output.data_ptr<at::Half>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kBFloat16) {
+        softmax_kernel<at::BFloat16><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::BFloat16>(),
+            output.data_ptr<at::BFloat16>(),
+            batch_size,
+            num_features
+        );
+    }
+    
+    // Check for CUDA errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    // Synchronize to ensure kernel completes
+    cudaDeviceSynchronize();
+    
+    return output;
+}
+"""
+
+softmax_cpp_source = """
+torch::Tensor softmax_cuda(torch::Tensor input);
+"""
+
+# Compile the inline CUDA code
+softmax_module = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softmax activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softmax_cuda = softmax_module.softmax_cuda
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+            
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        # Use custom kernel for CUDA tensors with 2 dimensions
+        if x.is_cuda and x.dim() == 2:
+            return self.softmax_cuda(x)
+        else:
+            # Fallback to PyTorch's implementation for other cases
+            return torch.softmax(x, dim=1)
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 48
+- Original fragment: `__syncthreads();`
+- node_type: cuda_syncthreads
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 48
+- Original fragment: `__syncthreads();`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - structured_ramp: passed
+  - structured_ramp: passed
+  - head_heavy: passed
+  - head_heavy: passed
+  - tail_heavy: passed
+  - tail_heavy: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.515127182006836, 'mean': -0.0012394363293424249, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.131533622741699, 'max': 10000.0, 'mean': 0.0353255495429039, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation removes a __syncthreads() barrier after the max reduction loop. However, the loop iterates with s > 0, and the last iteration (s=1) writes to shared_max[0] and shared_max[1] only for tid=0. After the loop exits, the next read of shared_max[0] occurs at line 50. Since the loop's final write is performed by thread 0, and all other threads are idle (tid >= s), there is no race condition: thread 0's write is visible to itself without a barrier. The removed barrier was redundant because 
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Place maximum values at positions processed by high-numbered threads (positions 255, 511, etc.) and extreme negative values elsewhere. If race causes wrong max computation, softmax will overflow/underflow producing dramatically different results. Run multiple times to increase probability of race manifestation.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Shape [16, 16384] - maximize race impact
+    # Thread tid processes positions: tid, tid+256, tid+512, ...
+    x = torch.full((16, 16384), -100.0, dtype=torch.float32, device=device)
+    
+    # Place max at positions processed by thread 255 (warp 7, last active warp)
+    # and thread 128 (warp 4, mid-point in reduction tree)
+    for row in range(16):
+        x[row, 255] = 100.0   # Thread 255 (warp 7)
+        x[row, 128] = 100.0   # Thread 128 (warp 4) - critical for s=128 iteration
+        x[row, 64] = 100.0    # Thread 64 (warp 2) - critical for s=64 iteration
+    
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Place a SINGLE extreme maximum value at positions that require cross-warp propagation (255, 191, 127, etc.) with all other values extremely negative (-80). Use different critical positions per row to test multiple reduction tree paths. The single-max pattern ensures no redundant paths can compensate for a failed propagation.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.full((16, 16384), -80.0, dtype=torch.float32, device=device)
+    # Critical positions: each requires cross-warp communication in reduction
+    # Position 255: thread 127 (warp 3) -> thread 63 (warp 1)
+    # Position 127: thread 63 (warp 1) -> thread 31 (warp 0)
+    # Position 191: thread 63 reads shared_max[191] written by thread 191 (warp 5)
+    critical_positions = [
+        255,   # warp 7->3->1 dependency
+        191,   # warp 5->1 dependency  
+        127,   # warp 3->1->0 dependency
+        223,   # warp 6->3 dependency
+        159,   # warp 4->1 dependency
+        175,   # warp 5->1 dependency
+        239,   # warp 7->3 dependency
+        207,   # warp 6->2 dependency
+        143,   # warp 4->1 dependency
+        231,   # warp 7->3 dependency
+        183,   # warp 5->2 dependency
+        199,   # warp 6->2 dependency
+        247,   # warp 7->3 dependency
+        215,   # warp 6->2 dependency
+        167,   # warp 5->2 dependency
+        151    # warp 4->1 dependency
+    ]
+    for row in range(16):
+        x[row, critical_positions[row]] = 80.0
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 3
+- Strategy: Use a narrow value range where all elements are close (near 0), but with the TRUE maximum at position 255 being just slightly higher (+0.5). If the race causes thread 0 to read stale data and miss this maximum, it uses a nearby value as max. The small difference (delta ~0.5) means exp values won't overflow, but the relative softmax probabilities will shift detectably. Add anti-correlated values at thread 0's position to ensure wrong max selection produces maximum divergence.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.full((16, 16384), -0.5, dtype=torch.float32, device=device)
+    for row in range(16):
+        # Position 0: thread 0's local contribution - set to 0.0
+        x[row, 0] = 0.0
+        # Position 255: thread 255's contribution - true max at +0.5
+        # Requires FULL reduction chain (255->127->63->31->15->7->3->1->0)
+        x[row, 255] = 0.5
+        # Also add max at far positions to stress memory bandwidth
+        # These are processed by thread 255 in later iterations
+        x[row, 255 + 256] = 0.3  # Position 511
+        x[row, 255 + 512] = 0.3  # Position 767
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 4
+- Strategy: Place the sole global maximum (+88.0) at positions processed exclusively by thread 192 (positions 192, 448, etc.) with all other values at extreme negative (-88.0). If the race causes thread 0 to read pre-updated shared_max[64] (which is -88.0) instead of the propagated value from position 192 (which is +88.0), then exp(88 - (-88)) = exp(176) causes overflow to inf, producing NaN in softmax vs correct normalized output.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.full((16, 16384), -88.0, dtype=torch.float32, device=device)
+    # Critical positions that stress specific reduction paths
+    # Thread 192 -> s=128 -> thread 64 -> s=64 -> thread 0
+    # Thread 160 -> s=128 -> thread 32 -> s=64 -> thread 0 (via s=32)
+    # Thread 224 -> s=128 -> thread 96 -> s=64 -> thread 32 -> s=32 -> thread 0
+    critical_positions_per_row = [
+        192,  # warp 6 -> warp 2 -> warp 0
+        160,  # warp 5 -> warp 1 -> warp 0
+        224,  # warp 7 -> warp 3 -> warp 0
+        176,  # warp 5 -> warp 1 -> warp 0
+        192,
+        208,  # warp 6 -> warp 2 -> warp 0
+        240,  # warp 7 -> warp 3 -> warp 1 -> warp 0
+        144,  # warp 4 -> warp 1 -> warp 0
+        192,
+        160,
+        224,
+        176,
+        200,  # warp 6 -> warp 2 -> warp 0
+        168,  # warp 5 -> warp 1 -> warp 0
+        232,  # warp 7 -> warp 3 -> warp 1 -> warp 0
+        152   # warp 4 -> warp 1 -> warp 0
+    ]
+    for row in range(16):
+        pos = critical_positions_per_row[row]
+        # Place sole maximum at this position
+        x[row, pos] = 88.0
+        # Ensure thread 0's positions stay low
+        x[row, 0] = -88.0
+        x[row, 256] = -88.0
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

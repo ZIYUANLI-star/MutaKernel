@@ -1,0 +1,66 @@
+--- /home/kbuser/projects/KernelBench-0/runs/iter_full_l1_caesar_paper_v2/iterations/problem_098/turn_09/kernel.py	2026-04-04 02:09:52.152508558 +0800
++++ "/mnt/d/doctor_learning/Academic_Project/paper_1/MutaKernel/\347\254\254\344\272\214\346\254\241\345\256\236\351\252\214\346\261\207\346\200\273/\347\254\254\344\272\214\346\254\241\345\256\236\351\252\214\346\261\207\346\200\273_\350\241\245\345\205\205/task_b_regenerate/kernels/L1_P98_round1.py"	2026-05-14 01:53:22.067809900 +0800
+@@ -40,13 +40,16 @@
+         float p = static_cast<float>(pred_batch[idx]);
+         float t = static_cast<float>(target_batch[idx]);
+         
+-        // KL divergence: t * log(t / p) = t * (log(t) - log(p))
+-        // But we compute directly to match PyTorch's kl_div
+-        if (t > 0.0f && p > 0.0f) {
+-            thread_sum += t * (__logf(t) - __logf(p));
++        // KL divergence matching PyTorch's kl_div:
++        // PyTorch kl_div(log_input, target) = target * (log(target) - log_input)
++        // Since we get predictions (not log), we compute:
++        // target * (log(target) - log(predictions))
++        // For target <= 0, contribution is 0 (by convention 0*log(0) = 0)
++        if (t > 0.0f) {
++            float log_p = (p > 0.0f) ? logf(p) : -1e10f;  // Handle p=0 case
++            float log_t = logf(t);
++            thread_sum += t * (log_t - log_p);
+         }
+-        // Note: PyTorch's kl_div expects log(predictions) as input,
+-        // but we're computing the full KL divergence here
+     }
+     
+     // Warp reduction
+@@ -101,7 +104,7 @@
+         );
+     }));
+     
+-    // Return batchmean reduction
++    // Return batchmean reduction (sum over all elements / batch_size)
+     return output.mean();
+ }
+ """
+@@ -118,12 +121,13 @@
+     functions=["fused_kl_div_cuda"],
+     verbose=False,
+     extra_cflags=["-O3"],
+-    extra_cuda_cflags=["-O3", "--use_fast_math"],
++    extra_cuda_cflags=["-O3"],
+ )
+ 
+ class ModelNew(nn.Module):
+     """
+     Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
++    Matches PyTorch's torch.nn.functional.kl_div(torch.log(predictions), targets, reduction='batchmean')
+     """
+     def __init__(self):
+         super(ModelNew, self).__init__()
+@@ -134,13 +138,9 @@
+         predictions = predictions.contiguous()
+         targets = targets.contiguous()
+         
+-        # Ensure numerical stability (matching PyTorch's behavior)
++        # Only clamp predictions to avoid log(0), but DO NOT normalize
++        # This matches PyTorch's behavior which takes raw inputs
+         predictions = torch.clamp(predictions, min=1e-12)
+-        targets = torch.clamp(targets, min=1e-12)
+-        
+-        # Normalize to probability distributions
+-        predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+-        targets = targets / targets.sum(dim=-1, keepdim=True)
+         
+         # Use fused CUDA kernel
+         return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+\ No newline at end of file

@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P41__launch_config_mutate__1",
+  "operator_name": "launch_config_mutate",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8457,
+        "completion_tokens": 3188,
+        "total_tokens": 11645,
+        "reasoning_tokens": 988
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Grid.x = (N+31)/32 - 1 launches one fewer block than needed. For N>=32, columns [(grid.x)*32, N) are never written, leaving torch::empty garbage. These corrupt the GroupNorm+Mean+ReLU output.",
+      "survival_reason": "The mutation reduces the grid x-dimension by 1, causing the last tile of output columns (up to 32 columns) to never be computed by any thread block. The output tensor is allocated with torch::empty, leaving those columns containing uninitialized memory. When the second kernel computes GroupNorm statistics and mean across all channels, it includes these garbage values, producing wildly incorrect results.",
+      "killable": true,
+      "kill_strategy": "Any input values will expose this bug because uninitialized memory will have arbitrary garbage values that differ significantly from correctly computed GELU outputs. The final output will be corrupted when GroupNorm averages over channels including the garbage columns.",
+      "recommendations": "Always verify grid launch dimensions cover the full output tensor. Add assertions like `assert grid.x * TILE_SIZE >= N` in debug builds to catch launch configuration bugs early.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    x = torch.randn(128, 512, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8254,
+        "completion_tokens": 2660,
+        "total_tokens": 10914,
+        "reasoning_tokens": 1230
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation reduces grid.x by 1, leaving the last TILE_SIZE=32 columns of the GEMM output uninitialized. With random inputs and default initialization, the uninitialized memory (from torch::empty) likely contains near-zero values. After GELU activation (which maps near-zero to near-zero), these garbage values average with valid outputs in GroupNorm+Mean, producing results within tolerance. To kill: create inputs where correct outputs in last 32 columns are large and positive, so averaging with garbage zeros creates detectable difference.",
+      "survival_reason": "The previous attempt used standard random inputs which produce GELU outputs distributed around 0-1 range. When the last 32 columns contain uninitialized memory (typically zeros or small garbage), the mean across all channels doesn't change enough to exceed the atol=1e-2, rtol=1e-2 tolerance. The infection (missing columns) doesn't propagate sufficiently because the magnitude difference is diluted across many channels. A fundamentally different strategy is to use large positive input values that cause the correct GEMM->BatchNorm->GELU output to be large and positive in the last columns, maximizing the difference when they're replaced by garbage.",
+      "killable": true,
+      "kill_strategy": "Use large positive input values (all elements = 10.0) to produce large positive GELU outputs across all columns. When the last 32 columns are uninitialized garbage (likely near-zero), the channel-wise mean in GroupNorm will differ significantly from the correct case where all columns have large positive values.",
+      "recommendations": "When testing grid launch configuration mutations, use extreme input values (large positives, large negatives, or specific patterns) rather than random values to ensure that any uncomputed regions produce outputs that are detectably different from garbage/uninitialized memory.",
+      "suggested_code": "def generate_inputs(device):\n    # Use large positive values to ensure GELU outputs are large\n    # When last 32 columns are uninitialized garbage, the mean will differ significantly\n    x = torch.full((128, 512), 10.0, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8453,
+        "completion_tokens": 5669,
+        "total_tokens": 14122,
+        "reasoning_tokens": 2972
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With scale=100 inputs, GEMM outputs span ~[-5000, +5000]. GELU(x) for x>>0 ≈ x, for x<<0 ≈ 0. This creates bimodal outputs. GroupNorm on garbage (near-zero) vs bimodal produces different means/variances: var(bimodal) >> var(zeros). Final mean differs by O(1) after GroupNorm, exceeding atol=0.01.",
+      "survival_reason": "Previous attempts produced GELU outputs with near-zero mean matching garbage memory. Random inputs with unit scale give moderate GEMM outputs that BN-normalize to small values; constant 10.0 gives zero-mean GEMM outputs due to symmetric weights. The solution uses high-magnitude inputs (scale=100) to create a bimodal GELU distribution with many zeros and many large positives. This bimodal distribution has fundamentally different group statistics (mean, variance) than garbage memory, causing GroupNorm to produce significantly different normalized values and final means.",
+      "killable": true,
+      "kill_strategy": "Use high-magnitude inputs (randn * 100) to create bimodal GELU outputs where the distribution statistics differ drastically from uninitialized memory zeros.",
+      "recommendations": "When testing kernels with tile-based grid configurations, use inputs that produce outputs with non-zero mean AND high variance to ensure uninitialized memory cannot coincidentally match expected values.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(12345)\n    # Large scale creates extreme GEMM outputs\n    # GELU clips negatives to ~0, keeps positives\n    # This bimodal distribution has different variance than garbage zeros\n    x = torch.randn(128, 512, dtype=torch.float32, device=device) * 100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8636,
+        "completion_tokens": 5279,
+        "total_tokens": 13915,
+        "reasoning_tokens": 2529
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With grid.x reduced by 1, last 32 columns of GEMM output are uninitialized. GroupNorm normalizes groups independently, potentially masking differences. Using alternating +/- extreme inputs creates bimodal GEMM outputs where GELU compresses negatives near zero. Garbage columns with memory artifacts won't follow this pattern, causing GroupNorm group statistics to differ significantly from correctly computed groups.",
+      "survival_reason": "Previous attempts failed due to: (1) GPU memory reuse causing garbage columns to contain similar values to reference, (2) GroupNorm normalizing both correct and garbage groups to similar distributions (mean~0, var~1), (3) Large magnitude inputs increasing rtol threshold. The random/uniform patterns didn't create sufficient deterministic structure to expose the garbage columns. A structured alternating extreme pattern creates predictable group statistics that garbage cannot match.",
+      "killable": true,
+      "kill_strategy": "Use alternating extreme values (+100, -100) in input rows to create bimodal GEMM outputs. After GELU, this becomes sparse (negatives -> ~0, positives -> large). Garbage columns won't have this bimodal-then-sparse pattern, causing divergent GroupNorm statistics and different final means.",
+      "recommendations": "For kernels using torch::empty for output allocation, mutation tests should verify all output regions are written by explicitly pre-filling output with sentinel values (e.g., NaN) before kernel launch, ensuring any unwritten regions are detectable.",
+      "suggested_code": "def generate_inputs(device):\n    # Create alternating extreme pattern\n    # This produces deterministic GEMM outputs where\n    # correctly computed columns have specific statistics\n    # that uninitialized garbage columns cannot match\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    # Alternate rows between +50 and -50\n    x[0::2, :] = 50.0\n    x[1::2, :] = -50.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8881,
+        "completion_tokens": 5546,
+        "total_tokens": 14427,
+        "reasoning_tokens": 2518
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With zero input, GEMM output[i,j] = bias[j] exactly. For columns in the last tile (e.g., 224-255 if out_features=256), mutant has garbage instead of bias[j]. GroupNorm over groups containing these columns computes wrong statistics. Mean across channels differs by ~|bias[col]|/num_channels for each uncomputed column.",
+      "survival_reason": "Previous attempts used random/large inputs where the GEMM output had high variance across columns. After GroupNorm (which normalizes to mean=0, std=1 per group) and channel-wise mean, both correct and garbage values averaged to near-zero. With bias_gn=0 default, the final mean was ~0 in both cases, making ReLU output ~0 for both. Zero input isolates the deterministic bias term, making uncomputed columns distinctly different from bias-derived values.",
+      "killable": true,
+      "kill_strategy": "Use all-zero input so GEMM output equals bias only. The last tile columns will have garbage instead of bias values, causing GroupNorm statistics to differ significantly, propagating to a different final mean.",
+      "recommendations": "Test GPU kernels with zero inputs to isolate bias terms and expose grid/block sizing bugs that leave columns uncomputed. Zero inputs create deterministic outputs that garbage memory cannot accidentally match.",
+      "suggested_code": "def generate_inputs(device):\n    # Zero input means GEMM output = bias exactly\n    # Uncomputed columns will have garbage, not bias values\n    # This deterministic pattern cannot be matched by garbage\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 963.83
+}

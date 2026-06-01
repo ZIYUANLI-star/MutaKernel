@@ -1,0 +1,144 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs 4D tensor-matrix multiplication: 
+        C[b, i, j, k] = sum_l A[b, i, j, l] * B[l, k]
+
+    Args:
+        A (torch.Tensor): Input 4D tensor of shape (b, i, j, l)
+        B (torch.Tensor): Input matrix of shape (l, k)
+
+    Returns:
+        torch.Tensor: Output 4D tensor of shape (b, i, j, k)
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, A, B):
+        """
+        Performs the 4D tensor-matrix multiplication.
+
+        Args:
+            A (torch.Tensor): Input 4D tensor of shape (b, i, j, l)
+            B (torch.Tensor): Input matrix of shape (l, k)
+
+        Returns:
+            torch.Tensor: Output 4D tensor of shape (b, i, j, k)
+        """
+        return torch.einsum("bijl,lk->bijk", A, B)
+
+# Test code
+b = 8
+i = 256
+j = 512
+l = 256
+k = 768
+
+def get_inputs():
+    A = torch.rand(b, i, j, l)
+    B = torch.rand(l, k)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Performs 4D tensor-matrix multiplication using optimized matrix multiplication:
+        C[b, i, j, k] = sum_l A[b, i, j, l] * B[l, k]
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A, B):
+        """
+        Performs the 4D tensor-matrix multiplication.
+
+        Args:
+            A (torch.Tensor): Input 4D tensor of shape (8, 256, 512, 256)
+            B (torch.Tensor): Input matrix of shape (256, 768)
+
+        Returns:
+            torch.Tensor: Output 4D tensor of shape (8, 256, 512, 768)
+        """
+        # Use TF32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Reshape A to 2D and perform matrix multiplication
+        batch_size = A.shape[0]
+        i = A.shape[1]
+        j = A.shape[2]
+        l = A.shape[3]
+        k = B.shape[1]
+        
+        A_reshaped = A.reshape(-1, l)
+        result = A_reshaped @ B
+        output = result.reshape(batch_size, i, j, k)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return output
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 40
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (20 failures)
+  - [large_magnitude seed=50000] max_diff=3.114100e+04, mean_diff=3.740993e+03, ref_range=[-1.0169e+08,1.0427e+08], orig_range=[-1.0169e+08,1.0426e+08]
+  - [large_magnitude seed=50001] max_diff=3.123300e+04, mean_diff=3.726950e+03, ref_range=[-1.0476e+08,9.9125e+07], orig_range=[-1.0475e+08,9.9131e+07]
+  - [mixed_extremes seed=50012] max_diff=2.015872e+06, mean_diff=1.839075e+05, ref_range=[-5.6137e+09,6.0305e+09], orig_range=[-5.6132e+09,6.0307e+09]
+  - [mixed_extremes seed=50013] max_diff=1.890432e+06, mean_diff=1.841884e+05, ref_range=[-5.7761e+09,5.3126e+09], orig_range=[-5.7763e+09,5.3130e+09]
+  - [alternating_sign seed=50014] max_diff=3.054219e+02, mean_diff=3.750711e+01, ref_range=[-7.3667e+05,7.6196e+05], orig_range=[-7.3666e+05,7.6192e+05]
+  - [alternating_sign seed=50015] max_diff=3.111328e+02, mean_diff=3.710366e+01, ref_range=[-7.4421e+05,7.8820e+05], orig_range=[-7.4421e+05,7.8823e+05]
+  - [sparse seed=50016] max_diff=1.047734e+02, mean_diff=2.781718e+00, ref_range=[-2.1235e+05,2.1713e+05], orig_range=[-2.1241e+05,2.1718e+05]
+  - [sparse seed=50017] max_diff=1.148281e+02, mean_diff=2.782415e+00, ref_range=[-2.1022e+05,2.3654e+05], orig_range=[-2.1021e+05,2.3658e+05]
+  ... and 12 more failures
+
+### training_stress (20 failures)
+  - [large_magnitude seed=70000] max_diff=3.275800e+04, mean_diff=3.737749e+03, ref_range=[-1.0552e+08,9.5626e+07], orig_range=[-1.0552e+08,9.5622e+07]
+  - [large_magnitude seed=70001] max_diff=3.217400e+04, mean_diff=3.739444e+03, ref_range=[-9.7398e+07,1.0080e+08], orig_range=[-9.7394e+07,1.0080e+08]
+  - [mixed_extremes seed=70012] max_diff=2.008320e+06, mean_diff=1.847328e+05, ref_range=[-5.5208e+09,5.2139e+09], orig_range=[-5.5216e+09,5.2140e+09]
+  - [mixed_extremes seed=70013] max_diff=2.102400e+06, mean_diff=1.843340e+05, ref_range=[-5.4535e+09,5.5634e+09], orig_range=[-5.4536e+09,5.5637e+09]
+  - [alternating_sign seed=70014] max_diff=3.063125e+02, mean_diff=3.662521e+01, ref_range=[-7.4167e+05,7.0230e+05], orig_range=[-7.4166e+05,7.0227e+05]
+  - [alternating_sign seed=70015] max_diff=3.206328e+02, mean_diff=3.724527e+01, ref_range=[-8.5277e+05,7.5638e+05], orig_range=[-8.5287e+05,7.5635e+05]
+  - [sparse seed=70016] max_diff=1.108750e+02, mean_diff=2.790429e+00, ref_range=[-2.1051e+05,2.1365e+05], orig_range=[-2.1047e+05,2.1361e+05]
+  - [sparse seed=70017] max_diff=1.161719e+02, mean_diff=2.810270e+00, ref_range=[-2.2102e+05,2.4016e+05], orig_range=[-2.2103e+05,2.4018e+05]
+  ... and 12 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

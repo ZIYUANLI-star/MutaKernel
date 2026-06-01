@@ -1,0 +1,154 @@
+{
+  "mutant_id": "L1_P44__mask_boundary__0",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P44",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5417,
+        "completion_tokens": 3849,
+        "total_tokens": 9266,
+        "reasoning_tokens": 1443
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "With output_pos = output_length, original guard `>= output_length` returns true (exits), mutated guard `> output_length` returns false (continues). Thread writes 0 to output_idx = base + output_length, which is out-of-bounds for that (batch,channel) pair but within buffer, corrupting next channel's position 0.",
+      "survival_reason": "The mutation causes threads where output_pos equals output_length to continue execution instead of returning early. These threads compute an output index that's one position beyond their assigned (batch,channel) segment, writing into the next channel's first element. This creates a race condition where the erroneous write (value 0) may overwrite the correct pooled value. Random input values may sometimes produce pooled values close to 0, making the corruption less detectable, but constant large inputs guarantee a large difference when corruption occurs.",
+      "killable": true,
+      "kill_strategy": "Fill input tensor with a large constant value (e.g., 100.0). When the bug triggers, specific output positions will be corrupted to 0 instead of the expected pooled value (~100.0), creating a difference of ~100 which far exceeds the tolerance threshold.",
+      "recommendations": "Boundary guards like `idx >= N` vs `idx > N` are critical for correct thread termination. Add assertions in tests that verify output tensor bounds are not inadvertently written beyond their intended regions, possibly using memory sanitizers or explicit bounds checking during development.",
+      "suggested_code": "def generate_inputs(device):\n    # Fill with large constant - any corruption will write 0 instead of ~100\n    x = torch.full((16, 32, 128), 100.0, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5242,
+        "completion_tokens": 6261,
+        "total_tokens": 11503,
+        "reasoning_tokens": 2693
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Thread (b,c,output_length) writes to index (b*32+c)*output_length+output_length = (b*32+c+1)*output_length, corrupting position (b,c+1,0). With even channels=+1000, odd channels=-1000, corruption writes +1000/(kernel_size) where -1000/(kernel_size) expected. Difference ~2000 >> tolerance 1%.",
+      "survival_reason": "Constant 100.0 failed because the corrupted writes and correct writes race to the same positions, and with uniform values, scheduling may cause the correct value to overwrite corruption. By using dramatically different values between adjacent channels (channel 0=+1000, channel 1=-1000, etc.), the corrupted value from channel c (positive) targeting channel c+1's position 0 (should be negative) creates a ~2000 difference. This exceeds tolerance regardless of partial ordering effects.",
+      "killable": true,
+      "kill_strategy": "Use channel-alternating extreme values: even channels get +1000.0, odd channels get -1000.0. The out-of-bounds write from an even channel corrupts the next odd channel's first position with a positive value where a negative value is expected.",
+      "recommendations": "For boundary condition mutations in kernels with multi-dimensional indexing, test with channel-varying or batch-varying patterns to expose cross-entity corruption that uniform values would hide due to race conditions.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros((16, 32, 128), dtype=torch.float32, device=device)\n    # Even channels get +1000, odd channels get -1000\n    x[:, 0::2, :] = 1000.0\n    x[:, 1::2, :] = -1000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5443,
+        "completion_tokens": 6093,
+        "total_tokens": 11536,
+        "reasoning_tokens": 2339
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With output_length=125, thread output_pos=125 reads input[125:128] and writes to output[(b*32+c)*125+125]=output[b,c+1,0]. This races with legitimate thread. Setting input[*,*,125:128]=NaN causes corrupted write to be NaN, while legitimate value from input[*,*,0:4] is valid. NaN never matches valid number under allclose.",
+      "survival_reason": "Previous attempts used uniform values where the race condition between out-of-bounds write and legitimate write was non-deterministic. The legitimate thread often won, preserving correct values. Using NaN at the corruption source positions (125-127) ensures that if the out-of-bounds thread ever wins the race, the output contains NaN which is guaranteed to fail comparison against any valid number, regardless of tolerance settings.",
+      "killable": true,
+      "kill_strategy": "Place NaN values at positions 125-127 (the source for out-of-bounds reads) and valid large values at positions 0-3 (the source for legitimate reads). When the race condition lets the corrupted NaN value persist, allclose will fail.",
+      "recommendations": "Boundary guard mutations affecting thread validity checks create race conditions when out-of-bounds threads write to memory also accessed by valid threads. Tests should use distinguishing marker values (like NaN or inf) at boundary positions to make corruption detectable regardless of race outcomes.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros((16, 32, 128), dtype=torch.float32, device=device)\n    # Positions 0-3 get large valid values (legitimate thread reads these)\n    x[:, :, 0:4] = 1000.0\n    # Positions 125-127 get NaN (out-of-bounds thread reads these)\n    x[:, :, 125:128] = float('nan')\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5690,
+        "completion_tokens": 4511,
+        "total_tokens": 10201,
+        "reasoning_tokens": 2151
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation changes 'output_pos >= output_length' to 'output_pos > output_length'. When output_pos == output_length (which occurs since threads 0-255 are launched and output_length < 256), the bogus thread reads from input positions near the end (125-127 for kernel_size=4) and writes to the NEXT channel's position 0 (output_idx wraps to next channel). If end-of-channel values differ significantly from start-of-channel values, the corruption produces detectable differences (1000 >> tolerance ~10).",
+      "survival_reason": "Round 1 failed because uniform values (100.0 everywhere) meant bogus and legitimate writes produced identical results - corruption was value-invisible. Round 2's alternating pattern still had each channel internally uniform, so the bogus read (end of channel N) matched the legitimate read (start of channel N+1) within tolerance when both channels had similar magnitudes. Round 3 incorrectly placed NaN where the reference also reads from, causing both to fail. The key insight is the bogus thread reads from END of input (positions ~125-127) while legitimate thread reads from START (positions ~0-3). These regions must have vastly different values.",
+      "killable": true,
+      "kill_strategy": "Create sharp value discontinuity: END of each channel's input (positions 120-127) should be 0.0, while START of each channel's input (positions 0-7) should be 1000.0. The bogus write averages ~0.0 but overwrites a position expecting ~1000.0. Difference of 1000 far exceeds tolerance of ~10.",
+      "recommendations": "When testing boundary guard mutations, design inputs where values at different index regions (start vs end, in-bounds vs out-of-bounds source) have maximally different magnitudes to expose any index-off-by-one corruption.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros((16, 32, 128), dtype=torch.float32, device=device)\n    # Start of each channel gets high values (legitimate reads)\n    x[:, :, 0:8] = 1000.0\n    # End of each channel stays at 0.0 (bogus thread reads these)\n    # x[:, :, 120:128] = 0.0  # already zero\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5944,
+        "completion_tokens": 5018,
+        "total_tokens": 10962,
+        "reasoning_tokens": 2257
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With input_length=128, kernel_size=4, stride=1, padding=0: output_length=125. Thread with output_pos=125 (threadIdx.x=125 in block y=0) triggers the bug. Mutant computes avg(input[125:128]) from channel C and writes to output[batch, C+1, 0], racing with the legitimate thread. Previous attempts used patterns where either both values were similar OR the legitimate thread consistently won the race.",
+      "survival_reason": "Round 1 failed because constant 100.0 everywhere means rogue and legitimate threads compute identical values. Round 2 used alternating channels (±1000) but the rogue reads from the END of its own channel (same sign as whole channel), not the start of next channel. Round 3 crashed due to NaN propagating to reference. Round 4 had zeros at end and 1000 at start, but the rogue reads channel 0's END (zeros) and should write to channel 1's position 0, where the START is also checked - but the race condition favored the legitimate thread. The key insight is we need EACH channel to have a DIFFERENT uniform value so that END of channel C differs maximally from START of channel C+1.",
+      "killable": true,
+      "kill_strategy": "Assign each channel a unique uniform value (channel_idx * 1000). The rogue thread from channel C computes avg of channel C's end (C*1000) and writes to channel C+1's position 0, where the correct value should be (C+1)*1000. Difference of 1000 far exceeds tolerance of ~10. This pattern ensures EVERY channel boundary is a potential detection point, maximizing chances of catching the race condition.",
+      "recommendations": "Boundary condition mutations involving `>=` vs `>` should be tested with inputs that create value discontinuities at the exact positions where out-of-bounds accesses would occur, particularly at memory layout boundaries between logical array dimensions.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros((16, 32, 128), dtype=torch.float32, device=device)\n    for c in range(32):\n        x[:, c, :] = c * 1000.0\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=7.500000e+02, mean_diff=6.866455e-02, ref_range=[0.0000e+00,3.1000e+04], mut_range=[0.0000e+00,3.1000e+04]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 5,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Assign each channel a unique uniform value (channel_idx * 1000). The rogue thread from channel C computes avg of channel C's end (C*1000) and writes to channel C+1's position 0, where the correct value should be (C+1)*1000. Difference of 1000 far exceeds tolerance of ~10. This pattern ensures EVERY channel boundary is a potential detection point, maximizing chances of catching the race condition.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros((16, 32, 128), dtype=torch.float32, device=device)\n    for c in range(32):\n        x[:, c, :] = c * 1000.0\n    return [x]"
+  },
+  "elapsed_sec": 1034.06
+}

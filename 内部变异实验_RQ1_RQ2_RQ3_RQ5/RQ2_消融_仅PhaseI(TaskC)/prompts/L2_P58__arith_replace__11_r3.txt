@@ -1,0 +1,471 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (112 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define fused kernel for LogSumExp + HardSwish + bias subtraction + clamp + max reduction
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__device__ __forceinline__ T sigmoid_approx(T x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+
+__global__ void fused_ops_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width,
+    int spatial_size
+) {
+    // Each thread handles one spatial position across all channels
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (spatial_idx >= spatial_size) return;
+    
+    int batch_idx = blockIdx.y;
+    int total_spatial = depth * height * width;
+    
+    // Calculate base indices
+    int base_input_idx = (batch_idx * channels) * spatial_size + spatial_idx;
+    int base_output_idx = batch_idx * spatial_size + spatial_idx;
+    
+    // Shared memory for reduction
+    extern __shared__ float shared_mem[];
+    float* channel_vals = shared_mem;
+    
+    // Load all channel values for this spatial position
+    for (int c = threadIdx.y; c < channels; c += blockDim.y) {
+        if (spatial_idx < spatial_size) {
+            int input_idx = base_input_idx + c * spatial_size;
+            channel_vals[c] = input[input_idx];
+        }
+    }
+    __syncthreads();
+    
+    // Thread 0 of each warp performs LogSumExp reduction
+    if (threadIdx.y == 0) {
+        // Find max value
+        float max_val = -INFINITY;
+        for (int c = 0; c < channels; c++) {
+            if (channel_vals[c] > max_val) {
+                max_val = channel_vals[c];
+            }
+        }
+        
+        // Sum exponentials
+        float sum_exp = 0.0f;
+        for (int c = 0; c < channels; c++) {
+            sum_exp += __expf(channel_vals[c] - max_val);
+        }
+        
+        float logsumexp_result = __logf(sum_exp) + max_val;
+        
+        // HardSwish: x * sigmoid(x + 3) / 6
+        float swish_input = logsumexp_result + 3.0f;
+        float sigmoid_val = sigmoid_approx(swish_input);
+        float hardswish_result = logsumexp_result * sigmoid_val / 6.0f;
+        
+        // Subtract bias (using first channel's bias since we're reducing across channels)
+        float biased_result = hardswish_result - bias[0];
+        
+        // Clamp between -1 and 1
+        float clamped_result = fminf(fmaxf(biased_result, -1.0f), 1.0f);
+        
+        // Find max across channels for final output
+        float max_final = -INFINITY;
+        for (int c = 0; c < channels; c++) {
+            // Apply same operations to each channel for max reduction
+            float channel_val = channel_vals[c];
+            float swish_channel = channel_val + 3.0f;
+            float sigmoid_channel = sigmoid_approx(swish_channel);
+            float hardswish_channel = channel_val * sigmoid_channel / 6.0f;
+            float biased_channel = hardswish_channel - bias[c];
+            float clamped_channel = fminf(fmaxf(biased_channel, -1.0f), 1.0f);
+            
+            if (clamped_channel > max_final) {
+                max_final = clamped_channel;
+            }
+        }
+        
+        output[base_output_idx] = max_final;
+    }
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias) {
+    auto sizes = input.sizes();
+    int batch_size = sizes[0];
+    int channels = sizes[1];
+    int depth = sizes[2];
+    int height = sizes[3];
+    int width = sizes[4];
+    int spatial_size = depth * height * width;
+    
+    // Output tensor: [batch_size, 1, depth, height, width]
+    auto output = torch::empty({batch_size, 1, depth, height, width}, 
+                               torch::device(torch::kCUDA).dtype(torch::kFloat32));
+    
+    // Optimized thread block configuration
+    dim3 block_size(256, 1);  // x: spatial, y: channels
+    dim3 grid_size((spatial_size + block_size.x - 1) / block_size.x, batch_size);
+    
+    // Calculate shared memory size
+    int shared_mem_size = channels * sizeof(float);
+    
+    fused_ops_kernel<<<grid_size, block_size, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        depth,
+        height,
+        width,
+        spatial_size
+    );
+    
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias);"
+
+# Compile the fused CUDA kernel
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-ffast-math"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fully fused CUDA kernel for all operations after conv transpose.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_ops.fused_ops_cuda(x, self.bias)
+        return x
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define fused kernel for LogSumExp + HardSwish + bias subtraction + clamp + max reduction
+fused_ops_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__device__ __forceinline__ T sigmoid_approx(T x) {
+    return 1.0f / (1.0f + __expf(-x));
+}
+
+__global__ void fused_ops_kernel(
+    const float* __restrict__ input, 
+    const float* __restrict__ bias, 
+    float* __restrict__ output,
+    int batch_size,
+    int channels,
+    int depth,
+    int height,
+    int width,
+    int spatial_size
+) {
+    // Each thread handles one spatial position across all channels
+    int spatial_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (spatial_idx >= spatial_size) return;
+    
+    int batch_idx = blockIdx.y;
+    int total_spatial = depth * height * width;
+    
+    // Calculate base indices
+    int base_input_idx = (batch_idx * channels) / spatial_size + spatial_idx;
+    int base_output_idx = batch_idx * spatial_size + spatial_idx;
+    
+    // Shared memory for reduction
+    extern __shared__ float shared_mem[];
+    float* channel_vals = shared_mem;
+    
+    // Load all channel values for this spatial position
+    for (int c = threadIdx.y; c < channels; c += blockDim.y) {
+        if (spatial_idx < spatial_size) {
+            int input_idx = base_input_idx + c * spatial_size;
+            channel_vals[c] = input[input_idx];
+        }
+    }
+    __syncthreads();
+    
+    // Thread 0 of each warp performs LogSumExp reduction
+    if (threadIdx.y == 0) {
+        // Find max value
+        float max_val = -INFINITY;
+        for (int c = 0; c < channels; c++) {
+            if (channel_vals[c] > max_val) {
+                max_val = channel_vals[c];
+            }
+        }
+        
+        // Sum exponentials
+        float sum_exp = 0.0f;
+        for (int c = 0; c < channels; c++) {
+            sum_exp += __expf(channel_vals[c] - max_val);
+        }
+        
+        float logsumexp_result = __logf(sum_exp) + max_val;
+        
+        // HardSwish: x * sigmoid(x + 3) / 6
+        float swish_input = logsumexp_result + 3.0f;
+        float sigmoid_val = sigmoid_approx(swish_input);
+        float hardswish_result = logsumexp_result * sigmoid_val / 6.0f;
+        
+        // Subtract bias (using first channel's bias since we're reducing across channels)
+        float biased_result = hardswish_result - bias[0];
+        
+        // Clamp between -1 and 1
+        float clamped_result = fminf(fmaxf(biased_result, -1.0f), 1.0f);
+        
+        // Find max across channels for final output
+        float max_final = -INFINITY;
+        for (int c = 0; c < channels; c++) {
+            // Apply same operations to each channel for max reduction
+            float channel_val = channel_vals[c];
+            float swish_channel = channel_val + 3.0f;
+            float sigmoid_channel = sigmoid_approx(swish_channel);
+            float hardswish_channel = channel_val * sigmoid_channel / 6.0f;
+            float biased_channel = hardswish_channel - bias[c];
+            float clamped_channel = fminf(fmaxf(biased_channel, -1.0f), 1.0f);
+            
+            if (clamped_channel > max_final) {
+                max_final = clamped_channel;
+            }
+        }
+        
+        output[base_output_idx] = max_final;
+    }
+}
+
+torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias) {
+    auto sizes = input.sizes();
+    int batch_size = sizes[0];
+    int channels = sizes[1];
+    int depth = sizes[2];
+    int height = sizes[3];
+    int width = sizes[4];
+    int spatial_size = depth * height * width;
+    
+    // Output tensor: [batch_size, 1, depth, height, width]
+    auto output = torch::empty({batch_size, 1, depth, height, width}, 
+                               torch::device(torch::kCUDA).dtype(torch::kFloat32));
+    
+    // Optimized thread block configuration
+    dim3 block_size(256, 1);  // x: spatial, y: channels
+    dim3 grid_size((spatial_size + block_size.x - 1) / block_size.x, batch_size);
+    
+    // Calculate shared memory size
+    int shared_mem_size = channels * sizeof(float);
+    
+    fused_ops_kernel<<<grid_size, block_size, shared_mem_size>>>(
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        output.data_ptr<float>(),
+        batch_size,
+        channels,
+        depth,
+        height,
+        width,
+        spatial_size
+    );
+    
+    return output;
+}
+"""
+
+fused_ops_cpp_source = "torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias);"
+
+# Compile the fused CUDA kernel
+fused_ops = load_inline(
+    name="fused_ops",
+    cpp_sources=fused_ops_cpp_source,
+    cuda_sources=fused_ops_source,
+    functions=["fused_ops_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-ffast-math"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fully fused CUDA kernel for all operations after conv transpose.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):
+        super(ModelNew, self).__init__()
+        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.fused_ops = fused_ops
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = self.fused_ops.fused_ops_cuda(x, self.bias)
+        return x
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 35
+- Original fragment: `*`
+- node_type: cuda_Mult
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[128, 3, 16, 32, 32], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 35
+- Original fragment: `*`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - extreme_magnitude: passed
+  - extreme_magnitude: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - near_zero: passed
+  - near_zero: passed
+  - all_negative: passed
+  - all_negative: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [128, 3, 16, 32, 32], 'dtype': 'torch.float32', 'min': -4.908847808837891, 'max': 5.37119197845459, 'mean': 0.00010189847671426833, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [128, 3, 16, 32, 32], 'dtype': 'torch.float32', 'min': -4.883575439453125, 'max': 10000.0, 'mean': 0.0009734227787703276, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: possibly_killable
+- Confidence: 0.95
+- Reasoning: The mutation changes the base_input_idx calculation from multiplication to division, which fundamentally alters memory access patterns. While Layer 2 tested 100+ random value distributions, it likely missed cases where the integer division produces different results than multiplication. Specifically, when (batch_idx * channels) is not an exact multiple of spatial_size, the division truncates, causing a different offset. This affects ALL memory accesses in the kernel since input_idx = base_input_
+- Kill strategy: Choose batch_idx values where (batch_idx * channels) % spatial_size ≠ 0. Since batch_idx ranges 0-127 (batch_size=128), we need batch_idx where (batch_idx * 3) % 16384 ≠ 0. This is true for most batch_idx except when batch_idx * 3 is a multiple of 16384. We should test with batch_idx values that maximize the difference between multiplication and division results.
+- Suggested test: Test with batch_idx values where (batch_idx * 3) % 16384 is non-zero and relatively large to maximize truncation effects. Use batch_idx = 1 (produces 3/16384 = 0 vs 3*16384 = 49152) and batch_idx = 54
+- Had executable code: True
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Create input where batch 0 is zeros and other batches have values that produce non-saturating outputs (between -1 and 1). After conv_transpose, batch 0 will produce a bias-dominated output while other batches produce different values. The mutant will incorrectly use batch 0's data for all batches.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.zeros(128, 3, 16, 32, 32, device=device, dtype=torch.float32)
+    # Batch 0 stays zero
+    # Other batches get distinct non-zero values that won't saturate after processing
+    x[1:, :, :, :, :] = 0.5  # Moderate value to avoid clamp saturation
+    # Add some variation to ensure conv_transpose produces different features
+    x[64:, :, :, :, :] = -0.5
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Create input where each batch has a distinct, linearly-scaled value pattern. Batch 0 gets large positive values (causing hardswish→+1 after clamp), while batch 127 gets large negative values (causing hardswish→-1 or 0). The systematic scaling ensures that even with random conv_transpose weights, the per-batch statistics differ enough to produce distinguishable outputs when the mutant incorrectly reads batch 0's data for all batches.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.zeros(128, 3, 16, 32, 32, device=device, dtype=torch.float32)
+    # Create per-batch gradient: batch 0 = -10, batch 64 = 0, batch 127 ≈ +10
+    for i in range(128):
+        x[i, :, :, :, :] = (i - 64) / 6.4  # Range: [-10, +9.84]
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P33__launch_config_mutate__1",
+  "operator_name": "launch_config_mutate",
+  "kernel_name": "L1_P33",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 10027,
+        "completion_tokens": 3616,
+        "total_tokens": 13643,
+        "reasoning_tokens": 1352
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Input shape [16,64,256,256] gives total_elements = 16*64*256*256 = 67,108,864. Since 67,108,864 = 2^26 and block_size = 256 = 2^8, total_elements is exactly divisible by block_size. Original num_blocks = ceil(67,108,864/256) = 262,144. Mutated num_blocks = 262,144 - 1 = 262,143. This leaves indices 67,108,608 to 67,108,863 (last 256 elements) unprocessed. However, this mutation is in the TRAINING mode branch (`if (!training) {...} else {...}`). The 'Training Mode (.train())' test was 'SKIPPED: operator_not_applicable', meaning all tests ran in eval mode where the mutated code path is never executed.",
+      "survival_reason": "The mutation affects line 205 which is inside the `else` branch executed only when `training=True`. The test framework's training mode testing was skipped with 'operator_not_applicable', meaning all 112+ test rounds ran in evaluation mode (`.eval()`). In eval mode, the `if (!training)` branch executes the `batchnorm2d_forward_inference_kernel` instead, which has no mutation. The mutated `apply_batchnorm_kernel` launch configuration is never reached. This explains the perfect bitwise match across all tested seeds - the mutated code was simply never executed.",
+      "killable": true,
+      "kill_strategy": "Run the model in training mode (`.train()`). The mutant launches one fewer thread block (262,143 instead of 262,144), leaving the last 256 elements of the output tensor uninitialized. With any non-trivial input values, the batch-normalized output should differ from uninitialized memory garbage. Use distinctive input values (e.g., all 1.0s or a specific pattern) so the expected normalized output is clearly distinguishable from uninitialized memory.",
+      "recommendations": "The mutation testing framework should NOT skip training mode testing for BatchNorm operators - the training and inference paths have completely different kernels. The 'operator_not_applicable' logic incorrectly excluded training mode, allowing this mutation in the training-only code path to survive. Any BatchNorm implementation should be tested in BOTH training and evaluation modes as they exercise fundamentally different code paths.",
+      "suggested_code": "def generate_inputs(device):\n    # All ones input: after batch norm in training mode,\n    # mean=1.0, var=0.0, output = (x-mean)/sqrt(var+eps) = 0\n    # Mutant will leave last 256 elements uninitialized\n    x = torch.ones(16, 64, 256, 256, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9615,
+        "completion_tokens": 3213,
+        "total_tokens": 12828,
+        "reasoning_tokens": 1156
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation at line 205 is inside the 'training mode' branch (else when training==true). The test harness uses model.eval() (evidenced by 'Training Mode: SKIPPED: operator_not_applicable'), routing all execution through inference kernel (lines 168-184). generate_inputs() returns only tensors and cannot call model.train(), making the training path unreachable.",
+      "survival_reason": "The mutation modifies num_blocks calculation in apply_batchnorm_kernel which is only launched when training=true. However, the testing contract only allows varying input tensor VALUES, not model state. The test harness runs models in eval mode (self.training=False), causing execution to take the inference path (batchnorm2d_forward_inference_kernel) which is NOT mutated. The 112 rounds of bitwise-identical results confirm the mutated code is never executed. The training mode skip message ('operator_not_applicable') confirms the framework doesn't test training mode for this operator.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable under the testing contract. It requires setting model.train() to execute the mutated path, but generate_inputs() can only return tensor values, not modify model state. The mutation is equivalent for all eval-mode testing.",
+      "recommendations": "Mutation testing frameworks should track code coverage during testing to detect mutations in unreachable code paths. When mutations exist in training-only paths, the test harness should explicitly test both train() and eval() modes. Consider adding a 'requires_training_mode' annotation to mutations to distinguish path-unreachable survivors from true equivalents.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 3
+  },
+  "elapsed_sec": 164.8
+}

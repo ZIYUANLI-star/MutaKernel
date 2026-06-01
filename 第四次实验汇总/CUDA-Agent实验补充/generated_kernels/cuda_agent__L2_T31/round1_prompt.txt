@@ -1,0 +1,123 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed convolution, subtracts a bias term, and applies tanh activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x - self.bias
+        x = torch.tanh(x)
+        return x
+
+batch_size = 32
+in_channels  = 64  
+out_channels = 64  
+height = width = 256 
+kernel_size = 4
+bias_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, bias_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, bias_shape, stride=2, padding=1, output_padding=1):
+        super(ModelNew, self).__init__()
+        # Initialize parameters with the same names as original model for state_dict compatibility
+        self.conv_transpose = nn.Module()
+        self.conv_transpose.weight = nn.Parameter(torch.randn(in_channels, out_channels, kernel_size, kernel_size))
+        self.conv_transpose.bias = nn.Parameter(torch.zeros(out_channels))
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+
+    @torch.compile(
+        backend='inductor', 
+        options={
+            'max_autotune': True,
+            'epilogue_fusion': True,
+            'coordinate_descent_tuning': True,
+        }
+    )
+    def forward(self, x):
+        # Enable TF32 for faster operations
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.enabled = True
+        torch.backends.cudnn.benchmark = True
+        
+        # Step 1: ConvTranspose without bias
+        x = torch.conv_transpose2d(
+            x, 
+            self.conv_transpose.weight, 
+            None,
+            (self.stride, self.stride), 
+            (self.padding, self.padding), 
+            (self.output_padding, self.output_padding)
+        )
+        
+        # Reshape conv bias to match output shape for broadcasting
+        conv_bias = self.conv_transpose.bias[:, None, None]
+        
+        # Calculate x + conv_bias - self.bias and apply tanh in one fusion
+        x = x + conv_bias - self.bias
+        x = torch.tanh(x)
+        
+        # Disable TF32 and benchmark mode
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.benchmark = False
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 2
+Failing dimensions: repeated_run
+Tolerance used: atol=0.01, rtol=0.01
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

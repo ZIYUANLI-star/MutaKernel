@@ -1,0 +1,100 @@
+{
+  "mutant_id": "L1_P37__index_replace__2",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P37",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4101,
+        "completion_tokens": 5237,
+        "total_tokens": 9338,
+        "reasoning_tokens": 1755
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With 1D grid launch, blockIdx.y=0 always. Original idx covers [0, 1048575]; mutated idx covers only [0, 1023]. With stride=1048576, mutant only processes 65,536 of 67,108,864 elements. Output uses torch::empty_like, so 67,043,328 elements remain uninitialized garbage.",
+      "survival_reason": "The mutation changes blockIdx.x to blockIdx.y, but the kernel is launched with a 1D grid where gridDim.y=1 by default. This means blockIdx.y is always 0, causing all 1024 blocks to compute identical idx values (just threadIdx.x). Consequently, only indices {threadIdx.x + k*stride} are ever accessed in the input loop and written in the output loop. With 67+ million total elements and only 65,536 being written, the vast majority of output elements remain uninitialized from torch::empty_like(). These garbage values will differ massively from the correctly computed original output.",
+      "killable": true,
+      "kill_strategy": "Use any non-trivial input values. The mutant leaves 99.9% of output uninitialized. Compare outputs to find garbage values at indices not in {t + k*1048576 | t ∈ [0,1023], k ∈ [0,63]}.",
+      "recommendations": "When using CUDA block/thread indices, always verify the launch configuration dimensionality matches the index dimensions used in the kernel. A 1D launch with <<<num_blocks, block_size>>> only populates blockIdx.x; blockIdx.y and blockIdx.z default to 0.",
+      "suggested_code": "def generate_inputs(device):\n    # Fill with constant 1.0 - original will output ~0.000122 everywhere\n    # Mutant will leave most elements as uninitialized garbage\n    x = torch.ones(16, 64, 256, 256, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3949,
+        "completion_tokens": 4725,
+        "total_tokens": 8674,
+        "reasoning_tokens": 1717
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Mutation changes idx from blockIdx.x*blockDim.x+threadIdx.x to blockIdx.y*blockDim.x+threadIdx.x. Since kernel is 1D (blockIdx.y=0), all 1024 blocks compute identical indices [t, t+1048576, t+2*1048576, ...] for t∈[0,1023]. This samples 64 chunks of 1024 elements spaced 1M apart, then multiplies by 1024 blocks. For uniform input, mutant sum = 1024*(sampled_sum) = 1024*(total/1024) = total, giving correct norm. For non-uniform input where sampled indices differ from rest, mutant computes wrong norm.",
+      "survival_reason": "Previous test used uniform values (all 1.0). With 67M total elements and mutant sampling 65536 specific elements (indices 0-1023, 1048576-1049599, etc.) multiplied by 1024 blocks, the sum accidentally equals the correct total for uniform input. The mutant only fails when sampled indices have different value distribution than unsampled indices. By placing non-zero values exclusively at indices NOT sampled by mutant (e.g., indices 1024-2047), the mutant computes near-zero norm while original computes correct norm, causing division by near-zero vs correct values.",
+      "killable": true,
+      "kill_strategy": "Place all non-zero values at indices that the mutant does NOT sample. Mutant samples indices: [0-1023, 1048576-1049599, 2097152-2098175, ...]. Place 1.0 values at indices 1024-2047 (not sampled). Mutant computes norm≈sqrt(1e-8), original computes norm=32. Output difference will be ~1.0 vs ~0.03 at affected positions.",
+      "recommendations": "When testing CUDA kernels with block/thread index mutations, avoid uniform input patterns. Use strategically placed non-uniform values to expose incorrect index calculations that happen to work for symmetric inputs.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    # Flatten for easier indexing - mutant samples indices 0-1023, 1048576-1049599, etc.\n    # Place values at indices 1024-2047 which are NOT sampled by mutant\n    x_flat = x.view(-1)\n    x_flat[1024:2048] = 1.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4236,
+        "completion_tokens": 6293,
+        "total_tokens": 10529,
+        "reasoning_tokens": 2803
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With single non-zero at index 0: Original norm = |A|, Mutant norm = sqrt(1024)*|A| = 32*|A|. Original output[0] = A/|A| = sign(A), Mutant output[0] = A/(32*|A|) = sign(A)/32. Difference = |1 - 1/32| = 0.96875 > atol + rtol*1 = 0.02.",
+      "survival_reason": "Previous attempts failed because: (1) Uniform values (round 1) cause the 1024x overcounting to match the reduced sampling coverage, making norms equal; (2) Placing values only at non-sampled indices (round 2) makes mutant norm ~sqrt(1e-8), but the resulting normalized outputs at sampled indices are all ~0 for both kernels, and unprocessed indices depend on undefined memory. The key insight is that with a sparse input at a SAMPLED index, the original norm equals the input magnitude while the mutant norm is 32x larger (due to 1024 blocks each contributing the same full sum). This creates a 32x difference in normalized output values at that specific location, far exceeding the tolerance threshold.",
+      "killable": true,
+      "kill_strategy": "Place a single large non-zero value at index 0 (a sampled index). Original computes norm=|value|, output[0]=1.0. Mutant computes norm=32*|value| (due to 1024x overcounting), output[0]=1/32≈0.031. The difference of ~0.97 far exceeds the tolerance of ~0.02.",
+      "recommendations": "When testing norm-based kernels with parallel reductions, always test sparse inputs (single non-zero element) to expose block coordination bugs where overcounting or undercounting of partial sums affects the final normalization factor.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    # Place single non-zero at flattened index 0 (x[0,0,0,0])\n    # Original: norm = 1.0, output[0,0,0,0] = 1.0\n    # Mutant: norm = 32.0 (1024 blocks overcounting), output[0,0,0,0] = 1/32 = 0.03125\n    # Difference: 0.96875 >> threshold 0.02\n    x[0, 0, 0, 0] = 1.0\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=8.750000e-01, mean_diff=1.303852e-08, ref_range=[0.0000e+00,1.0000e+00], mut_range=[0.0000e+00,1.2500e-01]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 3,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Place a single large non-zero value at index 0 (a sampled index). Original computes norm=|value|, output[0]=1.0. Mutant computes norm=32*|value| (due to 1024x overcounting), output[0]=1/32≈0.031. The difference of ~0.97 far exceeds the tolerance of ~0.02.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 64, 256, 256, dtype=torch.float32, device=device)\n    # Place single non-zero at flattened index 0 (x[0,0,0,0])\n    # Original: norm = 1.0, output[0,0,0,0] = 1.0\n    # Mutant: norm = 32.0 (1024 blocks overcounting), output[0,0,0,0] = 1/32 = 0.03125\n    # Difference: 0.96875 >> threshold 0.02\n    x[0, 0, 0, 0] = 1.0\n    return [x]"
+  },
+  "elapsed_sec": 339.5
+}

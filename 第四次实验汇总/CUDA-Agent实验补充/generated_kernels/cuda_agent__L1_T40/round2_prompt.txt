@@ -1,0 +1,225 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a transposed 3D convolution operation with asymmetric input and kernel sizes.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (tuple): Tuple of 3 integers representing the kernel size in the form (depth, height, width).
+        stride (tuple, optional): Tuple of 3 integers representing the stride in the form (depth, height, width). Defaults to (1, 1, 1).
+        padding (tuple, optional): Tuple of 3 integers representing the padding in the form (depth, height, width). Defaults to (0, 0, 0).
+        output_padding (tuple, optional): Tuple of 3 integers representing the output padding in the form (depth, height, width). Defaults to (0, 0, 0).
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1, 1), padding: tuple = (0, 0, 0), output_padding: tuple = (0, 0, 0), groups: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv_transpose3d = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding, groups=groups, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the transposed 3D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, depth_in, height_in, width_in).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, depth_out, height_out, width_out).
+        """
+        return self.conv_transpose3d(x)
+
+# Test code
+batch_size = 16
+in_channels = 32
+out_channels = 16
+kernel_size = (3, 5, 7)  # Asymmetric kernel size
+depth_in = 16
+height_in = 32
+width_in = 64
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, depth_in, height_in, width_in)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]  # Provide in_channels, out_channels, kernel_size for initialization
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1, 1), padding: tuple = (0, 0, 0), output_padding: tuple = (0, 0, 0), groups: int = 1, bias: bool = False):
+        super().__init__()
+        # Use the standard nn.ConvTranspose3d to ensure correct weight initialization and behavior
+        self.conv_transpose3d = nn.ConvTranspose3d(
+            in_channels, 
+            out_channels, 
+            kernel_size, 
+            stride=stride, 
+            padding=padding, 
+            output_padding=output_padding, 
+            groups=groups, 
+            bias=bias
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Disable TF32 to ensure numerical precision
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # Perform the convolution in full precision (float32)
+            # Ensure input and weights are in float32 for numerical stability
+            input_dtype = x.dtype
+            
+            if x.dtype != torch.float32:
+                x = x.float()
+            
+            output = self.conv_transpose3d(x)
+            
+            # Convert back to original dtype if needed
+            if input_dtype != torch.float32:
+                output = output.to(input_dtype)
+                
+            return output
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+```
+
+## Test Failures (Round 2 input)
+Total discrepancies: 56
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.289001e+00, mean_diff=1.571821e-01, ref_range=[-4.4209e+03,4.0336e+03], orig_range=[-4.4211e+03,4.0341e+03]
+  - [large_magnitude seed=50001] max_diff=1.289307e+00, mean_diff=1.574162e-01, ref_range=[-4.3457e+03,4.2029e+03], orig_range=[-4.3455e+03,4.2025e+03]
+  - [near_overflow seed=50002] max_diff=1.368768e+27, mean_diff=1.571979e+26, ref_range=[-4.3731e+30,4.1610e+30], orig_range=[-4.3733e+30,4.1616e+30]
+  - [near_overflow seed=50003] max_diff=1.462800e+27, mean_diff=1.576132e+26, ref_range=[-4.1703e+30,4.0415e+30], orig_range=[-4.1702e+30,4.0415e+30]
+  - [all_negative seed=50008] max_diff=1.301384e-01, mean_diff=1.671752e-02, ref_range=[-3.5615e+02,3.3713e+02], orig_range=[-3.5619e+02,3.3717e+02]
+  - [all_negative seed=50009] max_diff=1.199379e-01, mean_diff=1.567280e-02, ref_range=[-3.4568e+02,3.0194e+02], orig_range=[-3.4566e+02,3.0192e+02]
+  - [all_positive seed=50010] max_diff=1.211700e-01, mean_diff=1.552387e-02, ref_range=[-3.8117e+02,4.4696e+02], orig_range=[-3.8120e+02,4.4698e+02]
+  - [all_positive seed=50011] max_diff=1.380234e-01, mean_diff=1.660650e-02, ref_range=[-4.0346e+02,4.1113e+02], orig_range=[-4.0351e+02,4.1109e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.405762e+00, mean_diff=1.582827e-01, ref_range=[-4.5334e+03,4.4222e+03], orig_range=[-4.5335e+03,4.4224e+03]
+  - [large_magnitude seed=70001] max_diff=1.271851e+00, mean_diff=1.574575e-01, ref_range=[-4.4290e+03,4.2627e+03], orig_range=[-4.4294e+03,4.2625e+03]
+  - [near_overflow seed=70002] max_diff=1.215915e+27, mean_diff=1.579572e+26, ref_range=[-4.2115e+30,4.0900e+30], orig_range=[-4.2117e+30,4.0898e+30]
+  - [near_overflow seed=70003] max_diff=1.294684e+27, mean_diff=1.580425e+26, ref_range=[-4.3682e+30,4.5207e+30], orig_range=[-4.3687e+30,4.5204e+30]
+  - [all_negative seed=70008] max_diff=1.160259e-01, mean_diff=1.507493e-02, ref_range=[-3.0149e+02,3.3454e+02], orig_range=[-3.0151e+02,3.3451e+02]
+  - [all_negative seed=70009] max_diff=1.072998e-01, mean_diff=1.422817e-02, ref_range=[-3.5763e+02,3.0604e+02], orig_range=[-3.5763e+02,3.0606e+02]
+  - [all_positive seed=70010] max_diff=1.177855e-01, mean_diff=1.579085e-02, ref_range=[-3.3880e+02,3.9394e+02], orig_range=[-3.3886e+02,3.9391e+02]
+  - [all_positive seed=70011] max_diff=1.225967e-01, mean_diff=1.591043e-02, ref_range=[-3.5899e+02,3.5873e+02], orig_range=[-3.5903e+02,3.5874e+02]
+  ... and 20 more failures
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 56 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1, 1), padding: tuple = (0, 0, 0), output_padding: tuple = (0, 0, 0), groups: int = 1, bias: bool = False):
+        super().__init__()
+        # Use the standard nn.ConvTranspose3d to ensure correct weight initialization and behavior
+        self.conv_transpose3d = nn.ConvTranspose3d(
+            in_channels, 
+            out_channels, 
+            kernel_size, 
+            stride=stride, 
+            padding=padding, 
+            output_padding=output_padding, 
+            groups=groups, 
+            bias=bias
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Disable TF32 to ensure numerical precision
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # Perform the convolution in full precision (float32)
+            # Ensure input and weights are in float32 for numerical stability
+            input_dtype = x.dtype
+            
+            if x.dtype != torch.float32:
+                x = x.float()
+            
+            output = self.conv_transpose3d(x)
+            
+            # Convert back to original dtype if needed
+            if input_dtype != torch.float32:
+                output = output.to(input_dtype)
+                
+            return output
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+```
+
+### What still failed after Round 1
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.289001e+00, mean_diff=1.571821e-01, ref_range=[-4.4209e+03,4.0336e+03], orig_range=[-4.4211e+03,4.0341e+03]
+  - [large_magnitude seed=50001] max_diff=1.289307e+00, mean_diff=1.574162e-01, ref_range=[-4.3457e+03,4.2029e+03], orig_range=[-4.3455e+03,4.2025e+03]
+  - [near_overflow seed=50002] max_diff=1.368768e+27, mean_diff=1.571979e+26, ref_range=[-4.3731e+30,4.1610e+30], orig_range=[-4.3733e+30,4.1616e+30]
+  - [near_overflow seed=50003] max_diff=1.462800e+27, mean_diff=1.576132e+26, ref_range=[-4.1703e+30,4.0415e+30], orig_range=[-4.1702e+30,4.0415e+30]
+  - [all_negative seed=50008] max_diff=1.301384e-01, mean_diff=1.671752e-02, ref_range=[-3.5615e+02,3.3713e+02], orig_range=[-3.5619e+02,3.3717e+02]
+  - [all_negative seed=50009] max_diff=1.199379e-01, mean_diff=1.567280e-02, ref_range=[-3.4568e+02,3.0194e+02], orig_range=[-3.4566e+02,3.0192e+02]
+  - [all_positive seed=50010] max_diff=1.211700e-01, mean_diff=1.552387e-02, ref_range=[-3.8117e+02,4.4696e+02], orig_range=[-3.8120e+02,4.4698e+02]
+  - [all_positive seed=50011] max_diff=1.380234e-01, mean_diff=1.660650e-02, ref_range=[-4.0346e+02,4.1113e+02], orig_range=[-4.0351e+02,4.1109e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.405762e+00, mean_diff=1.582827e-01, ref_range=[-4.5334e+03,4.4222e+03], orig_range=[-4.5335e+03,4.4224e+03]
+  - [large_magnitude seed=70001] max_diff=1.271851e+00, mean_diff=1.574575e-01, ref_range=[-4.4290e+03,4.2627e+03], orig_range=[-4.4294e+03,4.2625e+03]
+  - [near_overflow seed=70002] max_diff=1.215915e+27, mean_diff=1.579572e+26, ref_range=[-4.2115e+30,4.0900e+30], orig_range=[-4.2117e+30,4.0898e+30]
+  - [near_overflow seed=70003] max_diff=1.294684e+27, mean_diff=1.580425e+26, ref_range=[-4.3682e+30,4.5207e+30], orig_range=[-4.3687e+30,4.5204e+30]
+  - [all_negative seed=70008] max_diff=1.160259e-01, mean_diff=1.507493e-02, ref_range=[-3.0149e+02,3.3454e+02], orig_range=[-3.0151e+02,3.3451e+02]
+  - [all_negative seed=70009] max_diff=1.072998e-01, mean_diff=1.422817e-02, ref_range=[-3.5763e+02,3.0604e+02], orig_range=[-3.5763e+02,3.0606e+02]
+  - [all_positive seed=70010] max_diff=1.177855e-01, mean_diff=1.579085e-02, ref_range=[-3.3880e+02,3.9394e+02], orig_range=[-3.3886e+02,3.9391e+02]
+  - [all_positive seed=70011] max_diff=1.225967e-01, mean_diff=1.591043e-02, ref_range=[-3.5899e+02,3.5873e+02], orig_range=[-3.5903e+02,3.5874e+02]
+  ... and 20 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

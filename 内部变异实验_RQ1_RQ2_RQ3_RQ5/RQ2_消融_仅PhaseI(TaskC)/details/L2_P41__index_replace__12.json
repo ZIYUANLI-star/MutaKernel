@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P41__index_replace__12",
+  "operator_name": "index_replace",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8435,
+        "completion_tokens": 2470,
+        "total_tokens": 10905,
+        "reasoning_tokens": 951
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "The mutation changes `tile_a[threadIdx.y][threadIdx.x]` to `tile_a[threadIdx.y][threadIdx.y]` on line 51. With TILE_SIZE=32 and block(32,32), threads have threadIdx.x,threadIdx.y ∈ [0,31]. Original: each thread (y,x) stores to unique position [y][x]. Mutated: all 32 threads with same y store to same position [y][y] causing race conditions. Only diagonal elements receive data (with undefined race outcomes), non-diagonal elements remain 0 or stale. This corrupts the entire matrix multiplication.",
+      "survival_reason": "This mutation fundamentally breaks the tiled GEMM algorithm by corrupting how input data is loaded into shared memory tile_a. In the original code, thread (threadIdx.y, threadIdx.x) stores the input value to tile_a[threadIdx.y][threadIdx.x], creating a proper 32x32 tile. In the mutated code, the same value is stored to tile_a[threadIdx.y][threadIdx.y], meaning all 32 threads in a row write to the same diagonal position. This creates race conditions and leaves most of tile_a either zero or containing stale values from previous iterations. The subsequent dot product computation reads incorrect values, producing wrong GEMM results for any non-trivial input. The EMD Layer 2 already detected divergence with seed 10000, confirming this mutation is killable.",
+      "killable": true,
+      "kill_strategy": "Use any non-zero input tensor. The corruption of tile_a loading means the GEMM result will be drastically wrong. Random inputs with moderate magnitude (e.g., standard normal) will produce clearly different outputs between original and mutant because the matrix multiplication uses corrupted tile data.",
+      "recommendations": "Mutation testing for tiled GEMM kernels should include systematic tests for shared memory indexing patterns, as index swaps in tile loading (like threadIdx.x vs threadIdx.y) produce catastrophic but potentially subtle corruption that depends on thread execution order.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    # Random input with reasonable magnitude\n    x = torch.randn(128, 512, device=device) * 5.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8249,
+        "completion_tokens": 4964,
+        "total_tokens": 13213,
+        "reasoning_tokens": 1926
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Mutant writes tile_a[y][y] with race among 32 threads (each bringing value 100*(tiled_k+x+1)), leaving off-diagonal uninitialized. Original correctly populates 32 distinct values per row. With column-indexed input, dot products differ by O(10^4) per tile, overwhelming any tolerance.",
+      "survival_reason": "Random inputs may have uninitialized memory that coincidentally produced similar aggregate behavior after averaging. The column-indexed pattern ensures each of the 32 positions within a tile row has a value differing by 100, making uninitialized garbage (likely small/zero values) starkly different from expected large sequential values. Additionally, the race condition at diagonal becomes deterministically wrong since competing threads write values differing by hundreds.",
+      "killable": true,
+      "kill_strategy": "Use column-indexed input values (x[i,j] proportional to j) so that different threadIdx.x values read very different magnitudes. The corrupted tile_a (race at diagonal, garbage elsewhere) will produce completely wrong GEMM results.",
+      "recommendations": "When testing tiled matrix operations, use structured inputs (e.g., column-indexed, row-indexed, or checkerboard patterns) that make indexing bugs immediately visible, rather than relying solely on random values which may accidentally have similar statistics across corrupted patterns.",
+      "suggested_code": "def generate_inputs(device):\n    # x[i,j] = (j+1) * 100, each column has unique large value\n    # This ensures different threadIdx.x values read vastly different magnitudes\n    cols = torch.arange(1, 513, device=device, dtype=torch.float32) * 100.0\n    x = cols.unsqueeze(0).expand(128, -1).contiguous()\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8463,
+        "completion_tokens": 6425,
+        "total_tokens": 14888,
+        "reasoning_tokens": 2677
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutant computes ~1/32 of GEMM terms (only diagonal of tile_a used). Previous attempts failed because double normalization (BN+GN+Mean) masks magnitude differences. Alternating signs create different cancellation patterns in correct vs corrupted GEMM, yielding different distributions through GELU that survive normalization.",
+      "survival_reason": "Previous attempts used magnitude-varying inputs that, after double normalization, converged to similar distributions. The GroupNorm re-centers and rescales, masking absolute differences. An alternating sign pattern exploits GELU's asymmetry (suppresses negatives, preserves positives) - the mutant's partial summation creates fundamentally different positive/negative ratios before GELU, which cannot be fully normalized away.",
+      "killable": true,
+      "kill_strategy": "Use alternating-sign input (+50, -50, +50, ...) along K dimension. The correct GEMM has full cancellation across all 512 terms while mutant samples ~16 random terms. The different cancellation patterns produce different GELU input distributions, leading to detectably different outputs after Mean+ReLU.",
+      "recommendations": "When testing tiled GEMM implementations, use structured input patterns (alternating signs, sparse patterns) rather than just random inputs, as normalization layers can mask magnitude-only differences. Test with inputs that exploit non-linear activations' sensitivity to sign distributions.",
+      "suggested_code": "def generate_inputs(device):\n    # Alternating sign pattern: +50, -50, +50, -50, ...\n    pattern = torch.ones(512, device=device, dtype=torch.float32)\n    pattern[1::2] = -1.0  # Odd indices negative\n    x = pattern.unsqueeze(0).expand(128, -1).contiguous() * 50.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8689,
+        "completion_tokens": 4377,
+        "total_tokens": 13066,
+        "reasoning_tokens": 1784
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original: tile_a[ty][1]=10000 for all ty, so GEMM includes 16*10000*weight[col,1] per row. Mutant: tile_a[ty][1] is garbage for ty≠1, so GEMM uses uninitialized values. Difference in GEMM output ~O(160000*weight_magnitude) per element.",
+      "survival_reason": "Previous attempts used dense inputs where the averaging effect of Mean(channels=256) and potential ReLU clamping masked differences. With uniform random values, even incorrect GEMM might produce similar mean statistics after GroupNorm normalization. The sparse pattern ensures that specific tile positions are critically important - the original correctly accumulates large values while the mutant accumulates garbage from uninitialized memory, creating asymmetric magnitudes that cannot be normalized away.",
+      "killable": true,
+      "kill_strategy": "Use sparse input with large values only at column offset 1 (mod 32). This ensures the mutant's diagonal-only writes miss these values entirely, while the original correctly loads them into the proper tile positions.",
+      "recommendations": "Test GPU kernels with sparse inputs that exercise specific memory access patterns, not just random dense inputs. Indexing bugs in shared memory often only manifest when data locality matters.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    # Place large values only at column offset 1 within each 32-wide tile\n    # Original: tile_a[ty][1] = 10000 for all ty\n    # Mutant: tile_a[ty][ty] = 10000 only when ty=1, tile_a[ty][1] is garbage otherwise\n    x[:, 1::32] = 10000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8917,
+        "completion_tokens": 4355,
+        "total_tokens": 13272,
+        "reasoning_tokens": 2223
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The GroupNorm layer normalizes each group to zero mean, and with weight_gn=1, bias_gn=0 (default init), the mean across all channels is always ~0 regardless of GEMM correctness. ReLU(~0)≈0 for both original and mutant. Need extreme values to cause numerical divergence beyond tolerance.",
+      "survival_reason": "All previous attempts failed because the model architecture with default parameters produces near-zero output regardless of GEMM correctness. GroupNorm normalizes each group to zero mean with unit variance, then with weight_gn=1 and bias_gn=0, outputs values with zero mean per group. The final mean across all channels is therefore ~0, and ReLU(~0)=0. The mutation corrupts GEMM results, but this difference is erased by GroupNorm normalization. To kill this mutant, we need inputs that cause numerical overflow/underflow to create differences that survive the normalization layers - specifically, values so extreme that the corrupted tile_a computation creates inf/nan that propagates differently through GELU and GroupNorm.",
+      "killable": true,
+      "kill_strategy": "Use extremely large input values (1e15 scale) to cause numerical overflow in the GEMM. The mutant's corrupted tile_a (uninitialized garbage × large weights) will produce different overflow/underflow patterns than the original's correct computation. These inf/nan differences will propagate through GELU and GroupNorm differently, potentially producing distinguishable final outputs.",
+      "recommendations": "Mutation tests for normalized architectures should verify behavior with extreme values (near overflow/underflow) where numerical instability can escape normalization's masking effect. Also consider testing with modified model parameters (non-default weight_gn, bias_gn) to ensure GEMM correctness matters for the output.",
+      "suggested_code": "def generate_inputs(device):\n    # Extremely large values to cause overflow differences\n    # Original: correct GEMM with consistent large values\n    # Mutant: corrupted tile_a with garbage creating inconsistent overflow\n    torch.manual_seed(999)\n    x = torch.full((128, 512), 1e15, device=device, dtype=torch.float32)\n    # Add small per-element variation to prevent uniform cancellation\n    x = x + torch.randn(128, 512, device=device) * 1e12\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 1017.2
+}

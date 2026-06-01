@@ -1,0 +1,171 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A simple model that performs a cumulative sum (prefix sum) operation along a specified dimension.
+
+    Parameters:
+        dim (int): The dimension along which to perform the scan operation.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the Scan model.
+
+        Args:
+            dim (int): The dimension along which to perform the cumulative sum.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        """
+        Forward pass for the Scan model, computing the cumulative sum along the specified dimension.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape), where `*input_shape` 
+                              can vary depending on the use case.
+
+        Returns:
+            torch.Tensor: Tensor of the same shape as `x` after applying cumulative sum along `dim`.
+        """
+        return torch.cumsum(x, dim=self.dim)
+
+# Define input dimensions and parameters
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    """
+    Generates random inputs for testing the Scan model.
+
+    Returns:
+        list: A list containing a single randomly generated tensor with shape 
+              (batch_size, *input_shape).
+    """
+    return [torch.rand(batch_size, *input_shape)]
+
+def get_init_inputs():
+    """
+    Returns the initialization parameters for the Scan model.
+
+    Returns:
+        list: A list containing the `dim` parameter for model initialization.
+    """
+    return [dim]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model for cumulative sum using tensor cores and efficient memory access.
+    """
+
+    def __init__(self, dim):
+        """
+        Initialize the optimized Scan model.
+        
+        Args:
+            dim (int): The dimension along which to perform the cumulative sum.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    @torch.compile(backend='inductor', options={'max_autotune': True, 'coordinate_descent_tuning': True})
+    def forward(self, x):
+        """
+        Forward pass using tensor cores and efficient memory access.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (32768, 32768).
+            
+        Returns:
+            torch.Tensor: Tensor of the same shape as `x` after applying cumulative sum.
+        """
+        # Enable TF32 and tensor core operations
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.cudnn_allow_tf32 = True
+        
+        # Use contiguous memory layout and convert to FP16
+        x_fp16 = x.contiguous().half()
+        
+        # Perform cumulative sum - use inplace if possible to save memory
+        result_fp16 = torch.cumsum(x_fp16, dim=self.dim)
+        
+        # Convert back to FP32
+        result = result_fp16.float()
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.cudnn_allow_tf32 = False
+        
+        return result
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 40
+Failing dimensions: value_stress, dtype_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (18 failures)
+  - [large_magnitude seed=50000] max_diff=2.562500e+00, mean_diff=9.343211e-02, ref_range=[-7.4897e+05,7.6814e+05], orig_range=[-7.4897e+05,7.6814e+05]
+  - [large_magnitude seed=50001] max_diff=2.937500e+00, mean_diff=9.402788e-02, ref_range=[-7.9022e+05,7.0581e+05], orig_range=[-7.9022e+05,7.0581e+05]
+  - [near_overflow seed=50002] max_diff=2.359823e+27, mean_diff=9.327233e+25, ref_range=[-7.5657e+32,7.6098e+32], orig_range=[-7.5657e+32,7.6098e+32]
+  - [near_overflow seed=50003] max_diff=2.475880e+27, mean_diff=9.376189e+25, ref_range=[-8.3670e+32,7.3286e+32], orig_range=[-8.3670e+32,7.3286e+32]
+  - [mixed_extremes seed=50012] max_diff=1.500000e+01, mean_diff=5.889590e-01, ref_range=[-5.0875e+06,5.5628e+06], orig_range=[-5.0875e+06,5.5628e+06]
+  - [mixed_extremes seed=50013] max_diff=1.550000e+01, mean_diff=5.913565e-01, ref_range=[-5.3346e+06,5.0814e+06], orig_range=[-5.3346e+06,5.0814e+06]
+  - [alternating_sign seed=50014] max_diff=1.582031e-01, mean_diff=5.629293e-03, ref_range=[-4.9575e+04,4.7198e+04], orig_range=[-4.9575e+04,4.7198e+04]
+  - [alternating_sign seed=50015] max_diff=1.679688e-01, mean_diff=5.612570e-03, ref_range=[-4.4439e+04,4.2176e+04], orig_range=[-4.4439e+04,4.2176e+04]
+  ... and 10 more failures
+
+### dtype_stress (4 failures)
+  - [? seed=60000] 
+  - [? seed=60001] 
+  - [? seed=60000] 
+  - [? seed=60001] 
+
+### training_stress (18 failures)
+  - [large_magnitude seed=70000] max_diff=2.125000e+00, mean_diff=9.303483e-02, ref_range=[-7.4840e+05,7.9744e+05], orig_range=[-7.4840e+05,7.9744e+05]
+  - [large_magnitude seed=70001] max_diff=2.218750e+00, mean_diff=9.372016e-02, ref_range=[-7.5040e+05,8.0283e+05], orig_range=[-7.5040e+05,8.0283e+05]
+  - [near_overflow seed=70002] max_diff=2.475880e+27, mean_diff=9.375262e+25, ref_range=[-7.4546e+32,8.7291e+32], orig_range=[-7.4546e+32,8.7291e+32]
+  - [near_overflow seed=70003] max_diff=2.475880e+27, mean_diff=9.319882e+25, ref_range=[-7.0161e+32,7.6510e+32], orig_range=[-7.0161e+32,7.6510e+32]
+  - [mixed_extremes seed=70012] max_diff=1.300000e+01, mean_diff=5.885900e-01, ref_range=[-4.9773e+06,5.6427e+06], orig_range=[-4.9773e+06,5.6427e+06]
+  - [mixed_extremes seed=70013] max_diff=1.425000e+01, mean_diff=5.875562e-01, ref_range=[-5.0030e+06,5.8351e+06], orig_range=[-5.0030e+06,5.8351e+06]
+  - [alternating_sign seed=70014] max_diff=1.601562e-01, mean_diff=5.636203e-03, ref_range=[-4.6752e+04,4.4060e+04], orig_range=[-4.6752e+04,4.4060e+04]
+  - [alternating_sign seed=70015] max_diff=1.484375e-01, mean_diff=5.637177e-03, ref_range=[-4.4740e+04,4.8959e+04], orig_range=[-4.4740e+04,4.8959e+04]
+  ... and 10 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

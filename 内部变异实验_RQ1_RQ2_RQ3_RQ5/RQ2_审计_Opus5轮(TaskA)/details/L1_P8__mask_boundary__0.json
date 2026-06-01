@@ -1,0 +1,40 @@
+{
+  "mutant_id": "L1_P8__mask_boundary__0",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P8",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7690,
+        "completion_tokens": 4365,
+        "total_tokens": 12055,
+        "reasoning_tokens": 1620
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With BLOCK_SIZE=256, THREADS_PER_COL=TILE_N/(BLOCK_SIZE/TILE_M)=128/(256/128)=64. For row_in_tile=(thread_id/64)%128 with thread_id∈[0,255], we get row_in_tile∈{0,1,2,3} only. Each block computes just 4 rows, not 128. With grid_size.y=(8205+127)/128=65 blocks, only 65×4=260 rows are computed vs M=8205 needed. The kernel is fundamentally broken and fails the torch.allclose check in forward(), triggering the fallback to torch.matmul for both original and mutant.",
+      "survival_reason": "The original CUDA kernel has a critical indexing bug: with BLOCK_SIZE=256 threads, THREADS_PER_COL=64, the expression row_in_tile=(thread_id/64)%128 only produces values {0,1,2,3}, meaning each block computes only 4 output rows instead of the intended 128. This results in the kernel computing only 260 rows total when 8205 are needed. Because of this, custom_result always differs significantly from torch_result, causing the torch.allclose() check (rtol=1e-4, atol=1e-4) in forward() to fail. When this check fails, both the original and mutant fall back to returning torch_result. The mutation at line 56 (changing `global_row < M` to `global_row < M - 1`) becomes irrelevant because the kernel output is already incorrect and discarded in favor of the PyTorch reference implementation.",
+      "killable": false,
+      "kill_strategy": "Unkillable under fixed-shape contract. The kernel has a fundamental design flaw causing it to fail correctness validation, which triggers the fallback path. Both original and mutant return torch.matmul(A, B) due to this fallback, making them semantically equivalent. To kill this mutant, one would need to either: (1) fix the kernel's row indexing bug so it actually produces correct output, or (2) remove the fallback mechanism - neither of which is allowed under the value-only testing contract.",
+      "recommendations": "This case reveals a critical lesson: mutation testing frameworks should analyze the full execution path, including fallback/recovery mechanisms. A mutant inside dead code (code whose output is discarded) cannot be killed by input variation alone. The kernel's correctness validation (torch.allclose check with fallback) effectively makes the entire CUDA kernel implementation dead code, masking all possible mutations within it. Future test coverage should verify that the custom kernel path is actually taken, not just that the final output is correct.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 67.1
+}

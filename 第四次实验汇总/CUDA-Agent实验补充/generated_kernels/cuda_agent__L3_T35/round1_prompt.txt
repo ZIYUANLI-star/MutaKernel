@@ -1,0 +1,151 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(Model, self).__init__()
+        
+        layers = []
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            layers.append(nn.Linear(current_input_size, hidden_size))
+            layers.append(nn.ReLU())
+            current_input_size = hidden_size
+        
+        layers.append(nn.Linear(current_input_size, output_size))
+        
+        self.network = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        return self.network(x)
+
+# Test code
+batch_size = 128
+input_size = 16384
+hidden_layer_sizes = [32768, 32768]
+output_size = 16384
+
+def get_inputs():
+    return [torch.rand(batch_size, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_layer_sizes, output_size]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_layer_sizes, output_size):
+        """
+        :param input_size: The number of input features
+        :param hidden_layer_sizes: A list of ints containing the sizes of each hidden layer
+        :param output_size: The number of output features
+        """
+        super(ModelNew, self).__init__()
+        
+        # Initialize parameters with the same names as in the original model
+        self.network = nn.ModuleList()
+        current_input_size = input_size
+        
+        for hidden_size in hidden_layer_sizes:
+            linear_layer = nn.Linear(current_input_size, hidden_size)
+            self.network.append(linear_layer)
+            # Add dummy ReLU to preserve the same number of layers
+            self.network.append(nn.Identity())
+            current_input_size = hidden_size
+        
+        self.network.append(nn.Linear(current_input_size, output_size))
+
+    def forward(self, x):
+        """
+        :param x: The input tensor, shape (batch_size, input_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        # Enable TF32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cuda.allow_tf32_reduced_precision_reduction = True
+        
+        # Iterate through layers, skipping the dummy ReLU layers
+        for i, layer in enumerate(self.network):
+            if isinstance(layer, nn.Linear):
+                # Use fused matrix multiplication + bias addition
+                x = torch.addmm(layer.bias, x, layer.weight.T)
+                # Apply ReLU after the first two linear layers (indices 0 and 2)
+                if i < len(self.network) - 1:
+                    # Fuse ReLU with the previous operation
+                    x = x.clamp_min(0.0)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cuda.allow_tf32_reduced_precision_reduction = False
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 54
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=2.520752e-01, mean_diff=4.111594e-02, ref_range=[-4.6826e+02,4.9053e+02], orig_range=[-4.6820e+02,4.9041e+02]
+  - [large_magnitude seed=50001] max_diff=2.484436e-01, mean_diff=4.125456e-02, ref_range=[-5.0086e+02,4.9239e+02], orig_range=[-5.0081e+02,4.9228e+02]
+  - [near_overflow seed=50002] max_diff=2.557256e+26, mean_diff=4.120456e+25, ref_range=[-4.9199e+29,4.9401e+29], orig_range=[-4.9196e+29,4.9392e+29]
+  - [near_overflow seed=50003] max_diff=2.530811e+26, mean_diff=4.107447e+25, ref_range=[-4.8545e+29,4.8225e+29], orig_range=[-4.8531e+29,4.8210e+29]
+  - [all_negative seed=50008] max_diff=2.620125e-02, mean_diff=4.106057e-03, ref_range=[-4.5252e+01,4.7282e+01], orig_range=[-4.5243e+01,4.7274e+01]
+  - [all_negative seed=50009] max_diff=2.590370e-02, mean_diff=4.164131e-03, ref_range=[-4.6333e+01,4.8436e+01], orig_range=[-4.6325e+01,4.8436e+01]
+  - [all_positive seed=50010] max_diff=2.712250e-02, mean_diff=4.135078e-03, ref_range=[-4.5000e+01,4.5705e+01], orig_range=[-4.4995e+01,4.5693e+01]
+  - [all_positive seed=50011] max_diff=2.668762e-02, mean_diff=4.104951e-03, ref_range=[-4.4731e+01,4.6007e+01], orig_range=[-4.4726e+01,4.5996e+01]
+  ... and 20 more failures
+
+### training_stress (26 failures)
+  - [large_magnitude seed=70000] max_diff=2.728119e-01, mean_diff=4.115103e-02, ref_range=[-5.0303e+02,4.9098e+02], orig_range=[-5.0293e+02,4.9087e+02]
+  - [large_magnitude seed=70001] max_diff=2.578888e-01, mean_diff=4.117345e-02, ref_range=[-4.5916e+02,4.9664e+02], orig_range=[-4.5911e+02,4.9653e+02]
+  - [near_overflow seed=70002] max_diff=2.627714e+26, mean_diff=4.106706e+25, ref_range=[-4.7973e+29,4.3557e+29], orig_range=[-4.7968e+29,4.3549e+29]
+  - [near_overflow seed=70003] max_diff=2.449869e+26, mean_diff=4.111807e+25, ref_range=[-4.4317e+29,4.7555e+29], orig_range=[-4.4311e+29,4.7549e+29]
+  - [all_negative seed=70008] max_diff=2.712727e-02, mean_diff=4.112082e-03, ref_range=[-4.9750e+01,4.3481e+01], orig_range=[-4.9743e+01,4.3482e+01]
+  - [all_negative seed=70009] max_diff=2.774429e-02, mean_diff=4.095019e-03, ref_range=[-4.3981e+01,4.4601e+01], orig_range=[-4.3976e+01,4.4597e+01]
+  - [all_positive seed=70010] max_diff=2.692986e-02, mean_diff=4.138850e-03, ref_range=[-5.1156e+01,4.5298e+01], orig_range=[-5.1156e+01,4.5282e+01]
+  - [all_positive seed=70011] max_diff=2.625370e-02, mean_diff=4.117533e-03, ref_range=[-5.0125e+01,4.5344e+01], orig_range=[-5.0120e+01,4.5338e+01]
+  ... and 18 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

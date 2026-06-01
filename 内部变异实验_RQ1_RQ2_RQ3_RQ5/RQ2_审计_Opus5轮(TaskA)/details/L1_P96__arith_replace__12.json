@@ -1,0 +1,121 @@
+{
+  "mutant_id": "L1_P96__arith_replace__12",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P96",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6457,
+        "completion_tokens": 4627,
+        "total_tokens": 11084,
+        "reasoning_tokens": 2068
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutant launches 2046 blocks vs 2048, leaving elements 523776-524287 (indices [127,3584:4096]) unprocessed. With large diff (1000) at those locations: original loss contribution = 512 * 999.5 / 524288 ≈ 0.976; mutant uses uninitialized memory (likely 0). Difference ≈ 0.976 >> tolerance 0.02.",
+      "survival_reason": "Previous tests used random or broadly distributed values where the 512 unprocessed elements (0.1% of total) had minimal impact on the mean. The tail_heavy policy affected 10% of elements, but most of those were still processed. No test specifically placed extreme values in the exact index range [127, 3584:4096] corresponding to the unprocessed elements. CUDA memory allocators may have returned zeroed memory, coincidentally matching near-zero expected losses for random inputs in that region.",
+      "killable": true,
+      "kill_strategy": "Place large prediction-target differences exclusively in the unprocessed region (row 127, columns 3584-4095). Set predictions[127, 3584:] = 1000.0 and targets[127, 3584:] = 0.0, with all other elements identical. Original computes ~0.976 mean loss; mutant computes ~0 (from uninitialized zeros).",
+      "recommendations": "When testing grid-size mutations, generate targeted tests that place significant values in boundary regions determined by the specific block/thread calculation, not just generic 'tail-heavy' distributions.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Place extreme values in exactly the unprocessed region: indices 523776-524287\n    # These correspond to tensor[127, 3584:4096] (512 elements)\n    predictions[127, 3584:] = 1000.0\n    targets[127, 3584:] = 0.0\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6054,
+        "completion_tokens": 5274,
+        "total_tokens": 11328,
+        "reasoning_tokens": 2042
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original: 2048 blocks processes all 524288 elements. Mutant: 2046 blocks processes only 523776 elements. Elements [127, 3584:4096] (512 values) are skipped. Uninitialized memory from torch::empty likely contains finite values, not NaN.",
+      "survival_reason": "Previous tests used large finite values in the unprocessed region. The uninitialized memory from torch::empty may coincidentally contain zeros or small values (from CUDA memory management), causing the mutant to produce results within tolerance. Additionally, when most elements contribute to the mean, missing 512 elements with near-zero uninitialized values may not produce sufficient difference to exceed the relative tolerance threshold.",
+      "killable": true,
+      "kill_strategy": "Place NaN values exclusively in the unprocessed region (tensor[127, 3584:4096]). Original kernel computes NaN losses for these elements, propagating NaN through reduction to produce NaN mean. Mutant never processes these elements, using uninitialized memory (very unlikely to be NaN), producing a finite mean. torch.allclose(NaN, finite) always returns False.",
+      "recommendations": "Kernel tests should include NaN propagation tests to verify correct handling of boundary conditions in grid calculations. Additionally, explicitly testing that all input elements contribute to outputs helps detect off-by-N block calculation errors.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Put NaN only in the unprocessed region (indices 523776-524287)\n    # These map to tensor[127, 3584:4096] - exactly 512 elements\n    predictions[127, 3584:] = float('nan')\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6339,
+        "completion_tokens": 5455,
+        "total_tokens": 11794,
+        "reasoning_tokens": 2398
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Mutation leaves indices 523776-524287 unprocessed. With torch::empty, these contain garbage (often zero in CUDA allocator). Previous Round 1 loss ~999.5 per element may have matched zeroed garbage through tolerance. Using 1e30 scale values creates loss ~2e30 per element, total contribution ~1e33, mean ~2e27 - impossible for any garbage to approximate.",
+      "survival_reason": "The CUDA caching allocator often returns zeroed or near-zero memory for torch::empty tensors. Previous attempts used moderate values (1000.0) where the resulting mean loss (~0.976) could potentially match zeroed garbage within tolerance if there was any numerical coincidence. The mutation is definitely reachable and affects 512 elements, but the garbage values happened to produce close-enough results. Using astronomically large values creates an unmissable difference.",
+      "killable": true,
+      "kill_strategy": "Use float32 near-max values (1e30, -1e30) in the unprocessed region to create losses of magnitude ~2e30 per element. The 512 unprocessed elements contribute ~1e33 total, giving mean ~2e27. Any garbage values (likely zero or small) in mutant cannot possibly match this. The difference will be ~2e27, vastly exceeding any tolerance.",
+      "recommendations": "When testing kernels with uninitialized memory regions, use extreme values (near float32 limits) rather than moderate values. Memory allocators may return zeroed memory, making moderate differences undetectable. Extreme values create differences that no garbage can approximate.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Unprocessed region: tensor[127, 3584:4096] = indices 523776-524287\n    # Use near-max float32 values to create unmissable loss\n    predictions[127, 3584:] = 1e30\n    targets[127, 3584:] = -1e30\n    # Smooth L1 loss per element: |2e30| - 0.5*1.0 ≈ 2e30\n    # 512 elements × 2e30 = ~1e33 total / 524288 = ~2e27 mean\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6693,
+        "completion_tokens": 4916,
+        "total_tokens": 11609,
+        "reasoning_tokens": 2066
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "num_blocks = (524288-257)/256 = 2046, leaving 512 elements (indices 523776-524287) unwritten by smooth_l1_loss_kernel. However, torch::empty() memory is being reused from prior reference execution, causing mutant to inherit correct values.",
+      "survival_reason": "The mutation does cause 512 elements to go unprocessed by smooth_l1_loss_kernel. However, CUDA/PyTorch memory allocation reuses memory blocks between kernel invocations. When the testing framework runs the reference implementation first, it correctly writes all elements to element_losses. The mutant then gets the same memory block via torch::empty(), so the 'uninitialized' region already contains correct values from the reference. This memory reuse makes the semantic bug undetectable through value-only testing.",
+      "killable": false,
+      "kill_strategy": "This mutant is practically unkillable with value-only changes because CUDA memory reuse causes the mutant's uninitialized region to inherit correct values from the reference's prior execution. The mutation IS a real semantic bug (512 elements not computed), but the infection doesn't propagate to the output due to implementation-level memory behavior. Killing this would require either: (1) controlling memory allocation order, (2) clearing GPU memory between runs, or (3) running mutant before reference—none achievable via input values alone.",
+      "recommendations": "Mutation testing frameworks for CUDA kernels should consider memory isolation between reference and mutant executions. Running mutant BEFORE reference, or explicitly zeroing/randomizing torch::empty() buffers during testing, would expose this class of bugs. Additionally, kernels should use torch::zeros() instead of torch::empty() for correctness guarantees regardless of launch configuration.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 3
+  },
+  "elapsed_sec": 427.84
+}

@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P8__arith_replace__31",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P8",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6136,
+        "completion_tokens": 5787,
+        "total_tokens": 11923,
+        "reasoning_tokens": 2189
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "For n=1, original writes to col_in_tile+1, mutant writes to col_in_tile-1. When col_in_tile=0 (thread_id%64==0), mutant writes to col=-1 (out-of-bounds). For other threads, columns 1,3,5,...,127 get swapped with columns -1,1,3,...,125. Near-zero inputs may cause both kernels to pass the internal 1e-4 tolerance check, bypassing fallback and exposing the column mismatch.",
+      "survival_reason": "The forward() function has a fallback mechanism that returns torch_result when custom_result differs significantly. For most inputs, the mutant's column swapping causes allclose to fail, triggering fallback to correct torch_result. However, with near-zero inputs, both custom_results are near-zero, potentially passing the tolerance check despite wrong placement. The mutant then returns its incorrectly-structured near-zero result rather than falling back.",
+      "killable": true,
+      "kill_strategy": "Use matrices with very small but distinct values in a pattern that makes the column swap visible. Set A such that rows have different small constants, and B such that columns have distinct small values. The product should have small but distinguishable values that expose the column swap when the mutant's tolerance check passes.",
+      "recommendations": "When implementing fallback correctness checks in kernel wrappers, use stricter tolerances than external testing tolerances to ensure fallback triggers reliably. Additionally, validate output structure (not just magnitude) when column/row indexing mutations are possible.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    # Very small values to potentially pass internal tolerance\n    # but structured to expose column swaps\n    A = torch.randn(8205, 2949, dtype=torch.float32, device=device) * 1e-6\n    B = torch.randn(2949, 5921, dtype=torch.float32, device=device) * 1e-6\n    # Add identifiable pattern in specific columns\n    A[:, 0] = 1e-4  # Small but non-negligible\n    B[0, ::2] = 1.0  # Even columns of row 0 are 1.0\n    B[0, 1::2] = -1.0  # Odd columns of row 0 are -1.0\n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6101,
+        "completion_tokens": 7169,
+        "total_tokens": 13270,
+        "reasoning_tokens": 3159
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes `col_in_tile + n` to `col_in_tile - n` in the output write loop, causing columns to be swapped/corrupted. However, the forward() function contains a defensive check: `if not torch.allclose(torch_result, custom_result, rtol=1e-4, atol=1e-4): return torch_result`. When the mutant kernel produces corrupted output, this check catches the discrepancy and falls back to torch_result, making the mutant's final output identical to what the original would produce.",
+      "survival_reason": "Previous attempts failed because the defensive verification check in forward() acts as a 'sanitizer' - when the mutant's buggy kernel writes to wrong columns (col_in_tile - n instead of col_in_tile + n), the max difference between custom_result and torch_result exceeds 1e-4, triggering the fallback to torch_result. Since the original's custom kernel is correct and ≈ torch_result, and the mutant falls back to torch_result, both return essentially the same values. The internal 1e-4 tolerance check ensures corrupted results never propagate to the final output. Even with near-zero inputs where the column swap might produce results within absolute tolerance, the original and mutant would both return values ≈ torch_result, staying within the test's 1e-2 tolerance.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable through value-level testing alone because the forward() function contains explicit verification logic that compares custom_result against torch_result and falls back to the correct PyTorch implementation when differences exceed rtol=atol=1e-4. Since the mutation causes severe column corruption (writing to col-1 instead of col+1), the verification always catches the error and returns the correct torch_result. The mutation is effectively 'neutralized' by the defensive programming pattern in the wrapper code.",
+      "recommendations": "This case highlights a testing anti-pattern: defensive checks that mask underlying kernel bugs. The verification logic `if not torch.allclose(...): return torch_result` makes the kernel's correctness bugs undetectable through black-box testing. Recommendation: (1) Remove or disable the fallback mechanism in test builds to expose kernel bugs, (2) Test the CUDA kernel directly without the wrapper's defensive check, (3) Add separate unit tests that verify the kernel's correctness independently of the fallback mechanism, (4) Consider making the fallback behavior configurable via an environment variable for testing purposes.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 266.69
+}

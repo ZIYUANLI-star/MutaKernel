@@ -1,0 +1,68 @@
+{
+  "mutant_id": "L1_P49__arith_replace__11",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P49",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7906,
+        "completion_tokens": 3852,
+        "total_tokens": 11758,
+        "reasoning_tokens": 1179
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "stride2=1 for contiguous tensors makes dim2_idx*stride2 == dim2_idx/stride2. With transposed tensor, stride2=256, causing dim2_idx*256 ≠ dim2_idx/256 for all dim2_idx>0 (integer division truncates to 0).",
+      "survival_reason": "All 112 rounds of testing used contiguous tensors where stride2=1. For contiguous layout, multiplication and integer division by 1 are identical operations. The mutation only produces different results when stride2>1, which occurs with non-contiguous tensor layouts. The kernel correctly reads strides from input.strides(), but no test provided a tensor with non-unit stride in dimension 2.",
+      "killable": true,
+      "kill_strategy": "Create a non-contiguous tensor by transposing dimensions 1 and 2. This changes stride2 from 1 to 256, causing dim2_idx/stride2 to truncate to 0 for most indices while dim2_idx*stride2 correctly computes the offset. This will cause the mutant to read from wrong memory locations.",
+      "recommendations": "Mutation testing for GPU kernels should include non-contiguous tensor layouts (transposed, permuted, strided views) as part of standard test coverage, since stride-based indexing is a common source of bugs that contiguous-only testing misses.",
+      "suggested_code": "def generate_inputs(device):\n    # Create base tensor with distinct values per column\n    base = torch.randn(16, 256, 256, device=device, dtype=torch.float32)\n    # Make columns have distinct maxima to detect wrong column access\n    for j in range(256):\n        base[:, :, j] = base[:, :, j] + j * 10.0  # Each column offset by 10*j\n    # Transpose to make stride2 = 256 instead of 1\n    # Shape remains [16, 256, 256], strides become [65536, 1, 256]\n    non_contiguous = base.transpose(1, 2)\n    return [non_contiguous]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7523,
+        "completion_tokens": 6889,
+        "total_tokens": 14412,
+        "reasoning_tokens": 2842
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "Mutation is in max_reduction_dim1_kernel (line 45). For contiguous [16,256,256] tensors: stride2=1, so dim2_idx*1 == dim2_idx/1. For non-contiguous tensors with stride2≠1, Round 1 showed mutant survives, indicating dim=2 is used (calling unmodified dim2_kernel). The mutation requires dim=1 config to execute the mutated code path, and stride2≠1 to expose the bug.",
+      "survival_reason": "The mutation changes multiplication to division in max_reduction_dim1_kernel. This kernel is only invoked when model.dim=1. Testing evidence shows the model is configured with dim=2 (otherwise Round 1's transposed tensor with stride2=256 would have killed it). With dim=2, the mutated code path is never reached. With dim=1 on contiguous tensors, stride2=1 makes x*1==x/1. Both scenarios result in equivalent behavior.",
+      "killable": false,
+      "kill_strategy": "The mutation requires two conditions to expose: (1) model initialized with dim=1 to execute max_reduction_dim1_kernel, and (2) non-contiguous input tensor with stride2≠1. Since we can only modify tensor values (not model configuration), and the model appears configured with dim=2, this mutation is unkillable under the current test contract.",
+      "recommendations": "Mutation testing frameworks should parameterize over model configurations (like reduction dimension) in addition to input values. When a mutation is in a conditionally-executed code path, the test suite must ensure coverage of that path through configuration variation.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": true,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 165.51,
+  "supplement_run": true
+}

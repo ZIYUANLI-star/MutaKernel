@@ -1,0 +1,137 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs matrix multiplication (C = A * B) for upper triangular matrices.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs matrix multiplication for upper triangular matrices.
+
+        Args:
+            A (torch.Tensor): Upper triangular matrix of shape (N, N).
+            B (torch.Tensor): Upper triangular matrix of shape (N, N).
+
+        Returns:
+            torch.Tensor: The product of A and B, also an upper triangular matrix of shape (N, N).
+        """
+        return torch.triu(torch.matmul(A, B))
+
+N = 4096
+
+def get_inputs():
+    """
+    Generates upper triangular matrices for testing.
+
+    Returns:
+        list: A list containing two upper triangular matrices of shape (N, N).
+    """
+    A = torch.triu(torch.rand(N, N))
+    B = torch.triu(torch.rand(N, N))
+    return [A, B]
+
+def get_init_inputs():
+    """
+    No specific initialization inputs are needed for this model.
+
+    Returns:
+        list: An empty list.
+    """
+    return []
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model for upper triangular matrix multiplication using TF32.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, A, B):
+        """
+        Performs matrix multiplication for upper triangular matrices using TF32.
+
+        Args:
+            A (torch.Tensor): Upper triangular matrix of shape (N, N).
+            B (torch.Tensor): Upper triangular matrix of shape (N, N).
+
+        Returns:
+            torch.Tensor: The product of A and B, also an upper triangular matrix of shape (N, N).
+        """
+        # Enable TF32 for better performance
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Compute matrix product
+        C = A @ B
+        
+        # Extract upper triangular part
+        C = C.triu(diagonal=0)
+        
+        # Disable TF32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return C
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 40
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (20 failures)
+  - [large_magnitude seed=50000] max_diff=1.031839e+05, mean_diff=7.504200e+03, ref_range=[-3.3391e+08,3.2885e+08], orig_range=[-3.3393e+08,3.2884e+08]
+  - [large_magnitude seed=50001] max_diff=1.032480e+05, mean_diff=7.506914e+03, ref_range=[-3.2141e+08,3.2356e+08], orig_range=[-3.2137e+08,3.2356e+08]
+  - [mixed_extremes seed=50012] max_diff=4.844400e+06, mean_diff=3.745328e+05, ref_range=[-1.5845e+10,1.7225e+10], orig_range=[-1.5844e+10,1.7224e+10]
+  - [mixed_extremes seed=50013] max_diff=5.089792e+06, mean_diff=3.747233e+05, ref_range=[-1.6585e+10,1.6688e+10], orig_range=[-1.6586e+10,1.6689e+10]
+  - [alternating_sign seed=50014] max_diff=1.014688e+03, mean_diff=7.540303e+01, ref_range=[-2.6120e+06,2.7008e+06], orig_range=[-2.6119e+06,2.7006e+06]
+  - [alternating_sign seed=50015] max_diff=1.127656e+03, mean_diff=7.422919e+01, ref_range=[-2.4561e+06,2.5138e+06], orig_range=[-2.4562e+06,2.5138e+06]
+  - [sparse seed=50016] max_diff=1.322324e+02, mean_diff=7.293445e+00, ref_range=[-3.9764e+05,4.0760e+05], orig_range=[-3.9763e+05,4.0757e+05]
+  - [sparse seed=50017] max_diff=1.360547e+02, mean_diff=7.297354e+00, ref_range=[-3.8875e+05,3.9964e+05], orig_range=[-3.8881e+05,3.9969e+05]
+  ... and 12 more failures
+
+### training_stress (20 failures)
+  - [large_magnitude seed=70000] max_diff=1.011545e+05, mean_diff=7.505280e+03, ref_range=[-3.2876e+08,3.4206e+08], orig_range=[-3.2875e+08,3.4203e+08]
+  - [large_magnitude seed=70001] max_diff=9.923600e+04, mean_diff=7.505048e+03, ref_range=[-3.5564e+08,3.4990e+08], orig_range=[-3.5563e+08,3.4990e+08]
+  - [mixed_extremes seed=70012] max_diff=5.411584e+06, mean_diff=3.747800e+05, ref_range=[-1.6736e+10,1.7279e+10], orig_range=[-1.6736e+10,1.7279e+10]
+  - [mixed_extremes seed=70013] max_diff=5.212544e+06, mean_diff=3.746801e+05, ref_range=[-1.6856e+10,1.6573e+10], orig_range=[-1.6856e+10,1.6573e+10]
+  - [alternating_sign seed=70014] max_diff=9.825000e+02, mean_diff=7.405654e+01, ref_range=[-2.4011e+06,2.6395e+06], orig_range=[-2.4010e+06,2.6395e+06]
+  - [alternating_sign seed=70015] max_diff=1.033414e+03, mean_diff=7.508865e+01, ref_range=[-2.5453e+06,2.5158e+06], orig_range=[-2.5455e+06,2.5158e+06]
+  - [sparse seed=70016] max_diff=1.500938e+02, mean_diff=7.311677e+00, ref_range=[-3.9740e+05,4.3850e+05], orig_range=[-3.9734e+05,4.3853e+05]
+  - [sparse seed=70017] max_diff=1.449453e+02, mean_diff=7.298036e+00, ref_range=[-3.9018e+05,3.8860e+05], orig_range=[-3.9018e+05,3.8858e+05]
+  ... and 12 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

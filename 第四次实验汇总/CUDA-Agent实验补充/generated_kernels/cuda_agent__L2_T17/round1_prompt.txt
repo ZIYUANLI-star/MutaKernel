@@ -1,0 +1,182 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Gemm, multiplies the result, and applies LeakyReLU.
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.multiplier = multiplier
+        self.leaky_relu = nn.LeakyReLU(negative_slope)
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x * self.multiplier
+        x = self.leaky_relu(x)
+        return x
+
+batch_size = 1024
+in_features  = 8192  
+out_features = 8192
+multiplier = 2.0
+negative_slope = 0.1
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, multiplier, negative_slope]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_multiply_leaky_relu.cu ===
+#include <cuda_runtime.h>
+
+__global__ void fused_multiply_leaky_relu_kernel(float* output, const float* gemm_out, float multiplier, float negative_slope) {
+    int idx = blockIdx.x * 128 + threadIdx.x;
+    int total_elems = 1024 * 8192;
+
+    if (idx < total_elems) {
+        float val = gemm_out[idx] * multiplier;
+        output[idx] = val > 0 ? val : negative_slope * val;
+    }
+}
+
+extern "C" void fused_multiply_leaky_relu_launcher(float* output, const float* gemm_out) {
+    float multiplier = 2.0f;
+    float negative_slope = 0.1f;
+
+    int blocks = (1024 * 8192 + 128 - 1) / 128;
+    fused_multiply_leaky_relu_kernel<<<blocks, 128>>>(output, gemm_out, multiplier, negative_slope);
+}
+"""
+
+_cpp_sources = """
+// === fused_multiply_leaky_relu_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_multiply_leaky_relu_launcher(float* output, const float* gemm_out);
+
+torch::Tensor fused_multiply_leaky_relu_forward(torch::Tensor gemm_out) {
+    TORCH_CHECK(gemm_out.is_cuda(), "Input must be CUDA tensor");
+    TORCH_CHECK(gemm_out.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(gemm_out.dtype() == torch::kFloat32, "Input must be float32");
+
+    auto output = torch::empty_like(gemm_out);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    fused_multiply_leaky_relu_launcher(output.data_ptr<float>(), gemm_out.data_ptr<float>());
+
+    return output;
+}
+
+void register_fused_multiply_leaky_relu(pybind11::module& m) {
+    m.def("fused_multiply_leaky_relu_forward", &fused_multiply_leaky_relu_forward,
+          "Fused multiply and leaky relu forward");
+}
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_multiply_leaky_relu_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a GEMM followed by a fused multiply + leaky relu.
+    """
+    def __init__(self, in_features, out_features, multiplier, negative_slope):
+        super(ModelNew, self).__init__()
+        # Use the same name as original model for state_dict compatibility
+        self.gemm = nn.Module()
+        self.gemm.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.gemm.bias = nn.Parameter(torch.empty(out_features))
+        self.multiplier = multiplier
+        self.negative_slope = negative_slope
+
+    def forward(self, x):
+        # Enable TF32 for better performance
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Use PyTorch's optimized linear layer implementation
+        x = torch.addmm(self.gemm.bias, x, self.gemm.weight.T)
+        
+        # Use fused kernel for multiply + leaky relu
+        x = cuda_extension.fused_multiply_leaky_relu_forward(x)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 56
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.807007e+00, mean_diff=1.522744e-01, ref_range=[-5.8087e+02,6.2253e+03], orig_range=[-5.8085e+02,6.2250e+03]
+  - [large_magnitude seed=50001] max_diff=1.850098e+00, mean_diff=1.524612e-01, ref_range=[-6.9285e+02,6.3834e+03], orig_range=[-6.9279e+02,6.3835e+03]
+  - [near_overflow seed=50002] max_diff=1.897285e+27, mean_diff=1.522250e+26, ref_range=[-6.1061e+29,6.1781e+30], orig_range=[-6.1060e+29,6.1779e+30]
+  - [near_overflow seed=50003] max_diff=1.810971e+27, mean_diff=1.520282e+26, ref_range=[-6.0458e+29,6.1248e+30], orig_range=[-6.0459e+29,6.1248e+30]
+  - [all_negative seed=50008] max_diff=1.798439e-01, mean_diff=1.513111e-02, ref_range=[-6.0364e+01,5.7719e+02], orig_range=[-6.0362e+01,5.7711e+02]
+  - [all_negative seed=50009] max_diff=1.848755e-01, mean_diff=1.532055e-02, ref_range=[-6.0033e+01,5.3635e+02], orig_range=[-6.0031e+01,5.3639e+02]
+  - [all_positive seed=50010] max_diff=1.728973e-01, mean_diff=1.519285e-02, ref_range=[-5.6021e+01,5.8041e+02], orig_range=[-5.6024e+01,5.8042e+02]
+  - [all_positive seed=50011] max_diff=1.868591e-01, mean_diff=1.501147e-02, ref_range=[-5.4633e+01,5.9486e+02], orig_range=[-5.4636e+01,5.9484e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.855209e+00, mean_diff=1.523156e-01, ref_range=[-5.9208e+02,6.6091e+03], orig_range=[-5.9208e+02,6.6087e+03]
+  - [large_magnitude seed=70001] max_diff=1.753189e+00, mean_diff=1.523409e-01, ref_range=[-6.5806e+02,6.5683e+03], orig_range=[-6.5807e+02,6.5685e+03]
+  - [near_overflow seed=70002] max_diff=1.793441e+27, mean_diff=1.521063e+26, ref_range=[-6.1071e+29,6.3133e+30], orig_range=[-6.1071e+29,6.3135e+30]
+  - [near_overflow seed=70003] max_diff=1.732674e+27, mean_diff=1.520601e+26, ref_range=[-6.0635e+29,6.0996e+30], orig_range=[-6.0631e+29,6.1000e+30]
+  - [all_negative seed=70008] max_diff=1.752052e-01, mean_diff=1.519680e-02, ref_range=[-6.1126e+01,5.5701e+02], orig_range=[-6.1127e+01,5.5697e+02]
+  - [all_negative seed=70009] max_diff=1.757202e-01, mean_diff=1.512319e-02, ref_range=[-5.8825e+01,6.4545e+02], orig_range=[-5.8828e+01,6.4544e+02]
+  - [all_positive seed=70010] max_diff=1.835632e-01, mean_diff=1.524668e-02, ref_range=[-5.6644e+01,5.4509e+02], orig_range=[-5.6641e+01,5.4508e+02]
+  - [all_positive seed=70011] max_diff=1.793213e-01, mean_diff=1.524296e-02, ref_range=[-5.7765e+01,5.8856e+02], orig_range=[-5.7762e+01,5.8850e+02]
+  ... and 20 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

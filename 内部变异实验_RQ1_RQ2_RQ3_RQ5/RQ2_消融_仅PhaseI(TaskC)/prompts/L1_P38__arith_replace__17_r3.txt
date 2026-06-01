@@ -1,0 +1,492 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for L1 normalization with warp-level reduction
+l1_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void l1_normalize_kernel_optimized(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim
+) {
+    // Use 2D grid: x for batch, y for elements
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    
+    // Shared memory for warp-level reduction results
+    __shared__ float warp_sums[32];  // 32 warps max for 1024 threads
+    
+    // Each thread processes multiple elements with vectorized loads
+    float thread_sum = 0.0f;
+    
+    // Process 4 elements at a time for better memory throughput
+    const int stride = blockDim.x * 4;
+    int idx = batch_idx * dim + tid * 4;
+    
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            // Load 4 elements at once
+            scalar_t val0 = input[idx];
+            scalar_t val1 = input[idx + 1];
+            scalar_t val2 = input[idx + 2];
+            scalar_t val3 = input[idx + 3];
+            
+            thread_sum += fabsf((float)val0) + fabsf((float)val1) + 
+                         fabsf((float)val2) + fabsf((float)val3);
+            idx += stride;
+        }
+    }
+    
+    // Warp-level reduction using shuffle instructions
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    }
+    
+    // First thread in each warp stores the warp sum
+    if (lane_id == 0) {
+        warp_sums[warp_id] = thread_sum;
+    }
+    __syncthreads();
+    
+    // Final reduction across warps (only first warp does this)
+    if (warp_id == 0) {
+        float warp_sum = lane_id < (blockDim.x / 32) ? warp_sums[lane_id] : 0.0f;
+        
+        // Reduce across warps
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+        
+        // Broadcast final sum to all threads
+        if (lane_id == 0) {
+            warp_sums[0] = warp_sum;
+        }
+    }
+    __syncthreads();
+    
+    // All threads get the final sum
+    float batch_sum = warp_sums[0];
+    batch_sum = batch_sum == 0.0f ? 1.0f : batch_sum;
+    float inv_batch_sum = 1.0f / batch_sum;
+    
+    // Normalize and write output with vectorized stores
+    idx = batch_idx * dim + tid * 4;
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            output[idx] = input[idx] * inv_batch_sum;
+            output[idx + 1] = input[idx + 1] * inv_batch_sum;
+            output[idx + 2] = input[idx + 2] * inv_batch_sum;
+            output[idx + 3] = input[idx + 3] * inv_batch_sum;
+            idx += stride;
+        }
+    }
+    
+    // Handle remaining elements
+    for (int i = tid; i < dim; i += blockDim.x) {
+        int pos = batch_idx * dim + i;
+        output[pos] = input[pos] * inv_batch_sum;
+    }
+}
+
+torch::Tensor l1_normalize_cuda(torch::Tensor input) {
+    // Check input dimensions
+    TORCH_CHECK(input.dim() >= 2, "Input must have at least 2 dimensions");
+    
+    // Make sure tensor is contiguous
+    auto input_contig = input.contiguous();
+    
+    auto sizes = input_contig.sizes();
+    auto batch_size = sizes[0];
+    auto dim = sizes[1];
+    
+    // Create output tensor
+    auto output = torch::empty_like(input_contig);
+    
+    // Optimized configuration - use 256 threads for good occupancy
+    const int block_size = 256;
+    const int grid_size = batch_size;
+    
+    // Launch kernel
+    AT_DISPATCH_FLOATING_TYPES(
+        input_contig.scalar_type(),
+        "l1_normalize_kernel_optimized",
+        [&] {
+            l1_normalize_kernel_optimized<scalar_t><<<grid_size, block_size>>>(
+                input_contig.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+l1_norm_cpp_source = "torch::Tensor l1_normalize_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code
+l1_normalize = load_inline(
+    name="l1_normalize",
+    cpp_sources=l1_norm_cpp_source,
+    cuda_sources=l1_norm_source,
+    functions=["l1_normalize_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-DNDEBUG"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs L1 normalization using custom CUDA kernel.
+    """
+    def __init__(self):
+        """
+        Initializes the optimized L1 normalization layer.
+        """
+        super(ModelNew, self).__init__()
+        self.l1_normalize = l1_normalize
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L1 normalization to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor with L1 normalization applied, same shape as input.
+        """
+        # Ensure tensor is on GPU
+        if not x.is_cuda:
+            x = x.cuda()
+        
+        # Apply fused L1 normalization kernel
+        return self.l1_normalize.l1_normalize_cuda(x)
+
+batch_size = 16
+dim = 16384
+
+def get_inputs():
+    x = torch.randn(batch_size, dim).cuda()
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for L1 normalization with warp-level reduction
+l1_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void l1_normalize_kernel_optimized(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int batch_size,
+    const int dim
+) {
+    // Use 2D grid: x for batch, y for elements
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    
+    // Shared memory for warp-level reduction results
+    __shared__ float warp_sums[32];  // 32 warps max for 1024 threads
+    
+    // Each thread processes multiple elements with vectorized loads
+    float thread_sum = 0.0f;
+    
+    // Process 4 elements at a time for better memory throughput
+    const int stride = blockDim.x * 4;
+    int idx = batch_idx * dim + tid * 4;
+    
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            // Load 4 elements at once
+            scalar_t val0 = input[idx];
+            scalar_t val1 = input[idx + 1];
+            scalar_t val2 = input[idx + 2];
+            scalar_t val3 = input[idx + 3];
+            
+            thread_sum += fabsf((float)val0) + fabsf((float)val1) + 
+                         fabsf((float)val2) + fabsf((float)val3);
+            idx += stride;
+        }
+    }
+    
+    // Warp-level reduction using shuffle instructions
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        thread_sum += __shfl_down_sync(0xffffffff, thread_sum, offset);
+    }
+    
+    // First thread in each warp stores the warp sum
+    if (lane_id == 0) {
+        warp_sums[warp_id] = thread_sum;
+    }
+    __syncthreads();
+    
+    // Final reduction across warps (only first warp does this)
+    if (warp_id == 0) {
+        float warp_sum = lane_id < (blockDim.x / 32) ? warp_sums[lane_id] : 0.0f;
+        
+        // Reduce across warps
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            warp_sum += __shfl_down_sync(0xffffffff, warp_sum, offset);
+        }
+        
+        // Broadcast final sum to all threads
+        if (lane_id == 0) {
+            warp_sums[0] = warp_sum;
+        }
+    }
+    __syncthreads();
+    
+    // All threads get the final sum
+    float batch_sum = warp_sums[0];
+    batch_sum = batch_sum == 0.0f ? 1.0f : batch_sum;
+    float inv_batch_sum = 1.0f / batch_sum;
+    
+    // Normalize and write output with vectorized stores
+    idx = batch_idx / dim + tid * 4;
+    for (int i = 0; i < dim; i += stride) {
+        if (idx + 3 < (batch_idx + 1) * dim) {
+            output[idx] = input[idx] * inv_batch_sum;
+            output[idx + 1] = input[idx + 1] * inv_batch_sum;
+            output[idx + 2] = input[idx + 2] * inv_batch_sum;
+            output[idx + 3] = input[idx + 3] * inv_batch_sum;
+            idx += stride;
+        }
+    }
+    
+    // Handle remaining elements
+    for (int i = tid; i < dim; i += blockDim.x) {
+        int pos = batch_idx * dim + i;
+        output[pos] = input[pos] * inv_batch_sum;
+    }
+}
+
+torch::Tensor l1_normalize_cuda(torch::Tensor input) {
+    // Check input dimensions
+    TORCH_CHECK(input.dim() >= 2, "Input must have at least 2 dimensions");
+    
+    // Make sure tensor is contiguous
+    auto input_contig = input.contiguous();
+    
+    auto sizes = input_contig.sizes();
+    auto batch_size = sizes[0];
+    auto dim = sizes[1];
+    
+    // Create output tensor
+    auto output = torch::empty_like(input_contig);
+    
+    // Optimized configuration - use 256 threads for good occupancy
+    const int block_size = 256;
+    const int grid_size = batch_size;
+    
+    // Launch kernel
+    AT_DISPATCH_FLOATING_TYPES(
+        input_contig.scalar_type(),
+        "l1_normalize_kernel_optimized",
+        [&] {
+            l1_normalize_kernel_optimized<scalar_t><<<grid_size, block_size>>>(
+                input_contig.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                batch_size,
+                dim
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+l1_norm_cpp_source = "torch::Tensor l1_normalize_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code
+l1_normalize = load_inline(
+    name="l1_normalize",
+    cpp_sources=l1_norm_cpp_source,
+    cuda_sources=l1_norm_source,
+    functions=["l1_normalize_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-DNDEBUG"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs L1 normalization using custom CUDA kernel.
+    """
+    def __init__(self):
+        """
+        Initializes the optimized L1 normalization layer.
+        """
+        super(ModelNew, self).__init__()
+        self.l1_normalize = l1_normalize
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L1 normalization to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (..., dim, ...).
+
+        Returns:
+            torch.Tensor: Output tensor with L1 normalization applied, same shape as input.
+        """
+        # Ensure tensor is on GPU
+        if not x.is_cuda:
+            x = x.cuda()
+        
+        # Apply fused L1 normalization kernel
+        return self.l1_normalize.l1_normalize_cuda(x)
+
+batch_size = 16
+dim = 16384
+
+def get_inputs():
+    x = torch.randn(batch_size, dim).cuda()
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 80
+- Original fragment: `*`
+- node_type: cuda_Mult
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 80
+- Original fragment: `*`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Error: worker_timeout_or_crash
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Create input where batch 0 has large values (creating small inv_batch_sum) and other batches have small values (creating large inv_batch_sum). The mutant will overwrite batch 0's output with values scaled by the wrong normalization factor, producing outputs orders of magnitude different from expected.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)
+    # Batch 0: large values -> small inv_batch_sum
+    x[0, :] = 100.0
+    # Batches 1-15: small values -> large inv_batch_sum
+    for i in range(1, 16):
+        x[i, :] = 0.001
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Set batch 0 to all 1.0 (creating small inv_batch_sum≈6.1e-5) and all other batches to all 0.0 (creating inv_batch_sum=1.0 via zero-protection). The mutant writes batch_0_input * other_inv = 1.0 * 1.0 = 1.0 to batch 0's region, instead of correct 6.1e-5.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)
+    x[0, :] = 1.0  # Batch 0: all ones -> inv_batch_sum ≈ 6.1e-5
+    # Batches 1-15: all zeros -> inv_batch_sum = 1.0 (zero-protected)
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

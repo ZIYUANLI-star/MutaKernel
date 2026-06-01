@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P16__arith_replace__6",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P16",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3930,
+        "completion_tokens": 3440,
+        "total_tokens": 7370,
+        "reasoning_tokens": 1042
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Original loop: (4096+31)/32 = 128 iterations. Mutated loop: (4096+31)*32 = 132064 iterations. This is 1032x more iterations, causing kernel timeout/crash before output is produced.",
+      "survival_reason": "The mutation changes the loop bound calculation from ceiling division to multiplication, expanding iterations from 128 to 132064. While mathematically the extra iterations contribute zeros (due to bounds checks failing for t >= 128), the massive increase in computation causes the kernel to timeout or crash in practice. This is evidenced by Layer 2 reporting 'worker_timeout_or_crash'. The mutant never completes execution to produce comparable output.",
+      "killable": true,
+      "kill_strategy": "Any input with the specified shapes will trigger the mutation's effect. The kernel will attempt 132064 iterations instead of 128, causing execution timeout/crash. The original kernel completes in ~1/1000th the time, allowing successful comparison that the mutant cannot satisfy.",
+      "recommendations": "Loop bound calculations involving integer division are critical correctness points in tiled kernels. Mutation testing should always include arithmetic operator mutations on tile count calculations, and test frameworks should enforce reasonable execution time limits to detect infinite/excessive loop mutations.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    A = torch.randn(4096, 1024, dtype=torch.float32, device=device)\n    B = torch.randn(4096, 2048, dtype=torch.float32, device=device)\n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3767,
+        "completion_tokens": 4485,
+        "total_tokens": 8252,
+        "reasoning_tokens": 1900
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With K=4096, TILE_SIZE=32: Original loop bound = (4096+31)/32 = 128 iterations. Mutant loop bound = (4096+31)*32 = 132,064 iterations. For iterations t >= 128: A_row = t*32+tx >= 4096 = K, so condition (A_row < K) fails, setting As[ty][tx] = 0.0f. Same for Bs. Inner loop then computes sum += 0.0f*0.0f for all extra 131,936 iterations, adding exactly 0.0 to sum. IEEE 754 guarantees x + 0.0f = x for all x (finite, Inf, NaN). Thus final sum is identical.",
+      "survival_reason": "The previous attempt used random values expecting timeout/crash to differentiate behaviors, but the mutant completed successfully (mutant_ok=True). The mutation changes the loop iteration count from 128 to 132,064, but for iterations beyond 128, all index calculations exceed K=4096, causing the bounds checks (A_row < K, B_row < K) to fail. This fills shared memory tiles with zeros. The inner multiply-accumulate loop then adds 0.0f*0.0f=0.0f to the running sum. Since IEEE 754 guarantees x+0.0f=x for all floating point values, the extra iterations have zero numerical impact on the final result regardless of input values.",
+      "killable": false,
+      "kill_strategy": "This mutation is semantically equivalent for the fixed input dimensions (K=4096). The mutation only increases iteration count, but extra iterations operate entirely on zeros due to bounds checking. No value-level strategy can produce different outputs since IEEE 754 float addition with zero is identity-preserving. The mutation could only be killed by: (1) using K < TILE_SIZE which would make first-iteration behavior differ, or (2) relying on timeout behavior, neither of which are value-level strategies within the fixed shape constraint.",
+      "recommendations": "Mutation testing for GPU kernels should include coverage of loop bound mutations with input dimensions that fall both above and below tile size boundaries. For this kernel, testing with K < 32 would have exposed the division vs multiplication semantic difference (0 vs 31 iterations), but fixed-shape testing constraints can make such mutations unkillable.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 214.06
+}

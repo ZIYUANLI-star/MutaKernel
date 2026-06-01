@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P53__mask_boundary__5",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P53",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6919,
+        "completion_tokens": 4795,
+        "total_tokens": 11714,
+        "reasoning_tokens": 1940
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation changes `val < thread_min` to `val < thread_min - 1` in min_reduction_dim2_kernel. For distinguishability: when thread_min=10.0, the mutant requires val < 9.0 to update, while original requires val < 10.0. Values in range [9.0, 10.0) would be accepted by original but rejected by mutant. For float32, this difference is meaningful when |thread_min| < ~8e6 (below this, precision distinguishes thread_min from thread_min-1). To trigger: need a row where column ordering presents value A first (becoming thread_min), followed by value B where A-1 ≤ B < A. The true minimum B would be captured by original but missed by mutant.",
+      "survival_reason": "The mutant survived because the tested value distributions (random, sparse, large magnitude, etc.) did not create the specific pattern needed: a sequence where the minimum value in each row falls within the interval [thread_min - 1, thread_min) for some intermediate thread_min state. Random distributions with 256 columns typically have minimum values that differ by more than 1.0 from the next-smallest value. The stress tests like 'relop_boundary_hit' used integer-valued tensors but didn't specifically construct the descending-by-less-than-1 pattern needed. Additionally, if the model's dim parameter is not set to 2, the min_reduction_dim2_kernel is never invoked, making the mutation unreachable.",
+      "killable": true,
+      "kill_strategy": "Create input where each row (when reducing over dim=2) has the structure: [A, B, ...larger values] where A-1 ≤ B < A. For example, column 0 = 10.0, column 1 = 9.5, remaining columns > 10.0. Original finds min=9.5, mutant returns 10.0. Difference of 0.5 exceeds tolerance threshold (~0.105).",
+      "recommendations": "When testing min/max reduction kernels with mutated comparison operators (especially those involving constant offsets like -1), include adversarial test patterns where consecutive candidate minimums/maximums differ by values near the mutation offset. Specifically test value sequences where the true extremum is within ±(offset) of the penultimate extremum encountered during iteration order.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 256, 256] - matches input spec\n    x = torch.full((16, 256, 256), 100.0, dtype=torch.float32, device=device)\n    # Column 0: value that becomes thread_min first (10.0)\n    x[:, :, 0] = 10.0\n    # Column 1: true minimum (9.5) that falls in [thread_min-1, thread_min)\n    # 9.5 >= 10.0-1=9.0 but 9.5 < 10.0\n    x[:, :, 1] = 9.5\n    # All other columns remain at 100.0 (larger than both)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6585,
+        "completion_tokens": 3650,
+        "total_tokens": 10235,
+        "reasoning_tokens": 1362
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "Mutation is in min_reduction_dim2_kernel (lines 43-65), only dispatched when dim==2 (line 131). The dim parameter is fixed at model construction via __init__(dim). Input tensors cannot influence which kernel is called. The test config uses dim!=2, making the mutated code unreachable.",
+      "survival_reason": "The mutation modifies min_reduction_dim2_kernel, which is only invoked when the model is constructed with dim=2. The test harness appears to use dim=0 or dim=1 based on survival evidence: perfectly crafted inputs targeting dim=2 reduction showed bitwise equivalence, and 112+ random rounds showed no divergence. Since dim is a constructor parameter independent of input tensor values, no value-level manipulation can cause the mutated kernel to execute.",
+      "killable": false,
+      "kill_strategy": "This mutant requires a configuration change: the model must be initialized with dim=2 to reach the mutated code path. Value-level changes cannot redirect kernel dispatch since dim is fixed at construction time.",
+      "recommendations": "Mutation testing should exercise all configuration parameters, not just batch sizes. For kernels with dimension-parameterized dispatch, ensure each dispatch path (dim=0, dim=1, dim=2) is tested independently to catch mutations in any branch.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 228.08
+}

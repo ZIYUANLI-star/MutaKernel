@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P24__mask_boundary__0",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P24",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4970,
+        "completion_tokens": 4089,
+        "total_tokens": 9059,
+        "reasoning_tokens": 1595
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "At s=1, original: tid<1 → thread 0 executes. Mutant: tid<0 → no thread executes. sdata[0] never combines with sdata[1], losing max values from thread 1's elements (indices 1, 513, 1025...).",
+      "survival_reason": "The mutation changes the boundary condition in the max reduction loop. At the final reduction step (s=1), the condition `tid < s - 1` becomes `tid < 0`, which is always false. This means sdata[0] is never combined with sdata[1], causing the global maximum to miss all values that accumulated through sdata[1]. When the true maximum is in elements processed by thread 1, the mutant computes an incorrect global_max, leading to wrong log_softmax outputs.",
+      "killable": true,
+      "kill_strategy": "Place the maximum value at column index 1 (processed by thread 1), while keeping other values small. The mutant will compute global_max incorrectly (missing thread 1's contribution), causing large numerical differences in the log_softmax output.",
+      "recommendations": "Parallel reductions must carefully verify boundary conditions at each reduction stage. Testing with extreme values at specific thread-assigned positions (not just random data) can expose off-by-one errors in reduction logic.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    x[:, 1] = 10.0  # Position 1 is processed by thread 1, will be missed by mutant's broken reduction\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4797,
+        "completion_tokens": 5721,
+        "total_tokens": 10518,
+        "reasoning_tokens": 2089
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Thread 1 is lost in mutant (s=1 round: tid<0 is never true). With max at thread 1 = 100, mutant uses max=0. exp(100-0)=exp(100)≈2.7e43 > float32_max≈3.4e38, causing overflow to inf. log(inf)=inf, so all outputs become -inf in mutant vs finite values in original.",
+      "survival_reason": "The previous attempt with value 10.0 failed because exp(10)≈22026 is well within float32 range, so despite using wrong max=0 instead of 10, the mathematical result was numerically equivalent (LogSoftmax formula is invariant to max shift when no overflow occurs). The key insight is that the max subtraction is ONLY for numerical stability—it cancels algebraically. To kill the mutant, we must cause the wrong max to trigger overflow. Using 100.0 causes exp(100)≈2.7e43 to overflow float32, producing inf and breaking the computation entirely.",
+      "killable": true,
+      "kill_strategy": "Place a large value (100.0) at column index 1, which is processed exclusively by thread 1. Thread 1's contribution is lost due to the mutation (the final s=1 round has condition tid<0 which no thread satisfies). The mutant will use max=0, causing exp(100) overflow to inf, yielding -inf outputs instead of correct finite values.",
+      "recommendations": "When testing numerical stability mutations in softmax-like kernels, use values large enough to cause overflow (>88 for float32) when the stability mechanism fails, since the mathematical result is otherwise invariant to the max shift.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    x[:, 1] = 100.0  # Thread 1 handles this; mutant loses thread 1's max, causing exp(100) overflow\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=inf, mean_diff=inf, ref_range=[-1.0000e+02,0.0000e+00], mut_range=[-inf,-inf]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Place a large value (100.0) at column index 1, which is processed exclusively by thread 1. Thread 1's contribution is lost due to the mutation (the final s=1 round has condition tid<0 which no thread satisfies). The mutant will use max=0, causing exp(100) overflow to inf, yielding -inf outputs instead of correct finite values.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    x[:, 1] = 100.0  # Thread 1 handles this; mutant loses thread 1's max, causing exp(100) overflow\n    return [x]"
+  },
+  "elapsed_sec": 188.28
+}

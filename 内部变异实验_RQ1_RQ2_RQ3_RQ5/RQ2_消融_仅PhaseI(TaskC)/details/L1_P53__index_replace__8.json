@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P53__index_replace__8",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P53",
+  "phase1_status": "candidate_equivalent",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6172,
+        "completion_tokens": 5057,
+        "total_tokens": 11229,
+        "reasoning_tokens": 2006
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "For dim=2 kernel: block_size=256 as 1D block → threadIdx.y=0 always. Original: row=threadIdx.x∈[0,255], each thread handles one row. Mutant: row=threadIdx.y=0 always, all threads handle row 0 only. Rows 1-255 are unwritten (garbage from torch::empty).",
+      "survival_reason": "The EMD Layer 2 passed 112 rounds because the test configuration likely used dim=0 or dim=1, never invoking min_reduction_dim2_kernel where the mutation resides. When dim=2 IS used, the mutant only computes output for row index 0 of each batch slice, leaving rows 1-255 containing uninitialized memory values. This creates massive output differences for 255/256 of output elements.",
+      "killable": true,
+      "kill_strategy": "Test with model dim=2. Create input where row r has uniform values equal to r (so min over dim2 gives r). Original produces output[b,r]=r for all rows. Mutant produces output[b,0]=0 correctly but output[b,r>0]=garbage, causing max absolute difference >> tolerance.",
+      "recommendations": "Mutation testing frameworks should ensure coverage of all execution paths by testing with different model configuration parameters (like dim=0, 1, 2), not just different input values. The mutation in dim2 kernel was invisible because dim=2 was never tested.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape [16, 256, 256] per input specification\n    x = torch.zeros(16, 256, 256, dtype=torch.float32, device=device)\n    \n    # Set row r to have all values = r + 1.0\n    # Expected min over dim2: output[b, r] = r + 1.0\n    # Mutant: only computes row 0 (value=1.0), rows 1-255 are garbage\n    for row in range(256):\n        x[:, row, :] = float(row + 1)\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6098,
+        "completion_tokens": 3989,
+        "total_tokens": 10087,
+        "reasoning_tokens": 1966
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "The mutation is in `min_reduction_dim2_kernel` which is ONLY called when `dim == 2`. The kernel launch uses `<<<grid, block_size>>>` where block_size is scalar, creating a 1D block with blockDim.y=1. Thus threadIdx.y=0 for ALL threads. In mutant, `row = threadIdx.y = 0` always, so only row 0 is processed. Rows 1-255 get uninitialized garbage. However, this path requires model.dim=2, which is a constructor parameter, not an input value.",
+      "survival_reason": "The previous attempt failed because the model's `dim` parameter is likely fixed to 0 or 1 in the test configuration, not 2. The mutation specifically affects `min_reduction_dim2_kernel` at line 51, changing `threadIdx.x` to `threadIdx.y`. This kernel is only invoked when `dim==2` is passed to `min_reduction_cuda()`. Since the testing contract states 'Only VALUES can vary' and the model's constructor parameter `dim` determines which kernel branch executes, this mutation is unreachable without changing the model configuration. The 112 rounds of bitwise-identical results confirm the mutated kernel path was never executed. The Layer 3 analysis incorrectly assumed dim=2 was being tested.",
+      "killable": false,
+      "kill_strategy": "UNKILLABLE under current contract. The mutation resides in `min_reduction_dim2_kernel` which requires `ModelNew(dim=2)` to be instantiated. The testing contract fixes model configuration and only allows input value changes. Since `dim` is a constructor argument determining which CUDA kernel is called, no input value pattern can reach the mutated code path when dim≠2. To kill this mutant, the test framework must initialize the model with `dim=2`.",
+      "recommendations": "Mutation testing for kernels with runtime-selected code paths (like dim-based kernel selection) requires testing ALL configuration variants, not just input value variations. The test harness should instantiate ModelNew(dim=0), ModelNew(dim=1), AND ModelNew(dim=2) to achieve full path coverage of the CUDA kernel branches.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 198.6
+}

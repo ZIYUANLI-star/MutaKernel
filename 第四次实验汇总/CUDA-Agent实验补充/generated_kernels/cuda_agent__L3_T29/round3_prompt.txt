@@ -1,0 +1,348 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, num_classes):
+        """
+        LeNet-5 architecture implementation in PyTorch.
+
+        :param num_classes: The number of output classes.
+        """
+        super(Model, self).__init__()
+        
+        # Convolutional layers
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=6, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5, stride=1)
+        
+        # Fully connected layers
+        self.fc1 = nn.Linear(in_features=16*5*5, out_features=120)
+        self.fc2 = nn.Linear(in_features=120, out_features=84)
+        self.fc3 = nn.Linear(in_features=84, out_features=num_classes)
+    
+    def forward(self, x):
+        """
+        Forward pass of the LeNet-5 model.
+
+        :param x: The input tensor, shape (batch_size, 1, 32, 32)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        # First convolutional layer with ReLU activation and max pooling
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        
+        # Second convolutional layer with ReLU activation and max pooling
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        
+        # Flatten the output for the fully connected layers
+        x = x.view(-1, 16*5*5)
+        
+        # First fully connected layer with ReLU activation
+        x = F.relu(self.fc1(x))
+        
+        # Second fully connected layer with ReLU activation
+        x = F.relu(self.fc2(x))
+        
+        # Final fully connected layer
+        x = self.fc3(x)
+        
+        return x
+
+# Test code for the LeNet-5 model (larger batch & image)
+batch_size = 4096
+num_classes = 20
+
+def get_inputs():
+    return [torch.rand(batch_size, 1, 32, 32)]
+
+def get_init_inputs():
+    return [num_classes]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Disable TF32 for numerical precision
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision('highest')
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes):
+        """
+        LeNet-5 architecture implementation in PyTorch.
+
+        :param num_classes: The number of output classes.
+        """
+        super().__init__()
+
+        # Initialize parameters to match the original model
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=6, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5, stride=1)
+        self.fc1 = nn.Linear(in_features=16*5*5, out_features=120)
+        self.fc2 = nn.Linear(in_features=120, out_features=84)
+        self.fc3 = nn.Linear(in_features=84, out_features=num_classes)
+
+    def forward(self, x):
+        """
+        Forward pass of the LeNet-5 model.
+
+        :param x: The input tensor, shape (batch_size, 1, 32, 32)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        # Ensure TF32 is disabled at runtime as well
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            # Ensure input is float32 for numerical stability
+            x = x.float()
+            
+            # First convolutional layer with ReLU activation and max pooling
+            x = F.relu(self.conv1(x))
+            x = F.max_pool2d(x, kernel_size=2, stride=2)
+            
+            # Second convolutional layer with ReLU activation and max pooling
+            x = F.relu(self.conv2(x))
+            x = F.max_pool2d(x, kernel_size=2, stride=2)
+            
+            # Flatten the output for the fully connected layers
+            x = x.view(-1, 16*5*5)
+            
+            # First fully connected layer with ReLU activation
+            x = F.relu(self.fc1(x))
+            
+            # Second fully connected layer with ReLU activation
+            x = F.relu(self.fc2(x))
+            
+            # Final fully connected layer
+            x = self.fc3(x)
+        
+        return x
+```
+
+## Test Failures (Round 3 input)
+Total discrepancies: 28
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (14 failures)
+  - [large_magnitude seed=50000] max_diff=5.928040e-02, mean_diff=9.568423e-03, ref_range=[-1.5219e+02,1.2160e+02], orig_range=[-1.5218e+02,1.2161e+02]
+  - [large_magnitude seed=50001] max_diff=7.875061e-02, mean_diff=1.167499e-02, ref_range=[-1.3663e+02,1.3479e+02], orig_range=[-1.3665e+02,1.3479e+02]
+  - [near_overflow seed=50002] max_diff=6.181283e+25, mean_diff=1.025865e+25, ref_range=[-7.3647e+28,9.8412e+28], orig_range=[-7.3677e+28,9.8418e+28]
+  - [near_overflow seed=50003] max_diff=7.374447e+25, mean_diff=1.083243e+25, ref_range=[-1.2319e+29,9.1009e+28], orig_range=[-1.2318e+29,9.1001e+28]
+  - [mixed_extremes seed=50012] max_diff=4.538116e-01, mean_diff=7.041974e-02, ref_range=[-1.0178e+03,9.8330e+02], orig_range=[-1.0178e+03,9.8304e+02]
+  - [mixed_extremes seed=50013] max_diff=4.862518e-01, mean_diff=7.803253e-02, ref_range=[-1.0426e+03,1.4060e+03], orig_range=[-1.0426e+03,1.4061e+03]
+  - [head_heavy seed=50024] max_diff=5.178223e-01, mean_diff=2.466553e-02, ref_range=[-1.0680e+03,1.1385e+03], orig_range=[-1.0681e+03,1.1386e+03]
+  - [head_heavy seed=50025] max_diff=5.299683e-01, mean_diff=2.437720e-02, ref_range=[-1.2794e+03,9.8678e+02], orig_range=[-1.2795e+03,9.8694e+02]
+  ... and 6 more failures
+
+### training_stress (14 failures)
+  - [large_magnitude seed=70000] max_diff=6.884766e-02, mean_diff=1.143050e-02, ref_range=[-1.1416e+02,1.5274e+02], orig_range=[-1.1418e+02,1.5277e+02]
+  - [large_magnitude seed=70001] max_diff=6.461334e-02, mean_diff=1.012934e-02, ref_range=[-9.3617e+01,1.1169e+02], orig_range=[-9.3610e+01,1.1167e+02]
+  - [near_overflow seed=70002] max_diff=7.340683e+25, mean_diff=1.222014e+25, ref_range=[-1.6736e+29,1.3012e+29], orig_range=[-1.6735e+29,1.3012e+29]
+  - [near_overflow seed=70003] max_diff=6.861362e+25, mean_diff=1.069317e+25, ref_range=[-1.2010e+29,1.6892e+29], orig_range=[-1.2009e+29,1.6892e+29]
+  - [mixed_extremes seed=70012] max_diff=4.852905e-01, mean_diff=7.866823e-02, ref_range=[-9.6276e+02,7.5447e+02], orig_range=[-9.6269e+02,7.5461e+02]
+  - [mixed_extremes seed=70013] max_diff=3.898315e-01, mean_diff=6.332918e-02, ref_range=[-7.2024e+02,1.0879e+03], orig_range=[-7.2032e+02,1.0879e+03]
+  - [head_heavy seed=70024] max_diff=5.111084e-01, mean_diff=2.211035e-02, ref_range=[-7.9206e+02,6.3226e+02], orig_range=[-7.9209e+02,6.3245e+02]
+  - [head_heavy seed=70025] max_diff=6.139526e-01, mean_diff=2.806681e-02, ref_range=[-1.4622e+03,1.5297e+03], orig_range=[-1.4621e+03,1.5298e+03]
+  ... and 6 more failures
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 28 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Disable TF32 for numerical precision
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision('highest')
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes):
+        """
+        LeNet-5 architecture implementation in PyTorch.
+
+        :param num_classes: The number of output classes.
+        """
+        super().__init__()
+
+        # Initialize parameters to match the original model
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=6, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5, stride=1)
+        self.fc1 = nn.Linear(in_features=16*5*5, out_features=120)
+        self.fc2 = nn.Linear(in_features=120, out_features=84)
+        self.fc3 = nn.Linear(in_features=84, out_features=num_classes)
+
+    def forward(self, x):
+        """
+        Forward pass of the LeNet-5 model.
+
+        :param x: The input tensor, shape (batch_size, 1, 32, 32)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        # First convolutional layer with ReLU activation and max pooling
+        x = F.relu(self.conv1(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        
+        # Second convolutional layer with ReLU activation and max pooling
+        x = F.relu(self.conv2(x))
+        x = F.max_pool2d(x, kernel_size=2, stride=2)
+        
+        # Flatten the output for the fully connected layers
+        x = x.view(-1, 16*5*5)
+        
+        # First fully connected layer with ReLU activation
+        x = F.relu(self.fc1(x))
+        
+        # Second fully connected layer with ReLU activation
+        x = F.relu(self.fc2(x))
+        
+        # Final fully connected layer
+        x = self.fc3(x)
+        
+        return x
+```
+
+### What still failed after Round 1
+
+### value_stress (14 failures)
+  - [large_magnitude seed=50000] max_diff=5.928040e-02, mean_diff=9.568423e-03, ref_range=[-1.5219e+02,1.2160e+02], orig_range=[-1.5218e+02,1.2161e+02]
+  - [large_magnitude seed=50001] max_diff=7.875061e-02, mean_diff=1.167499e-02, ref_range=[-1.3663e+02,1.3479e+02], orig_range=[-1.3665e+02,1.3479e+02]
+  - [near_overflow seed=50002] max_diff=6.181283e+25, mean_diff=1.025865e+25, ref_range=[-7.3647e+28,9.8412e+28], orig_range=[-7.3677e+28,9.8418e+28]
+  - [near_overflow seed=50003] max_diff=7.374447e+25, mean_diff=1.083243e+25, ref_range=[-1.2319e+29,9.1009e+28], orig_range=[-1.2318e+29,9.1001e+28]
+  - [mixed_extremes seed=50012] max_diff=4.538116e-01, mean_diff=7.041974e-02, ref_range=[-1.0178e+03,9.8330e+02], orig_range=[-1.0178e+03,9.8304e+02]
+  - [mixed_extremes seed=50013] max_diff=4.862518e-01, mean_diff=7.803253e-02, ref_range=[-1.0426e+03,1.4060e+03], orig_range=[-1.0426e+03,1.4061e+03]
+  - [head_heavy seed=50024] max_diff=5.178223e-01, mean_diff=2.466553e-02, ref_range=[-1.0680e+03,1.1385e+03], orig_range=[-1.0681e+03,1.1386e+03]
+  - [head_heavy seed=50025] max_diff=5.299683e-01, mean_diff=2.437720e-02, ref_range=[-1.2794e+03,9.8678e+02], orig_range=[-1.2795e+03,9.8694e+02]
+  ... and 6 more failures
+
+### training_stress (14 failures)
+  - [large_magnitude seed=70000] max_diff=6.884766e-02, mean_diff=1.143050e-02, ref_range=[-1.1416e+02,1.5274e+02], orig_range=[-1.1418e+02,1.5277e+02]
+  - [large_magnitude seed=70001] max_diff=6.461334e-02, mean_diff=1.012934e-02, ref_range=[-9.3617e+01,1.1169e+02], orig_range=[-9.3610e+01,1.1167e+02]
+  - [near_overflow seed=70002] max_diff=7.340683e+25, mean_diff=1.222014e+25, ref_range=[-1.6736e+29,1.3012e+29], orig_range=[-1.6735e+29,1.3012e+29]
+  - [near_overflow seed=70003] max_diff=6.861362e+25, mean_diff=1.069317e+25, ref_range=[-1.2010e+29,1.6892e+29], orig_range=[-1.2009e+29,1.6892e+29]
+  - [mixed_extremes seed=70012] max_diff=4.852905e-01, mean_diff=7.866823e-02, ref_range=[-9.6276e+02,7.5447e+02], orig_range=[-9.6269e+02,7.5461e+02]
+  - [mixed_extremes seed=70013] max_diff=3.898315e-01, mean_diff=6.332918e-02, ref_range=[-7.2024e+02,1.0879e+03], orig_range=[-7.2032e+02,1.0879e+03]
+  - [head_heavy seed=70024] max_diff=5.111084e-01, mean_diff=2.211035e-02, ref_range=[-7.9206e+02,6.3226e+02], orig_range=[-7.9209e+02,6.3245e+02]
+  - [head_heavy seed=70025] max_diff=6.139526e-01, mean_diff=2.806681e-02, ref_range=[-1.4622e+03,1.5297e+03], orig_range=[-1.4621e+03,1.5298e+03]
+  ... and 6 more failures
+
+## Previous Repair Attempt (Round 2)
+After round 2, still 28 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+# Disable TF32 for numerical precision
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
+torch.set_float32_matmul_precision('highest')
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_classes):
+        """
+        LeNet-5 architecture implementation in PyTorch.
+
+        :param num_classes: The number of output classes.
+        """
+        super().__init__()
+
+        # Initialize parameters to match the original model
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=6, kernel_size=5, stride=1)
+        self.conv2 = nn.Conv2d(in_channels=6, out_channels=16, kernel_size=5, stride=1)
+        self.fc1 = nn.Linear(in_features=16*5*5, out_features=120)
+        self.fc2 = nn.Linear(in_features=120, out_features=84)
+        self.fc3 = nn.Linear(in_features=84, out_features=num_classes)
+
+    def forward(self, x):
+        """
+        Forward pass of the LeNet-5 model.
+
+        :param x: The input tensor, shape (batch_size, 1, 32, 32)
+        :return: The output tensor, shape (batch_size, num_classes)
+        """
+        # Ensure TF32 is disabled at runtime as well
+        with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_math=True, enable_mem_efficient=False):
+            # Ensure input is float32 for numerical stability
+            x = x.float()
+            
+            # First convolutional layer with ReLU activation and max pooling
+            x = F.relu(self.conv1(x))
+            x = F.max_pool2d(x, kernel_size=2, stride=2)
+            
+            # Second convolutional layer with ReLU activation and max pooling
+            x = F.relu(self.conv2(x))
+            x = F.max_pool2d(x, kernel_size=2, stride=2)
+            
+            # Flatten the output for the fully connected layers
+            x = x.view(-1, 16*5*5)
+            
+            # First fully connected layer with ReLU activation
+            x = F.relu(self.fc1(x))
+            
+            # Second fully connected layer with ReLU activation
+            x = F.relu(self.fc2(x))
+            
+            # Final fully connected layer
+            x = self.fc3(x)
+        
+        return x
+```
+
+### What still failed after Round 2
+
+### value_stress (14 failures)
+  - [large_magnitude seed=50000] max_diff=5.928040e-02, mean_diff=9.568423e-03, ref_range=[-1.5219e+02,1.2160e+02], orig_range=[-1.5218e+02,1.2161e+02]
+  - [large_magnitude seed=50001] max_diff=7.875061e-02, mean_diff=1.167499e-02, ref_range=[-1.3663e+02,1.3479e+02], orig_range=[-1.3665e+02,1.3479e+02]
+  - [near_overflow seed=50002] max_diff=6.181283e+25, mean_diff=1.025865e+25, ref_range=[-7.3647e+28,9.8412e+28], orig_range=[-7.3677e+28,9.8418e+28]
+  - [near_overflow seed=50003] max_diff=7.374447e+25, mean_diff=1.083243e+25, ref_range=[-1.2319e+29,9.1009e+28], orig_range=[-1.2318e+29,9.1001e+28]
+  - [mixed_extremes seed=50012] max_diff=4.538116e-01, mean_diff=7.041974e-02, ref_range=[-1.0178e+03,9.8330e+02], orig_range=[-1.0178e+03,9.8304e+02]
+  - [mixed_extremes seed=50013] max_diff=4.862518e-01, mean_diff=7.803253e-02, ref_range=[-1.0426e+03,1.4060e+03], orig_range=[-1.0426e+03,1.4061e+03]
+  - [head_heavy seed=50024] max_diff=5.178223e-01, mean_diff=2.466553e-02, ref_range=[-1.0680e+03,1.1385e+03], orig_range=[-1.0681e+03,1.1386e+03]
+  - [head_heavy seed=50025] max_diff=5.299683e-01, mean_diff=2.437720e-02, ref_range=[-1.2794e+03,9.8678e+02], orig_range=[-1.2795e+03,9.8694e+02]
+  ... and 6 more failures
+
+### training_stress (14 failures)
+  - [large_magnitude seed=70000] max_diff=6.884766e-02, mean_diff=1.143050e-02, ref_range=[-1.1416e+02,1.5274e+02], orig_range=[-1.1418e+02,1.5277e+02]
+  - [large_magnitude seed=70001] max_diff=6.461334e-02, mean_diff=1.012934e-02, ref_range=[-9.3617e+01,1.1169e+02], orig_range=[-9.3610e+01,1.1167e+02]
+  - [near_overflow seed=70002] max_diff=7.340683e+25, mean_diff=1.222014e+25, ref_range=[-1.6736e+29,1.3012e+29], orig_range=[-1.6735e+29,1.3012e+29]
+  - [near_overflow seed=70003] max_diff=6.861362e+25, mean_diff=1.069317e+25, ref_range=[-1.2010e+29,1.6892e+29], orig_range=[-1.2009e+29,1.6892e+29]
+  - [mixed_extremes seed=70012] max_diff=4.852905e-01, mean_diff=7.866823e-02, ref_range=[-9.6276e+02,7.5447e+02], orig_range=[-9.6269e+02,7.5461e+02]
+  - [mixed_extremes seed=70013] max_diff=3.898315e-01, mean_diff=6.332918e-02, ref_range=[-7.2024e+02,1.0879e+03], orig_range=[-7.2032e+02,1.0879e+03]
+  - [head_heavy seed=70024] max_diff=5.111084e-01, mean_diff=2.211035e-02, ref_range=[-7.9206e+02,6.3226e+02], orig_range=[-7.9209e+02,6.3245e+02]
+  - [head_heavy seed=70025] max_diff=6.139526e-01, mean_diff=2.806681e-02, ref_range=[-1.4622e+03,1.5297e+03], orig_range=[-1.4621e+03,1.5298e+03]
+  ... and 6 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

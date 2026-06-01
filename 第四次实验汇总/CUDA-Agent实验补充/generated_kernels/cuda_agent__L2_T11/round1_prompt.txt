@@ -1,0 +1,225 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies Instance Normalization, and divides by a constant.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.instance_norm = nn.InstanceNorm2d(out_channels)
+        self.divide_by = divide_by
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.instance_norm(x)
+        x = x / self.divide_by
+        return x
+
+batch_size = 128
+in_channels  = 64  
+out_channels = 128  
+height = width = 128  
+kernel_size = 3
+divide_by = 2.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, divide_by]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === conv_bias_instance_norm_divide_cuda.cu ===
+#include <cuda_runtime.h>
+
+__global__ void conv_bias_instance_norm_divide_kernel(float* output, const float* input, const float* bias) {
+    int idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    // Each block processes one (instance, channel) pair
+    int block_size = 128;
+    int num_blocks = 128 * 128;  // 128 instances * 128 channels
+    int elements_per_block = 126 * 126;
+    
+    if (idx < num_blocks && tid < block_size) {
+        int instance = idx / 128;
+        int channel = idx % 128;
+        
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        
+        // Step 1: Calculate mean and variance for this (instance, channel)
+        float conv_bias = bias[channel];
+        
+        for (int i = tid; i < elements_per_block; i += block_size) {
+            int linear_idx = instance * (128 * 126 * 126) + channel * (126 * 126) + i;
+            float val = input[linear_idx] + conv_bias;
+            sum += val;
+            sum_sq += val * val;
+        }
+        
+        // Block reduce for sum and sum_sq
+        __shared__ float sh_sum[128];
+        __shared__ float sh_sum_sq[128];
+        sh_sum[tid] = sum;
+        sh_sum_sq[tid] = sum_sq;
+        __syncthreads();
+        
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) {
+                sh_sum[tid] += sh_sum[tid + s];
+                sh_sum_sq[tid] += sh_sum_sq[tid + s];
+            }
+            __syncthreads();
+        }
+        
+        float mean = sh_sum[0] / elements_per_block;
+        float var = (sh_sum_sq[0] / elements_per_block - mean * mean);
+        float inv_std = rsqrt(var + 1e-05);
+        
+        __syncthreads();
+        
+        // Step 2: Normalize and divide by 2.0
+        float gamma = 1.0f;  // No affine in the model
+        float beta = 0.0f;
+        
+        for (int i = tid; i < elements_per_block; i += block_size) {
+            int linear_idx = instance * (128 * 126 * 126) + channel * (126 * 126) + i;
+            float val = input[linear_idx] + conv_bias;
+            
+            float normalized_val = gamma * (val - mean) * inv_std + beta;
+            output[linear_idx] = normalized_val / 2.0f;
+        }
+    }
+}
+
+extern "C" void conv_bias_instance_norm_divide_launcher(float* output, const float* input, const float* bias, cudaStream_t stream) {
+    int num_blocks = 128 * 128;  // 128 instances * 128 channels
+    int block_size = 128;
+    
+    conv_bias_instance_norm_divide_kernel<<<num_blocks, block_size, 0, stream>>>(output, input, bias);
+}
+
+"""
+
+_cpp_sources = """
+// === conv_bias_instance_norm_divide_cuda_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void conv_bias_instance_norm_divide_launcher(float* output, const float* input, const float* bias, cudaStream_t stream);
+
+torch::Tensor conv_bias_instance_norm_divide_forward(torch::Tensor input, torch::Tensor bias) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(input.dim() == 4, "Input must be 4D tensor");
+    
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    TORCH_CHECK(bias.dim() == 1, "Bias must be 1D tensor");
+    
+    auto output = torch::empty_like(input);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    conv_bias_instance_norm_divide_launcher(output.data_ptr<float>(), input.data_ptr<float>(), bias.data_ptr<float>(), stream);
+    
+    return output;
+}
+
+void register_conv_bias_instance_norm_divide(pybind11::module& m) {
+    m.def("conv_bias_instance_norm_divide_forward", &conv_bias_instance_norm_divide_forward, "Fused conv bias + instance norm + divide by 2.0 forward");
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["conv_bias_instance_norm_divide_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using:
+    - PyTorch's convolution (without bias)
+    - Custom fused kernel for conv bias + instance norm + division
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, divide_by):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.instance_norm = nn.InstanceNorm2d(out_channels)  # Keep for state dict compatibility
+        self.divide_by = divide_by
+
+    def forward(self, x):
+        # Use PyTorch's convolution without bias
+        torch.backends.cudnn.enabled = True
+        x = torch.conv2d(x, self.conv.weight, None, self.conv.stride, self.conv.padding, self.conv.dilation)
+        torch.backends.cudnn.enabled = False
+        
+        # Use custom fused kernel for conv bias + instance norm + divide by 2.0
+        x = cuda_extension.conv_bias_instance_norm_divide_forward(x, self.conv.bias)
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 8
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (4 failures)
+  - [uniform_constant seed=50018] max_diff=nan, mean_diff=nan, ref_range=[-6.0315e-03,8.4442e-03], orig_range=[nan,nan]
+  - [uniform_constant seed=50019] max_diff=nan, mean_diff=nan, ref_range=[-9.6505e-03,4.2221e-03], orig_range=[nan,nan]
+  - [structured_ramp seed=50020] max_diff=nan, mean_diff=nan, ref_range=[-4.1901e-02,3.0591e-02], orig_range=[nan,nan]
+  - [structured_ramp seed=50021] max_diff=8.570735e-02, mean_diff=2.706374e-05, ref_range=[-2.9463e-02,3.8461e-02], orig_range=[-2.9722e-02,1.1773e-01]
+
+### training_stress (4 failures)
+  - [uniform_constant seed=70018] max_diff=nan, mean_diff=nan, ref_range=[-3.6189e-03,7.2378e-03], orig_range=[nan,nan]
+  - [uniform_constant seed=70019] max_diff=nan, mean_diff=nan, ref_range=[-6.0315e-03,7.2379e-03], orig_range=[nan,nan]
+  - [structured_ramp seed=70020] max_diff=2.037356e-02, mean_diff=3.320866e-05, ref_range=[-2.9771e-02,2.7180e-02], orig_range=[-3.1948e-02,3.6093e-02]
+  - [structured_ramp seed=70021] max_diff=1.721320e-02, mean_diff=3.055492e-05, ref_range=[-2.6473e-02,3.0356e-02], orig_range=[-3.7909e-02,3.6460e-02]
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

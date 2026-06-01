@@ -1,0 +1,314 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a matrix multiplication, batch normalization, bias addition, division, and Swish activation.
+    """
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, bias_shape=(1,), divide_value=1.0):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.bn = nn.BatchNorm1d(out_features, eps=bn_eps, momentum=bn_momentum)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.divide_value = divide_value
+
+    def forward(self, x):
+        x = self.matmul(x)
+        x = self.bn(x)
+        x = x + self.bias
+        x = x / self.divide_value
+        x = x * torch.sigmoid(x)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+bn_eps = 1e-5
+bn_momentum = 0.1
+bias_shape = (1,)
+divide_value = 1.0
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, bn_eps, bn_momentum, bias_shape, divide_value]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_postprocess.cu ===
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float sigmoid(float x) {
+    return 1.0f / (1.0f + exp(-x));
+}
+
+__global__ void fused_bias_batchnorm_extrabias_division_swish_kernel(
+    float* output,
+    const float* gemm_out,
+    const float* gemm_bias,
+    const float* running_mean,
+    const float* running_var,
+    const float* bn_weight,
+    const float* bn_bias,
+    const float* extra_bias,
+    float divide_value,
+    float eps,
+    int batch_size,
+    int features
+) {
+    int tid = blockIdx.x * 128 + threadIdx.x;
+    
+    if (tid < batch_size * features) {
+        int feature_idx = tid % features;
+        
+        // Get all required values
+        float val = gemm_out[tid];
+        float gb = gemm_bias[feature_idx];
+        float rm = running_mean[feature_idx];
+        float rv = running_var[feature_idx];
+        float gw = bn_weight[feature_idx];
+        float gb_bn = bn_bias[feature_idx];
+        float eb = extra_bias[0];
+        
+        // Compute inv_std once
+        float inv_std = rsqrt(rv + eps);
+        
+        // Fused operations:
+        // 1. Scale and shift by batch norm parameters
+        // 2. Add GEMM bias and extra bias
+        // 3. Divide
+        // 4. Apply swish activation
+        val = val * gw * inv_std + (gb_bn - rm * gw * inv_std);
+        val += gb + eb;
+        val /= divide_value;
+        float sig = sigmoid(val);
+        output[tid] = val * sig;
+    }
+}
+
+extern "C" void fused_bias_batchnorm_extrabias_division_swish_launcher(
+    float* output,
+    const float* gemm_out,
+    const float* gemm_bias,
+    const float* running_mean,
+    const float* running_var,
+    const float* bn_weight,
+    const float* bn_bias,
+    const float* extra_bias,
+    float divide_value,
+    float eps,
+    int batch_size,
+    int features,
+    cudaStream_t stream
+) {
+    int blocks = (batch_size * features + 127) / 128;
+    fused_bias_batchnorm_extrabias_division_swish_kernel<<<blocks, 128, 0, stream>>>(
+        output, gemm_out, gemm_bias, running_mean, running_var, bn_weight, bn_bias,
+        extra_bias, divide_value, eps, batch_size, features
+    );
+}
+
+"""
+
+_cpp_sources = """
+// === fused_postprocess_binding.cpp ===
+
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_bias_batchnorm_extrabias_division_swish_launcher(
+    float* output,
+    const float* gemm_out,
+    const float* gemm_bias,
+    const float* running_mean,
+    const float* running_var,
+    const float* bn_weight,
+    const float* bn_bias,
+    const float* extra_bias,
+    float divide_value,
+    float eps,
+    int batch_size,
+    int features,
+    cudaStream_t stream
+);
+
+torch::Tensor fused_postprocess_forward(
+    torch::Tensor gemm_out,
+    torch::Tensor gemm_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor extra_bias,
+    float divide_value,
+    float eps
+) {
+    TORCH_CHECK(gemm_out.is_cuda() && gemm_out.dtype() == torch::kFloat32 && gemm_out.is_contiguous());
+    TORCH_CHECK(gemm_bias.is_cuda() && gemm_bias.dtype() == torch::kFloat32 && gemm_bias.is_contiguous());
+    TORCH_CHECK(running_mean.is_cuda() && running_mean.dtype() == torch::kFloat32 && running_mean.is_contiguous());
+    TORCH_CHECK(running_var.is_cuda() && running_var.dtype() == torch::kFloat32 && running_var.is_contiguous());
+    TORCH_CHECK(bn_weight.is_cuda() && bn_weight.dtype() == torch::kFloat32 && bn_weight.is_contiguous());
+    TORCH_CHECK(bn_bias.is_cuda() && bn_bias.dtype() == torch::kFloat32 && bn_bias.is_contiguous());
+    TORCH_CHECK(extra_bias.is_cuda() && extra_bias.dtype() == torch::kFloat32 && extra_bias.is_contiguous());
+    
+    TORCH_CHECK(gemm_out.ndimension() == 2, "gemm_out must be 2D (batch_size, features)");
+    TORCH_CHECK(extra_bias.size(0) == 1, "extra_bias must have size 1");
+    
+    int batch_size = gemm_out.size(0);
+    int features = gemm_out.size(1);
+    
+    TORCH_CHECK(gemm_bias.size(0) == features && running_mean.size(0) == features &&
+               running_var.size(0) == features && bn_weight.size(0) == features &&
+               bn_bias.size(0) == features);
+    
+    auto output = torch::empty_like(gemm_out);
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    fused_bias_batchnorm_extrabias_division_swish_launcher(
+        output.data_ptr<float>(),
+        gemm_out.data_ptr<float>(),
+        gemm_bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        extra_bias.data_ptr<float>(),
+        divide_value,
+        eps,
+        batch_size,
+        features,
+        stream
+    );
+    
+    return output;
+}
+
+void register_fused_postprocess(pybind11::module& m) {
+    m.def("fused_postprocess_forward", &fused_postprocess_forward,
+          "Fused postprocessing after GEMM: bias + batch norm + extra bias + division + swish",
+          py::arg("gemm_out"),
+          py::arg("gemm_bias"),
+          py::arg("running_mean"),
+          py::arg("running_var"),
+          py::arg("bn_weight"),
+          py::arg("bn_bias"),
+          py::arg("extra_bias"),
+          py::arg("divide_value"),
+          py::arg("eps"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_postprocess_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix multiplication with cuBLAS and fuses
+    batch normalization, bias addition, division, and Swish activation into a single kernel.
+    """
+    def __init__(self, in_features, out_features, bn_eps=1e-5, bn_momentum=0.1, bias_shape=(1,), divide_value=1.0):
+        super(ModelNew, self).__init__()
+        # Preserve original structure for state_dict compatibility
+        self.matmul = nn.Linear(in_features, out_features)  # We'll use the weights/bias but not the forward pass
+        self.bn = nn.BatchNorm1d(out_features, eps=bn_eps, momentum=bn_momentum)  # Preserve BN params/stats
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.divide_value = divide_value
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x):
+        # Step 1: Matrix multiplication using cuBLAS with TF32 for better performance
+        weight = self.matmul.weight
+        
+        # Enable TF32 for this operation
+        torch.backends.cuda.matmul.allow_tf32 = True
+        x = x @ weight.T
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # Step 2: Use custom fused kernel for all postprocessing steps
+        x = cuda_extension.fused_postprocess_forward(
+            x,
+            self.matmul.bias,
+            self.bn.running_mean,
+            self.bn.running_var,
+            self.bn.weight,
+            self.bn.bias,
+            self.bias,
+            self.divide_value,
+            self.bn.eps
+        )
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 62
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=9.035034e-01, mean_diff=6.915908e-02, ref_range=[-2.7846e-01,3.1116e+03], orig_range=[-2.7846e-01,3.1115e+03]
+  - [large_magnitude seed=50001] max_diff=9.250488e-01, mean_diff=6.939460e-02, ref_range=[-2.7846e-01,3.1922e+03], orig_range=[-2.7846e-01,3.1922e+03]
+  - [near_overflow seed=50002] max_diff=9.486372e+26, mean_diff=6.919581e+25, ref_range=[-0.0000e+00,3.0890e+30], orig_range=[-0.0000e+00,3.0889e+30]
+  - [near_overflow seed=50003] max_diff=9.054854e+26, mean_diff=6.910059e+25, ref_range=[-0.0000e+00,3.0624e+30], orig_range=[-0.0000e+00,3.0624e+30]
+  - [all_negative seed=50008] max_diff=9.609556e-02, mean_diff=6.687703e-03, ref_range=[-2.7846e-01,2.8609e+02], orig_range=[-2.7846e-01,2.8605e+02]
+  - [all_negative seed=50009] max_diff=9.243774e-02, mean_diff=7.175036e-03, ref_range=[-2.7846e-01,2.6979e+02], orig_range=[-2.7846e-01,2.6981e+02]
+  - [all_positive seed=50010] max_diff=8.644485e-02, mean_diff=6.914528e-03, ref_range=[-2.7846e-01,2.8977e+02], orig_range=[-2.7846e-01,2.8977e+02]
+  - [all_positive seed=50011] max_diff=9.342957e-02, mean_diff=6.922249e-03, ref_range=[-2.7846e-01,2.9801e+02], orig_range=[-2.7846e-01,2.9800e+02]
+  ... and 20 more failures
+
+### training_stress (34 failures)
+  - [large_magnitude seed=70000] max_diff=1.201561e+01, mean_diff=7.459691e-01, ref_range=[-2.7846e-01,4.3172e+00], orig_range=[-2.7846e-01,1.6333e+01]
+  - [large_magnitude seed=70001] max_diff=1.237299e+01, mean_diff=8.873562e-01, ref_range=[-2.7846e-01,5.2263e+00], orig_range=[-2.7846e-01,1.7599e+01]
+  - [all_negative seed=70008] max_diff=2.074036e+01, mean_diff=1.953856e+00, ref_range=[-2.7846e-01,5.9698e+00], orig_range=[-2.7846e-01,2.4861e+01]
+  - [all_negative seed=70009] max_diff=2.403996e+01, mean_diff=1.667092e+00, ref_range=[-2.7846e-01,4.6586e+00], orig_range=[-2.7846e-01,2.6944e+01]
+  - [all_positive seed=70010] max_diff=1.945976e+01, mean_diff=1.980007e+00, ref_range=[-2.7846e-01,5.8119e+00], orig_range=[-2.7846e-01,2.4089e+01]
+  - [all_positive seed=70011] max_diff=2.080315e+01, mean_diff=1.796477e+00, ref_range=[-2.7846e-01,5.1735e+00], orig_range=[-2.7846e-01,2.4257e+01]
+  - [mixed_extremes seed=70012] max_diff=1.136577e+01, mean_diff=5.409030e-01, ref_range=[-2.7846e-01,2.9921e+00], orig_range=[-2.7846e-01,1.4358e+01]
+  - [mixed_extremes seed=70013] max_diff=1.093923e+01, mean_diff=1.013373e+00, ref_range=[-2.7846e-01,5.7115e+00], orig_range=[-2.7846e-01,1.6651e+01]
+  ... and 26 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

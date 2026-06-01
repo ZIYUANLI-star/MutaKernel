@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P23__const_perturb__2",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P23",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4834,
+        "completion_tokens": 4911,
+        "total_tokens": 9745,
+        "reasoning_tokens": 2001
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Input has dim()=2. Original checks dim()==2 (TRUE, uses custom kernel). Mutant checks dim()==3 (FALSE, uses torch.softmax). Different code paths with different floating-point reduction orders produce numerical differences.",
+      "survival_reason": "The mutation changes the dimension check from 2 to 3, causing all 2D inputs (which is the fixed input specification) to bypass the custom CUDA kernel entirely and use PyTorch's built-in softmax instead. Both implementations compute softmax mathematically, but they use different floating-point operation orderings, particularly in the parallel reduction for computing the sum of exponentials. These accumulation order differences lead to numerical discrepancies that may exceed the tolerance threshold.",
+      "killable": true,
+      "kill_strategy": "Use high-magnitude random inputs to maximize floating-point accumulation differences between the parallel tree reduction in the custom kernel versus PyTorch's reduction strategy. Values scaled by ~50-100 with normal distribution create scenarios where the different reduction orders produce measurably different sums.",
+      "recommendations": "Mutation testing for condition checks (like dimension guards) should include tests that verify the correct code path is taken, not just that the output is numerically similar. Consider adding explicit code-path verification or logging to catch such routing mutations.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    # High magnitude values to maximize numerical differences in reduction\n    x = torch.randn(16, 16384, device=device, dtype=torch.float32) * 50.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4657,
+        "completion_tokens": 5108,
+        "total_tokens": 9765,
+        "reasoning_tokens": 2654
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation changes `x.dim() == 2` to `x.dim() == 3`. Since input is always 2D (shape [16, 16384]), the mutant NEVER uses the custom CUDA kernel - it always falls through to `torch.softmax(x, dim=1)`. The original uses the custom kernel. Both compute mathematically equivalent softmax, and with atol=rtol=1e-2, float32 precision differences between tree reduction (custom) vs PyTorch's reduction are too small (<1e-4 typically).",
+      "survival_reason": "The previous attempt used high-magnitude random values hoping to expose numerical differences in parallel reduction. This failed because: (1) Both implementations use numerically stable softmax (subtract max before exp), (2) Float32 has ~7 significant digits precision, so even with 16384 elements the worst-case summation error is O(n*eps) ≈ 16384*1e-7 ≈ 1.6e-3, well under 1e-2 tolerance, (3) Softmax outputs are bounded [0,1], so relative tolerance adds at most 1e-2. The key insight is that both paths produce mathematically identical results with negligible numerical differences. To kill this, we need inputs where the custom kernel has a BUG that PyTorch doesn't, or we need impossibly precise tolerances.",
+      "killable": false,
+      "kill_strategy": "This mutant appears unkillable with the given tolerance (atol=1e-2, rtol=1e-2). The mutation causes the custom kernel to be bypassed entirely (2D input fails `dim() == 3` check), falling back to PyTorch's softmax. Both implementations compute the same mathematical function with similar numerical stability. Float32 precision limits the maximum difference to approximately 1e-4 to 1e-3 for this input size, which is well within the 1e-2 tolerance. No value pattern can create a difference exceeding threshold without changing shapes or tolerance requirements.",
+      "recommendations": "Mutation testing for numerical kernels should use tighter tolerances (e.g., atol=1e-5, rtol=1e-5) when testing for semantic equivalence of floating-point algorithms. The current 1e-2 tolerance is too loose to distinguish between algorithmically different but mathematically equivalent implementations. Additionally, consider adding explicit path-coverage tests that verify which code path (custom kernel vs fallback) is actually taken.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 211.2
+}

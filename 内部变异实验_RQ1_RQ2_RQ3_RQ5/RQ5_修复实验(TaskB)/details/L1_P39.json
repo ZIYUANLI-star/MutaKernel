@@ -1,0 +1,203 @@
+{
+  "kernel_name": "L1_P39",
+  "level": "L1",
+  "problem_id": "39",
+  "executed": true,
+  "trigger": "task_b_regenerate_opus45",
+  "max_rounds": 3,
+  "n_failing_inputs": 9,
+  "round0_stats": {
+    "n_total": 9,
+    "n_confirmed_buggy": 9,
+    "n_ref_failed": 0,
+    "n_unexpected_pass": 0
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 2993,
+        "completion_tokens": 4453,
+        "total_tokens": 7446,
+        "reasoning_tokens": 1393
+      },
+      "reasoning_chars": 5575,
+      "llm_elapsed_sec": 50.55,
+      "v_stress_elapsed_sec": 59.49,
+      "v_kb_elapsed_sec": 12.06,
+      "new_kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized L2 normalization\nl2_norm_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <cuda_fp16.h>\n#include <math.h>\n\ntemplate<typename T>\n__global__ void l2_norm_kernel(const T* __restrict__ input, T* __restrict__ output, \n                               int batch_size, int dim) {\n    const int batch_idx = blockIdx.x;\n    const int tid = threadIdx.x;\n    \n    // Use 256 threads per block (power of 2 for reduction)\n    const int threads = 256;\n    \n    // Shared memory for reduction\n    __shared__ float sdata[256];\n    \n    // Each thread processes multiple elements\n    float thread_sum = 0.0f;\n    \n    // Process elements with stride equal to total threads\n    for (int i = tid; i < dim; i += threads) {\n        int idx = batch_idx * dim + i;\n        float val = static_cast<float>(input[idx]);\n        thread_sum += val * val;\n    }\n    \n    // Parallel reduction\n    sdata[tid] = thread_sum;\n    __syncthreads();\n    \n    // Tree reduction\n    for (int stride = threads / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            sdata[tid] += sdata[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // Compute reciprocal of L2 norm (1 / sqrt(sum))\n    // No epsilon added to match PyTorch's torch.norm behavior exactly\n    float scale = 0.0f;\n    if (tid == 0) {\n        float sum_sq = sdata[0];\n        float norm = sqrtf(sum_sq);\n        // Match PyTorch behavior: compute 1/norm directly\n        // This matches x / torch.norm(x, p=2, dim=1, keepdim=True)\n        scale = 1.0f / norm;\n        sdata[0] = scale;\n    }\n    __syncthreads();\n    \n    scale = sdata[0];\n    \n    // Normalize elements\n    for (int i = tid; i < dim; i += threads) {\n        int idx = batch_idx * dim + i;\n        float val = static_cast<float>(input[idx]);\n        output[idx] = static_cast<T>(val * scale);\n    }\n}\n\ntorch::Tensor l2_norm_cuda(torch::Tensor input) {\n    auto batch_size = input.size(0);\n    auto dim = input.size(1);\n    auto output = torch::empty_like(input);\n    \n    const int threads = 256;\n    const int blocks = batch_size;\n    \n    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), \"l2_norm_cuda\", ([&] {\n        l2_norm_kernel<scalar_t><<<blocks, threads>>>(\n            input.data_ptr<scalar_t>(),\n            output.data_ptr<scalar_t>(),\n            batch_size,\n            dim\n        );\n    }));\n    \n    cudaDeviceSynchronize();\n    return output;\n}\n\"\"\"\n\nl2_norm_cpp_source = \"torch::Tensor l2_norm_cuda(torch::Tensor input);\"\n\n# Compile the inline CUDA code for L2 normalization\nl2_norm_module = load_inline(\n    name=\"l2_norm_v2\",\n    cpp_sources=l2_norm_cpp_source,\n    cuda_sources=l2_norm_source,\n    functions=[\"l2_norm_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized L2 normalization model with custom CUDA kernel.\n    \"\"\"\n    def __init__(self):\n        super(ModelNew, self).__init__()\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Applies L2 normalization using custom CUDA kernel.\n        \n        Args:\n            x (torch.Tensor): Input tensor of shape (batch_size, dim).\n            \n        Returns:\n            torch.Tensor: L2 normalized tensor, same shape as input.\n        \"\"\"\n        # Ensure tensor is on CUDA device\n        if not x.is_cuda:\n            x = x.cuda()\n            \n        return l2_norm_module.l2_norm_cuda(x)",
+      "extraction_ok": true,
+      "v_stress": {
+        "n_total": 9,
+        "n_pass": 9,
+        "n_fail": 0,
+        "n_ref_failed_skipped": 0,
+        "all_pass": true,
+        "per_input": [
+          {
+            "policy": "near_zero",
+            "seed": 42,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 38169.368743896484,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 43,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 616.1866188049316,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 44,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 554.2027950286865,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 354,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 435.75453758239746,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 355,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 463.38796615600586,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 356,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 463.46235275268555,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 342,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 485.9297275543213,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 343,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 540.1027202606201,
+            "status": "pass"
+          },
+          {
+            "policy": "near_zero",
+            "seed": 344,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 489.4077777862549,
+            "status": "pass"
+          }
+        ],
+        "still_failing": []
+      },
+      "v_kb": {
+        "n_total": 5,
+        "n_pass": 5,
+        "all_pass": true,
+        "per_seed": [
+          {
+            "seed": 42,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 1337,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 7,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 100,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 2024,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          }
+        ],
+        "regressed_seeds": []
+      },
+      "round_pass": true
+    }
+  ],
+  "final_status": "fixed_at_round_1",
+  "final_round": 1,
+  "elapsed_sec": 129.51
+}

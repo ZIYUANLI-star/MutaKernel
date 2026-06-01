@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P49__launch_config_mutate__1",
+  "operator_name": "launch_config_mutate",
+  "kernel_name": "L1_P49",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7191,
+        "completion_tokens": 4603,
+        "total_tokens": 11794,
+        "reasoning_tokens": 1639
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation in max_reduction_dim2_kernel only executes when reduction_dim==2. With dim2=256, block_size=256: original elements_per_thread=1, mutant elements_per_thread=0. Zero causes no elements processed, outputting -FLT_MAX. Layer 2 bitwise equality across 112 rounds proves dim=2 was never tested (otherwise massive -FLT_MAX vs real max differences would appear).",
+      "survival_reason": "The mutation resides exclusively in max_reduction_dim2_kernel, which is only invoked when the model is initialized with dim=2. All 112 rounds of Layer 2 testing showed bitwise equality, which is only possible if the model configuration used dim=1 throughout testing. Under dim=1 configuration, the mutated code path is never executed, making the mutation observationally equivalent. The mutation would cause catastrophic failure (outputting -FLT_MAX instead of actual maximums) if dim=2 were used.",
+      "killable": true,
+      "kill_strategy": "Initialize model with dim=2 and provide any input where true maximum along dimension 2 exceeds -FLT_MAX. The mutant will output -FLT_MAX (~-3.4e38) while the original outputs correct max values. Even uniform values of 1.0 would show massive divergence.",
+      "recommendations": "EMD Layer 2 testing should cover ALL code paths by testing different model configurations (both dim=1 and dim=2), not just varying input values. Critical mutations in alternative execution branches can escape detection when only one configuration is tested.",
+      "suggested_code": "def generate_inputs(device):\n    # Simple tensor where max along any dimension is 1.0\n    # Mutant will output -FLT_MAX (~-3.4e38) instead of 1.0 when dim=2\n    x = torch.ones(16, 256, 256, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7049,
+        "completion_tokens": 3480,
+        "total_tokens": 10529,
+        "reasoning_tokens": 1296
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "Mutation in max_reduction_dim2_kernel (line 94). With dim2=256, blockDim.x=256: original elements_per_thread=(256+255)/256=1, mutant=1-1=0. Zero elements_per_thread means no iteration, output=-FLT_MAX. But mutant survives => dim2_kernel not being called => model initialized with dim=1, calling dim1_kernel (unmutated).",
+      "survival_reason": "The mutation modifies max_reduction_dim2_kernel, but the test framework appears to initialize the model with dim=1, which routes execution through max_reduction_dim1_kernel instead. Round 1's torch.ones input would have caused massive divergence (1.0 vs -3.4e38) if dim=2 were used, but the test passed with ref/original/mutant all matching. This confirms the dim=2 code path containing the mutation is simply never executed. Input values cannot change which kernel is selected - that's determined by model initialization.",
+      "killable": false,
+      "kill_strategy": "Requires changing model initialization to dim=2. The mutation makes dim2 reduction output -FLT_MAX for all positions regardless of input values. No value-level change can trigger this code path when model is initialized with dim=1.",
+      "recommendations": "Mutation testing frameworks should explicitly test all configurable code paths. For kernels with multiple modes (like dim=1 vs dim=2), generate mutants for each mode and ensure test configurations exercise all paths. Consider parameterized testing that sweeps configuration options.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 175.4
+}

@@ -1,0 +1,227 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, multiplies by a learnable scalar, applies LeakyReLU, and then GELU.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape)) 
+        self.leaky_relu = nn.LeakyReLU()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x * self.multiplier
+        x = self.leaky_relu(x)
+        x = torch.nn.functional.gelu(x)
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+multiplier_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, multiplier_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a convolution, multiplies by a learnable scalar, applies LeakyReLU, and then GELU.
+    Optimized while maintaining numerical stability.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
+        super(ModelNew, self).__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.leaky_relu = nn.LeakyReLU()
+
+    def forward(self, x):
+        # Disable TF32 for numerical stability
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # Convolution using the module directly for consistency
+            x = self.conv(x)
+            
+            # Multiply by learnable scalar
+            x = x * self.multiplier
+            
+            # LeakyReLU using PyTorch's implementation for numerical consistency
+            x = self.leaky_relu(x)
+            
+            # GELU using PyTorch's implementation for numerical consistency
+            x = torch.nn.functional.gelu(x)
+        finally:
+            # Restore original TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+        
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+multiplier_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, multiplier_shape]
+```
+
+## Test Failures (Round 2 input)
+Total discrepancies: 52
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (26 failures)
+  - [large_magnitude seed=50000] max_diff=2.609131e+00, mean_diff=5.075561e-02, ref_range=[-1.6997e-01,8.0800e+03], orig_range=[-1.6997e-01,8.0801e+03]
+  - [large_magnitude seed=50001] max_diff=2.091797e+00, mean_diff=5.597248e-02, ref_range=[-1.6997e-01,6.9700e+03], orig_range=[-1.6997e-01,6.9694e+03]
+  - [near_overflow seed=50002] max_diff=2.207914e+27, mean_diff=5.259320e+25, ref_range=[-0.0000e+00,7.7347e+30], orig_range=[-0.0000e+00,7.7351e+30]
+  - [near_overflow seed=50003] max_diff=1.940024e+27, mean_diff=4.759888e+25, ref_range=[-0.0000e+00,6.1689e+30], orig_range=[-0.0000e+00,6.1684e+30]
+  - [all_negative seed=50008] max_diff=2.033463e-01, mean_diff=6.013761e-03, ref_range=[-1.6997e-01,3.8171e+02], orig_range=[-1.6997e-01,3.8172e+02]
+  - [all_negative seed=50009] max_diff=1.447601e-01, mean_diff=3.709795e-03, ref_range=[-1.6997e-01,3.6700e+02], orig_range=[-1.6997e-01,3.6702e+02]
+  - [all_positive seed=50010] max_diff=2.566233e-01, mean_diff=6.512303e-03, ref_range=[-1.6997e-01,6.1958e+02], orig_range=[-1.6997e-01,6.1956e+02]
+  - [all_positive seed=50011] max_diff=2.554474e-01, mean_diff=7.023159e-03, ref_range=[-1.6997e-01,8.0438e+02], orig_range=[-1.6997e-01,8.0439e+02]
+  ... and 18 more failures
+
+### training_stress (26 failures)
+  - [large_magnitude seed=70000] max_diff=2.938232e+00, mean_diff=5.719613e-02, ref_range=[-1.6997e-01,1.0022e+04], orig_range=[-1.6997e-01,1.0023e+04]
+  - [large_magnitude seed=70001] max_diff=2.517090e+00, mean_diff=5.806294e-02, ref_range=[-1.6997e-01,8.5370e+03], orig_range=[-1.6997e-01,8.5368e+03]
+  - [near_overflow seed=70002] max_diff=3.654507e+27, mean_diff=5.009676e+25, ref_range=[-0.0000e+00,1.0560e+31], orig_range=[-0.0000e+00,1.0560e+31]
+  - [near_overflow seed=70003] max_diff=2.689860e+27, mean_diff=6.224324e+25, ref_range=[-0.0000e+00,9.7033e+30], orig_range=[-0.0000e+00,9.7027e+30]
+  - [all_negative seed=70008] max_diff=2.978973e-01, mean_diff=6.454824e-03, ref_range=[-1.6997e-01,6.0498e+02], orig_range=[-1.6997e-01,6.0492e+02]
+  - [all_negative seed=70009] max_diff=2.034912e-01, mean_diff=6.132469e-03, ref_range=[-1.6997e-01,7.8059e+02], orig_range=[-1.6997e-01,7.8068e+02]
+  - [all_positive seed=70010] max_diff=2.638550e-01, mean_diff=6.040824e-03, ref_range=[-1.6997e-01,6.9397e+02], orig_range=[-1.6997e-01,6.9393e+02]
+  - [all_positive seed=70011] max_diff=1.687170e-01, mean_diff=4.864184e-03, ref_range=[-1.6997e-01,3.8294e+02], orig_range=[-1.6997e-01,3.8291e+02]
+  ... and 18 more failures
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 52 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a convolution, multiplies by a learnable scalar, applies LeakyReLU, and then GELU.
+    Optimized while maintaining numerical stability.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
+        super(ModelNew, self).__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+        self.leaky_relu = nn.LeakyReLU()
+
+    def forward(self, x):
+        # Disable TF32 for numerical stability
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # Convolution using the module directly for consistency
+            x = self.conv(x)
+            
+            # Multiply by learnable scalar
+            x = x * self.multiplier
+            
+            # LeakyReLU using PyTorch's implementation for numerical consistency
+            x = self.leaky_relu(x)
+            
+            # GELU using PyTorch's implementation for numerical consistency
+            x = torch.nn.functional.gelu(x)
+        finally:
+            # Restore original TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+        
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+multiplier_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, multiplier_shape]
+```
+
+### What still failed after Round 1
+
+### value_stress (26 failures)
+  - [large_magnitude seed=50000] max_diff=2.609131e+00, mean_diff=5.075561e-02, ref_range=[-1.6997e-01,8.0800e+03], orig_range=[-1.6997e-01,8.0801e+03]
+  - [large_magnitude seed=50001] max_diff=2.091797e+00, mean_diff=5.597248e-02, ref_range=[-1.6997e-01,6.9700e+03], orig_range=[-1.6997e-01,6.9694e+03]
+  - [near_overflow seed=50002] max_diff=2.207914e+27, mean_diff=5.259320e+25, ref_range=[-0.0000e+00,7.7347e+30], orig_range=[-0.0000e+00,7.7351e+30]
+  - [near_overflow seed=50003] max_diff=1.940024e+27, mean_diff=4.759888e+25, ref_range=[-0.0000e+00,6.1689e+30], orig_range=[-0.0000e+00,6.1684e+30]
+  - [all_negative seed=50008] max_diff=2.033463e-01, mean_diff=6.013761e-03, ref_range=[-1.6997e-01,3.8171e+02], orig_range=[-1.6997e-01,3.8172e+02]
+  - [all_negative seed=50009] max_diff=1.447601e-01, mean_diff=3.709795e-03, ref_range=[-1.6997e-01,3.6700e+02], orig_range=[-1.6997e-01,3.6702e+02]
+  - [all_positive seed=50010] max_diff=2.566233e-01, mean_diff=6.512303e-03, ref_range=[-1.6997e-01,6.1958e+02], orig_range=[-1.6997e-01,6.1956e+02]
+  - [all_positive seed=50011] max_diff=2.554474e-01, mean_diff=7.023159e-03, ref_range=[-1.6997e-01,8.0438e+02], orig_range=[-1.6997e-01,8.0439e+02]
+  ... and 18 more failures
+
+### training_stress (26 failures)
+  - [large_magnitude seed=70000] max_diff=2.938232e+00, mean_diff=5.719613e-02, ref_range=[-1.6997e-01,1.0022e+04], orig_range=[-1.6997e-01,1.0023e+04]
+  - [large_magnitude seed=70001] max_diff=2.517090e+00, mean_diff=5.806294e-02, ref_range=[-1.6997e-01,8.5370e+03], orig_range=[-1.6997e-01,8.5368e+03]
+  - [near_overflow seed=70002] max_diff=3.654507e+27, mean_diff=5.009676e+25, ref_range=[-0.0000e+00,1.0560e+31], orig_range=[-0.0000e+00,1.0560e+31]
+  - [near_overflow seed=70003] max_diff=2.689860e+27, mean_diff=6.224324e+25, ref_range=[-0.0000e+00,9.7033e+30], orig_range=[-0.0000e+00,9.7027e+30]
+  - [all_negative seed=70008] max_diff=2.978973e-01, mean_diff=6.454824e-03, ref_range=[-1.6997e-01,6.0498e+02], orig_range=[-1.6997e-01,6.0492e+02]
+  - [all_negative seed=70009] max_diff=2.034912e-01, mean_diff=6.132469e-03, ref_range=[-1.6997e-01,7.8059e+02], orig_range=[-1.6997e-01,7.8068e+02]
+  - [all_positive seed=70010] max_diff=2.638550e-01, mean_diff=6.040824e-03, ref_range=[-1.6997e-01,6.9397e+02], orig_range=[-1.6997e-01,6.9393e+02]
+  - [all_positive seed=70011] max_diff=1.687170e-01, mean_diff=4.864184e-03, ref_range=[-1.6997e-01,3.8294e+02], orig_range=[-1.6997e-01,3.8291e+02]
+  ... and 18 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

@@ -1,0 +1,89 @@
+{
+  "mutant_id": "L1_P35__const_perturb__1",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P35",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7318,
+        "completion_tokens": 3699,
+        "total_tokens": 11017,
+        "reasoning_tokens": 1523
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "The mutation changes shared_data[256] to shared_data[255]. With threads_per_block=256, thread 255 writes to shared_data[255] which is now out-of-bounds (array indices 0-254). In the reduction loop, thread 127 reads shared_data[127+128]=shared_data[255], also out-of-bounds. This is undefined behavior that should corrupt the mean/variance calculation when thread 255's contribution is non-zero.",
+      "survival_reason": "Despite being undefined behavior, the mutant survived 112 differential tests likely because CUDA shared memory allocation is typically rounded up to alignment boundaries (e.g., 256 bytes = 64 floats). An allocation of 255 floats (1020 bytes) may round up to 1024 bytes, making shared_data[255] technically accessible on the test hardware. However, this is implementation-specific and not guaranteed. The random inputs may also not have made thread 255's contribution sufficiently distinct from other threads' contributions. To expose the bug, we need inputs where thread 255 processes values that are dramatically different from other threads, making any corruption of its data highly visible.",
+      "killable": true,
+      "kill_strategy": "Create an input pattern where thread 255's processed elements have extremely large values (e.g., 1e8) while all other elements processed by threads 0-254 are zero. This maximizes the impact of any data corruption from the out-of-bounds access. If thread 255's sum is lost or corrupted, the mean will be drastically wrong (near zero instead of a large positive value), causing normalized outputs to differ by orders of magnitude.",
+      "recommendations": "Shared memory arrays should always be sized to match or exceed the number of threads accessing them. Use compile-time assertions or static_assert to verify blockDim.x <= shared_memory_size. Additionally, mutation testing frameworks should flag any shared memory size changes as high-priority for stress testing with thread-index-specific value patterns.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256] with spatial_size = 65536\n    x = torch.zeros(16, 64, 256, 256, device=device, dtype=torch.float32)\n    \n    # For each batch and channel, thread 255 processes elements at spatial indices\n    # 255, 511, 767, ..., 65535 (every 256th element starting from 255)\n    # Set these to very large values to maximize thread 255's contribution\n    \n    H, W = 256, 256\n    spatial_size = H * W  # 65536\n    \n    for b in range(16):\n        for c in range(64):\n            # Thread 255 processes indices: 255, 255+256, 255+512, ... within spatial dimension\n            # These map to h, w coordinates\n            idx = 255\n            while idx < spatial_size:\n                h = idx // W\n                w = idx % W\n                x[b, c, h, w] = 1e8  # Very large value\n                idx += 256\n    \n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7391,
+        "completion_tokens": 3715,
+        "total_tokens": 11106,
+        "reasoning_tokens": 1617
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes shared_data[256] to shared_data[255]. With 256 threads, thread 255 writes to an out-of-bounds index. The previous attempt used large values (1e8) for thread 255's positions, but floating-point precision and the specific memory layout likely caused the corruption to be masked. Using NaN values exploits different propagation semantics: if thread 255's NaN contribution is correctly included, NaN propagates through sum→mean→all outputs. If thread 255's data is lost/corrupted, the mean stays finite.",
+      "survival_reason": "The previous attempt using large magnitude values (1e8) failed because even if thread 255's contribution was partially corrupted, the out-of-bounds shared memory access in CUDA doesn't necessarily lose data entirely—it might write to adjacent padding memory that gets read back. With normal floating-point values, small accumulation errors are absorbed by the tolerance. NaN values provide a binary distinguisher: NaN propagation is all-or-nothing. If thread 255's NaN is included in the sum, the mean becomes NaN, making ALL outputs NaN. If thread 255's data is lost due to the out-of-bounds access, the mean stays finite (zero), producing finite outputs. This tests a fundamentally different property—NaN propagation rather than magnitude.",
+      "killable": true,
+      "kill_strategy": "Place NaN values exclusively in positions processed by thread 255 (spatial column w=255). Thread 255 processes indices 255, 511, 767... which map to the last spatial column. If original correctly sums thread 255's contribution, NaN propagates to mean→all outputs become NaN. If mutant's out-of-bounds access loses thread 255's data, outputs stay finite (zero). This creates a non-equivalent observable difference.",
+      "recommendations": "When testing GPU kernels with shared memory reductions, include NaN/Inf sentinel value tests that exploit the propagation properties of special floating-point values. These can expose race conditions and out-of-bounds accesses that magnitude-based tests miss, since NaN propagation is deterministic and all-or-nothing.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256]\n    # Thread 255 processes spatial indices 255, 511, 767, ...\n    # which correspond to spatial column w=255 (the last column)\n    x = torch.zeros(16, 64, 256, 256, device=device, dtype=torch.float32)\n    \n    # Set the last column (w=255) to NaN - these are processed by thread 255\n    x[:, :, :, 255] = float('nan')\n    \n    # Original kernel: NaN included in sum -> mean=NaN -> all outputs=NaN\n    # Mutant kernel: if thread 255's data lost -> sum finite -> mean finite -> outputs finite\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7748,
+        "completion_tokens": 2301,
+        "total_tokens": 10049,
+        "reasoning_tokens": 1027
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes shared memory array from 256 to 255 elements. With 256 threads, thread 255 writes to shared_data[255] (out of bounds). However, CUDA shared memory allocation has minimum granularity (typically 4-byte aligned blocks), so position 255 likely exists in physical memory. The write and subsequent read by thread 127 during reduction (shared_data[127+128]=shared_data[255]) access the same physical location. The 112 test rounds confirm bitwise equivalence, suggesting the out-of-bounds access is hitting valid memory due to alignment padding.",
+      "survival_reason": "Round 1 failed because large values at thread 255's positions don't cause differences when the out-of-bounds memory still functions correctly due to alignment. Round 2 failed because NaN propagates through both implementations identically - if the memory works, NaN will contaminate both. The fundamental issue is that CUDA shared memory allocation granularity means declaring [255] vs [256] likely allocates the same physical block, so index 255 is still accessible. This is effectively a compiler/runtime equivalence where the mutation doesn't change observable behavior for any input values.",
+      "killable": false,
+      "kill_strategy": "This mutation appears to be unkillable through value-level testing. The shared memory declaration `shared_data[255]` vs `shared_data[256]` results in the same actual memory behavior because CUDA allocates shared memory with alignment constraints. Position 255 remains accessible in both cases. The only way to kill this would be through a different hardware configuration or compiler that strictly enforces array bounds, but the current runtime doesn't distinguish these cases for any input values.",
+      "recommendations": "For robust kernel testing, consider: (1) Using CUDA memory sanitizers (compute-sanitizer --tool memcheck) during testing to catch out-of-bounds accesses that happen to work; (2) Adding explicit bounds checking in debug builds; (3) Using static analysis tools to flag shared memory array sizes that don't match thread block dimensions; (4) This mutation exposes a gap where undefined behavior happens to be benign - tests should include runtime verification tools, not just output comparison.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 223.77
+}

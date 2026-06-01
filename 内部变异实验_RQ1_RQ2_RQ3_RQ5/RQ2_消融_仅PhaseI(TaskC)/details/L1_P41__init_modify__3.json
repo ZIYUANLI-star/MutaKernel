@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P41__init_modify__3",
+  "operator_name": "init_modify",
+  "kernel_name": "L1_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8087,
+        "completion_tokens": 4220,
+        "total_tokens": 12307,
+        "reasoning_tokens": 1616
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Mutation changes max_val init from -INFINITY to 0.0f in batch_channel_parallel kernel. When all pooling window values < 0, condition 'val > max_val' is never true (since val < 0 < max_val=0.0f), so mutant outputs 0.0f instead of correct negative max. With input shape [16,64,128] and parameters yielding output_length>=64, total_elements>=65536 triggers the mutated kernel path.",
+      "survival_reason": "Layer 2 testing with 'all_negative' may not have used sufficiently negative values uniformly, or the model parameters used during EMD testing resulted in total_elements < 65536, causing the first (unaffected) kernel to be used instead. The mutation only affects the batch_channel_parallel kernel which requires total_elements >= 65536. If model parameters during testing yielded smaller output sizes, the mutant code was never executed.",
+      "killable": true,
+      "kill_strategy": "Provide input tensor with ALL values set to a large negative number (e.g., -100.0). If the batch_channel_parallel kernel path is triggered, the mutant will output 0.0f everywhere while the reference outputs -100.0 (or the correct negative max), causing a difference of 100.0 which far exceeds the tolerance threshold.",
+      "recommendations": "Stress tests for reduction kernels should specifically test with all-negative inputs (for max operations) and all-positive inputs (for min operations) using uniform extreme values to expose identity element bugs. Additionally, ensure test configurations trigger all kernel dispatch paths based on problem size thresholds.",
+      "suggested_code": "def generate_inputs(device):\n    # All values are strongly negative (-100.0)\n    # This ensures every pooling window has only negative values\n    # Mutant will output 0.0f, reference will output -100.0\n    # Difference = 100.0 >> tolerance threshold\n    x = torch.full((16, 64, 128), -100.0, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7972,
+        "completion_tokens": 5068,
+        "total_tokens": 13040,
+        "reasoning_tokens": 2190
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation is in `maxpool1d_forward_kernel_batch_channel_parallel` which is only invoked when `total_elements = batch_size * channels * output_length >= 65536`. With input shape [16, 64, 128] and typical model parameters (kernel_size >= 3, stride = kernel_size), output_length ≤ 42, giving total_elements ≤ 43008 < 65536. The first kernel `maxpool1d_forward_kernel` (which has correct `-INFINITY` initialization) is used instead.",
+      "survival_reason": "The previous attempt with all -100.0 values failed because the batch_channel_parallel kernel where the mutation resides is NOT being executed. The kernel selection at line 143 (`if (total_elements < 65536)`) routes execution to `maxpool1d_forward_kernel` (which has unchanged `-INFINITY` initialization) rather than `maxpool1d_forward_kernel_batch_channel_parallel` (where the mutation changes `-INFINITY` to `0.0f`). With batch_size=16, channels=64, and typical model configurations (kernel_size=4, stride=4 gives output_length=32, total_elements=32768), the condition `32768 < 65536` is true, so the unmutated first kernel is always used. The Layer 2 stress tests including 'all_negative' passed because they exercised the first kernel, not the mutated second kernel. No value-level change can alter which kernel is selected since kernel selection depends solely on dimensions and model parameters.",
+      "killable": false,
+      "kill_strategy": "UNKILLABLE with value changes alone. The mutation is in a code path (`maxpool1d_forward_kernel_batch_channel_parallel`) that is not executed given the fixed input shape [16, 64, 128] and the likely model configuration. Triggering the mutated path requires total_elements >= 65536, which needs output_length >= 64, achievable only with smaller kernel_size/stride (e.g., kernel_size=2, stride=2). This requires changing model configuration parameters, not just input values.",
+      "recommendations": "Mutation testing for CUDA kernels with multiple code paths should verify which path is actually executed for the test configuration. Consider annotating kernel selection branches to track which kernels are tested. For this codebase, the batch_channel_parallel kernel should have separate test configurations that guarantee its execution (e.g., kernel_size=2 with the given input shape).",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 144.36
+}

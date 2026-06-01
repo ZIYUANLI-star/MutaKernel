@@ -1,0 +1,186 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class Model(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        """
+        Vision Transformer (ViT) model.
+
+        :param image_size: The size of the input image (assumed to be square).
+        :param patch_size: The size of each patch (assumed to be square).
+        :param num_classes: The number of output classes.
+        :param dim: The dimensionality of the embedding space.
+        :param depth: The number of transformer layers.
+        :param heads: The number of attention heads.
+        :param mlp_dim: The dimensionality of the MLP (Multi-Layer Perceptron) in the transformer.
+        :param channels: The number of channels in the input image (default is 3 for RGB).
+        :param dropout: Dropout rate applied in the MLP.
+        :param emb_dropout: Dropout rate applied to the embedded patches.
+        """
+        super(Model, self).__init__()
+        
+        assert image_size % patch_size == 0, "Image dimensions must be divisible by the patch size."
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dim_feedforward=mlp_dim, dropout=dropout, batch_first=True),
+            num_layers=depth
+        )
+        
+        self.to_cls_token = nn.Identity()
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+
+    def forward(self, img):
+        """
+        Forward pass of the Vision Transformer.
+
+        :param img: The input image tensor, shape (batch_size, channels, image_size, image_size).
+        :return: The output tensor, shape (batch_size, num_classes).
+        """
+        p = self.patch_size
+        
+        x = img.unfold(2, p, p).unfold(3, p, p).reshape(img.shape[0], -1, p*p*img.shape[1])
+        x = self.patch_to_embedding(x)
+        
+        cls_tokens = self.cls_token.expand(img.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        x = self.dropout(x)
+        
+        x = self.transformer(x)
+        
+        x = self.to_cls_token(x[:, 0])
+        return self.mlp_head(x)
+
+# Test code
+image_size = 224
+patch_size = 16
+num_classes = 10
+dim = 512
+depth = 6
+heads = 8
+mlp_dim = 2048
+channels = 3
+dropout = 0.0
+emb_dropout = 0.0
+
+def get_inputs():
+    return [torch.rand(2, channels, image_size, image_size)]
+
+def get_init_inputs():
+    return [image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels, dropout, emb_dropout]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, image_size, patch_size, num_classes, dim, depth, heads, mlp_dim, channels=3, dropout=0.1, emb_dropout=0.1):
+        super(ModelNew, self).__init__()
+        
+        assert image_size % patch_size == 0, "Image dimensions must be divisible by the patch size."
+        num_patches = (image_size // patch_size) ** 2
+        patch_dim = channels * patch_size ** 2
+        
+        self.patch_size = patch_size
+        self.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.patch_to_embedding = nn.Linear(patch_dim, dim)
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.dropout = nn.Dropout(emb_dropout)
+        
+        # Create transformer with batch_first=True
+        self.transformer = nn.TransformerEncoder(
+            nn.TransformerEncoderLayer(d_model=dim, nhead=heads, dim_feedforward=mlp_dim, dropout=dropout, batch_first=True),
+            num_layers=depth
+        )
+        
+        self.to_cls_token = nn.Identity()
+        self.mlp_head = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, num_classes)
+        )
+
+    def load_state_dict(self, state_dict):
+        # Load weights normally
+        return super().load_state_dict(state_dict)
+
+    def forward(self, img):
+        p = self.patch_size
+        
+        # Patch creation
+        x = img.unfold(2, p, p).unfold(3, p, p).reshape(img.shape[0], -1, p*p*img.shape[1])
+        x = x @ self.patch_to_embedding.weight.T + self.patch_to_embedding.bias
+        
+        # Add cls token and positional embedding
+        cls_tokens = self.cls_token.expand(img.shape[0], -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding
+        
+        # Use TensorFloat32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Transformer
+        x = self.transformer(x)
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # MLP head
+        x = x[:, 0]
+        x = x @ self.mlp_head[0].weight.T + self.mlp_head[0].bias
+        x = x * (0.5 * (1.0 + torch.erf(x / 1.41421356237309504880)))
+        x = x @ self.mlp_head[3].weight.T + self.mlp_head[3].bias
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 1
+Failing dimensions: training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### training_stress (1 failures)
+  - [tail_heavy seed=70027] max_diff=2.333817e-02, mean_diff=4.930001e-03, ref_range=[-4.2865e-01,6.8289e-01], orig_range=[-4.3510e-01,6.8303e-01]
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

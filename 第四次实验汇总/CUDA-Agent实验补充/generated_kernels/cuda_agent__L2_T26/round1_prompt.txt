@@ -1,0 +1,148 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, adds a bias term, scales, applies sigmoid, and performs group normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.bias = nn.Parameter(torch.randn(bias_shape)) 
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.GroupNorm(num_groups, out_channels)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x + self.bias
+        x = x * self.scale
+        x = torch.sigmoid(x)
+        x = self.group_norm(x)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 32
+height = width = 256
+kernel_size = 3
+num_groups = 8
+bias_shape = (out_channels, 1, 1)
+scale_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a convolution (using PyTorch's optimized implementation), adds fused biases, scales, applies sigmoid,
+    and performs group normalization.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, num_groups, bias_shape, scale_shape):
+        super(ModelNew, self).__init__()
+        self.conv = nn.Module()
+        self.conv.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
+        self.conv.bias = nn.Parameter(torch.randn(out_channels))
+        self.bias = nn.Parameter(torch.randn(bias_shape))  # This matches the original state dict key
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.group_norm = nn.Module()
+        self.group_norm.weight = nn.Parameter(torch.ones(out_channels))
+        self.group_norm.bias = nn.Parameter(torch.zeros(out_channels))
+        self.num_groups = num_groups
+
+    @torch.compile
+    def forward(self, x):
+        # Step 1: Convolution using PyTorch's optimized implementation with TF32
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Calculate conv output
+        conv_output = torch.conv2d(x, self.conv.weight, self.conv.bias, stride=1, padding=0, dilation=1)
+        
+        # Step 2: Fuse additional bias, scaling, and sigmoid
+        fused_output = conv_output + self.bias
+        fused_output *= self.scale
+        fused_output = torch.sigmoid(fused_output)
+        
+        # Step 3: Group normalization using PyTorch's optimized implementation
+        fused_output = torch.group_norm(fused_output, self.num_groups, 
+                                       self.group_norm.weight, self.group_norm.bias)
+        
+        # Reshape back
+        fused_output = fused_output.view(128, 32, 254, 254)
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return fused_output
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 52
+Failing dimensions: value_stress, dtype_stress, training_stress, repeated_run
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (24 failures)
+  - [large_magnitude seed=50000] max_diff=2.364382e-01, mean_diff=2.706375e-06, ref_range=[-1.0144e+00,1.0176e+00], orig_range=[-1.0144e+00,1.0176e+00]
+  - [large_magnitude seed=50001] max_diff=1.790868e-01, mean_diff=3.110456e-07, ref_range=[-1.1546e+00,1.1565e+00], orig_range=[-1.1546e+00,1.1565e+00]
+  - [near_overflow seed=50002] max_diff=1.999975e+00, mean_diff=4.544493e-07, ref_range=[-1.0066e+00,1.0059e+00], orig_range=[-1.0066e+00,1.0059e+00]
+  - [near_overflow seed=50003] max_diff=2.000041e+00, mean_diff=2.916769e-06, ref_range=[-1.0083e+00,1.0099e+00], orig_range=[-1.0083e+00,1.0099e+00]
+  - [all_negative seed=50008] max_diff=3.205821e-02, mean_diff=3.290588e-07, ref_range=[-1.9748e+00,1.8073e+00], orig_range=[-1.9748e+00,1.8073e+00]
+  - [all_negative seed=50009] max_diff=2.705532e-02, mean_diff=3.079593e-07, ref_range=[-1.8811e+00,1.8822e+00], orig_range=[-1.8811e+00,1.8822e+00]
+  - [all_positive seed=50010] max_diff=2.556506e-02, mean_diff=3.365435e-07, ref_range=[-1.7105e+00,1.7968e+00], orig_range=[-1.7105e+00,1.7968e+00]
+  - [all_positive seed=50011] max_diff=2.521324e-02, mean_diff=3.254259e-07, ref_range=[-2.1491e+00,2.2714e+00], orig_range=[-2.1491e+00,2.2714e+00]
+  ... and 16 more failures
+
+### dtype_stress (2 failures)
+  - [? seed=60000] 
+  - [? seed=60001] 
+
+### training_stress (24 failures)
+  - [large_magnitude seed=70000] max_diff=1.562559e-01, mean_diff=3.228325e-07, ref_range=[-1.0377e+00,1.0384e+00], orig_range=[-1.0377e+00,1.0384e+00]
+  - [large_magnitude seed=70001] max_diff=1.982194e-01, mean_diff=3.046523e-07, ref_range=[-1.0139e+00,1.0126e+00], orig_range=[-1.0139e+00,1.0126e+00]
+  - [near_overflow seed=70002] max_diff=1.999997e+00, mean_diff=3.539825e-06, ref_range=[-1.0070e+00,1.0059e+00], orig_range=[-1.0070e+00,1.0059e+00]
+  - [near_overflow seed=70003] max_diff=2.000000e+00, mean_diff=3.441907e-06, ref_range=[-1.0067e+00,1.0087e+00], orig_range=[-1.0067e+00,1.0087e+00]
+  - [all_negative seed=70008] max_diff=2.670892e-02, mean_diff=1.090216e-06, ref_range=[-1.9219e+00,2.6475e+00], orig_range=[-1.9219e+00,2.6475e+00]
+  - [all_negative seed=70009] max_diff=4.317148e-02, mean_diff=3.301045e-07, ref_range=[-2.1168e+00,1.8791e+00], orig_range=[-2.1168e+00,1.8791e+00]
+  - [all_positive seed=70010] max_diff=3.753188e-02, mean_diff=2.575112e-07, ref_range=[-1.6250e+00,1.2175e+00], orig_range=[-1.6250e+00,1.2175e+00]
+  - [all_positive seed=70011] max_diff=2.180928e-02, mean_diff=3.095761e-07, ref_range=[-2.3363e+00,1.3601e+00], orig_range=[-2.3363e+00,1.3601e+00]
+  ... and 16 more failures
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

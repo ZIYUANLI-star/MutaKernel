@@ -1,0 +1,94 @@
+{
+  "mutant_id": "L1_P38__arith_replace__17",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P38",
+  "tier": 1,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6021,
+        "completion_tokens": 7973,
+        "total_tokens": 13994,
+        "reasoning_tokens": 3600
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "batch_idx/dim=0 for all batches (0-15/16384=0). Mutated vectorized section writes to batch 0's region with wrong normalization factor. Race between batches' vectorized writes and batch 0's remaining writes. Different L1 norms across batches would expose corruption if race goes wrong way.",
+      "survival_reason": "The mutation causes all batches' vectorized sections to write to batch 0's memory region with their own (incorrect) normalization factors. The 'remaining elements' section then overwrites with correct values, but there's an inter-block race condition. Tests survived because: (1) random inputs give similar L1 norms across batches, minimizing visible corruption, and (2) GPU scheduling may consistently favor the correct writes. None of the tested value policies created batch-heterogeneous inputs where different batches have drastically different L1 norms concentrated at the same positions.",
+      "killable": true,
+      "kill_strategy": "Create sparse inputs where batch 0 and other batches have vastly different L1 norms, with non-zero values at position 0. If batch 0 has value 1.0 (L1=1) and batch 1 has value 1000.0 (L1=1000) at position 0, corruption would write 1.0/1000=0.001 instead of 1.0/1=1.0, a difference of ~0.999 which exceeds tolerance.",
+      "recommendations": "Add batch-heterogeneous test patterns where different batch rows have vastly different L1 norms (e.g., one batch sparse with norm=1, another with norm=1000) to expose inter-batch write races in kernels with batch-indexed memory access patterns.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Batch 0: small L1 norm (value 1.0)\n    x[0, 0] = 1.0\n    # Other batches: progressively larger L1 norms\n    for i in range(1, 16):\n        x[i, 0] = 100.0 * (i + 1)  # L1 norms: 200, 300, ..., 1600\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5552,
+        "completion_tokens": 6268,
+        "total_tokens": 11820,
+        "reasoning_tokens": 2520
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation causes batch N>0 to write to batch 0's memory region (idx=tid*4 instead of batch_idx*dim+tid*4). However, the 'remaining elements' loop unconditionally writes ALL positions with correct indices (pos=batch_idx*dim+i). This creates a race: if remaining loop runs after vectorized loop, correct values persist. Testing shows this order consistently occurs.",
+      "survival_reason": "The mutation introduces a memory corruption bug where batch N's vectorized writes go to batch 0's space. However, EVERY position is also written by the 'remaining elements' loop with correct indexing. The CUDA block scheduler apparently executes blocks such that the remaining loop's correct writes occur AFTER any corrupted vectorized writes, masking the bug. This is a timing-dependent race condition that happens to resolve correctly.",
+      "killable": true,
+      "kill_strategy": "Use extreme value differences to maximize corruption visibility, and try to create computational imbalance. Fill batch 0 with small values (fast L1 computation) and batch 1+ with large diverse values. If batch 0 completes early and batch 1's vectorized loop catches up to write corrupted values BEFORE batch 0's remaining loop completes, corruption will show.",
+      "recommendations": "Race conditions in GPU kernels are notoriously hard to detect with standard testing. Consider using CUDA race detection tools (cuda-memcheck --tool racecheck) or implementing explicit barriers/atomic operations for correctness verification.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    # Batch 0: all 1.0, L1 sum = 16384, normalized = 6.1e-5\n    x[0, :] = 1.0\n    # Batches 1-15: all 1e6, L1 sum = 1.6384e10, normalized = 6.1e-5\n    # If corruption: batch 0 gets 1.0 * (1/1.6384e10) = 6.1e-11\n    x[1:, :] = 1e6\n    # Add variation to break any caching\n    x[0, 0] = 2.0\n    x[1, 0] = 2e6\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5894,
+        "completion_tokens": 4808,
+        "total_tokens": 10702,
+        "reasoning_tokens": 2028
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "batch_idx/dim=0 for all batches (0-15)/16384. Mutated vectorized loop writes to positions 0-based for all batches, BUT remaining loop (lines 86-90) uses CORRECT formula 'batch_idx*dim+i' and iterates over ALL 16384 elements per batch (tid∈[0,255], stride=256, 64 iterations). Remaining loop always executes AFTER vectorized loop within each block, overwriting any corruption.",
+      "survival_reason": "The mutation creates a data race between CUDA blocks where multiple batches write to batch 0's memory region. However, within each block, the 'remaining elements' loop always executes after the buggy vectorized loop and writes ALL 16384 elements with the correct position formula. Since cross-block scheduling is GPU-hardware-dependent (not input-value-dependent), the race consistently resolves with correct values winning. The remaining loop effectively 'masks' the vectorized loop bug.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable via value-level testing. The bug manifests as a data race whose outcome depends on GPU block scheduling, not input values. The correct 'remaining elements' loop writes all positions after the buggy vectorized loop, masking the corruption. Killing this requires either: (1) configuration changes (smaller dim where remaining loop doesn't cover all positions), or (2) hardware/driver conditions that change block scheduling - neither controllable via input values.",
+      "recommendations": "When implementing redundant code paths (like vectorized + remaining loops), ensure mutations in one path can't be masked by the other. Consider removing the redundant remaining loop or adding assertions that vectorized loop wrote expected positions. This mutation reveals a test coverage gap where equivalent semantics in different code paths hide bugs.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 398.78
+}

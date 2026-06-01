@@ -1,0 +1,140 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B)
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication.
+
+        Args:
+            A: Input tensor of shape (M, K).
+            B: Input tensor of shape (K, N).
+
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        return torch.matmul(A.T, B.T)
+
+M = 1024 * 2
+K = 4096 * 2
+N = 2048 * 2
+
+def get_inputs():
+    A = torch.rand(K, M)
+    B = torch.rand(N, K)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs matrix multiplication using cuBLAS with TF32
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs matrix multiplication using cuBLAS with TF32 optimization.
+        
+        Uses the property: (A^T)(B^T) = (B A)^T
+        
+        Args:
+            A: Input tensor of shape (K, M).
+            B: Input tensor of shape (N, K).
+
+        Returns:
+            Output tensor of shape (M, N).
+        """
+        # Enable TF32 for this operation
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # First compute B @ A, which is (N, K) @ (K, M) = (N, M)
+        # Then transpose to get (M, N)
+        result = (B @ A).T
+        
+        # Disable TF32 after
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return result
+
+M = 1024 * 2
+K = 4096 * 2
+N = 2048 * 2
+
+def get_inputs():
+    A = torch.rand(K, M)
+    B = torch.rand(N, K)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 40
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (20 failures)
+  - [large_magnitude seed=50000] max_diff=1.437720e+05, mean_diff=2.125114e+04, ref_range=[-4.8548e+08,4.9342e+08], orig_range=[-4.8548e+08,4.9345e+08]
+  - [large_magnitude seed=50001] max_diff=1.441680e+05, mean_diff=2.123871e+04, ref_range=[-4.6111e+08,4.7584e+08], orig_range=[-4.6111e+08,4.7578e+08]
+  - [mixed_extremes seed=50012] max_diff=7.277568e+06, mean_diff=1.060164e+06, ref_range=[-2.3899e+10,2.3099e+10], orig_range=[-2.3899e+10,2.3100e+10]
+  - [mixed_extremes seed=50013] max_diff=7.745536e+06, mean_diff=1.061065e+06, ref_range=[-2.3659e+10,2.2327e+10], orig_range=[-2.3658e+10,2.2325e+10]
+  - [alternating_sign seed=50014] max_diff=1.389688e+03, mean_diff=2.107673e+02, ref_range=[-3.9359e+06,3.6295e+06], orig_range=[-3.9358e+06,3.6297e+06]
+  - [alternating_sign seed=50015] max_diff=1.486062e+03, mean_diff=2.111005e+02, ref_range=[-3.7531e+06,3.8556e+06], orig_range=[-3.7529e+06,3.8554e+06]
+  - [sparse seed=50016] max_diff=1.913750e+02, mean_diff=2.087375e+01, ref_range=[-4.9512e+05,5.4104e+05], orig_range=[-4.9521e+05,5.4102e+05]
+  - [sparse seed=50017] max_diff=2.033438e+02, mean_diff=2.087197e+01, ref_range=[-5.4868e+05,4.8515e+05], orig_range=[-5.4874e+05,4.8509e+05]
+  ... and 12 more failures
+
+### training_stress (20 failures)
+  - [large_magnitude seed=70000] max_diff=1.392600e+05, mean_diff=2.124739e+04, ref_range=[-4.7859e+08,4.6985e+08], orig_range=[-4.7860e+08,4.6986e+08]
+  - [large_magnitude seed=70001] max_diff=1.365520e+05, mean_diff=2.126116e+04, ref_range=[-4.8902e+08,4.8860e+08], orig_range=[-4.8903e+08,4.8858e+08]
+  - [mixed_extremes seed=70012] max_diff=7.036096e+06, mean_diff=1.060783e+06, ref_range=[-2.3382e+10,2.3088e+10], orig_range=[-2.3380e+10,2.3087e+10]
+  - [mixed_extremes seed=70013] max_diff=6.968320e+06, mean_diff=1.061279e+06, ref_range=[-2.4231e+10,2.3284e+10], orig_range=[-2.4230e+10,2.3284e+10]
+  - [alternating_sign seed=70014] max_diff=1.356812e+03, mean_diff=2.117874e+02, ref_range=[-3.6475e+06,3.5716e+06], orig_range=[-3.6477e+06,3.5711e+06]
+  - [alternating_sign seed=70015] max_diff=1.358344e+03, mean_diff=2.134560e+02, ref_range=[-3.6148e+06,3.5211e+06], orig_range=[-3.6150e+06,3.5213e+06]
+  - [sparse seed=70016] max_diff=1.776328e+02, mean_diff=2.090398e+01, ref_range=[-5.1625e+05,5.0145e+05], orig_range=[-5.1626e+05,5.0146e+05]
+  - [sparse seed=70017] max_diff=1.822812e+02, mean_diff=2.088998e+01, ref_range=[-4.9034e+05,5.1386e+05], orig_range=[-4.9033e+05,5.1392e+05]
+  ... and 12 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

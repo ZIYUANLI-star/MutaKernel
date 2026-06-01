@@ -1,0 +1,168 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a standard 3D convolution operation with square input and square kernel.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the square convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv3d = nn.Conv3d(in_channels, out_channels, (kernel_size, kernel_size, kernel_size), stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 3D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, depth, width, height).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, depth_out, width_out, height_out).
+        """
+        return self.conv3d(x)
+
+# Test code
+batch_size = 16
+in_channels = 3
+out_channels = 64
+kernel_size = 3
+depth = 64
+width = 64
+height = 64
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, depth, width, height)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]  # Provide in_channels, out_channels, kernel_size for initialization
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized 3D convolution using float16 and tensor cores.
+    
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the square convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super(ModelNew, self).__init__()
+        
+        # Create a dummy conv3d module to preserve the same state dict structure
+        self.conv3d = nn.Conv3d(in_channels, out_channels, (kernel_size, kernel_size, kernel_size), 
+                               stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+
+    @torch.compile(backend='inductor')
+    def _conv_forward(self, x):
+        # Convert to float16 for tensor core operations
+        x_fp16 = x.half()
+        weight_fp16 = self.conv3d.weight.half()
+        bias_fp16 = self.conv3d.bias.half() if self.conv3d.bias is not None else None
+        
+        # Perform convolution
+        output_fp16 = torch.conv3d(
+            x_fp16,
+            weight_fp16,
+            bias_fp16,
+            stride=(1, 1, 1),
+            padding=(0, 0, 0),
+            dilation=(1, 1, 1),
+            groups=1
+        )
+        
+        # Convert back to float32
+        return output_fp16.float()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 3D convolution using float16 and tensor cores.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, depth, width, height).
+            
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, depth_out, width_out, height_out).
+        """
+        return self._conv_forward(x)
+
+
+# Enable TF32 globally
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 52
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (26 failures)
+  - [large_magnitude seed=50000] max_diff=1.694824e+00, mean_diff=1.590002e-01, ref_range=[-3.4996e+03,3.3340e+03], orig_range=[-3.5000e+03,3.3340e+03]
+  - [large_magnitude seed=50001] max_diff=1.670898e+00, mean_diff=1.590224e-01, ref_range=[-3.6892e+03,3.6543e+03], orig_range=[-3.6900e+03,3.6540e+03]
+  - [near_overflow seed=50002] max_diff=nan, mean_diff=nan, ref_range=[-3.5428e+30,3.4132e+30], orig_range=[nan,nan]
+  - [near_overflow seed=50003] max_diff=nan, mean_diff=nan, ref_range=[-3.3201e+30,3.3955e+30], orig_range=[nan,nan]
+  - [all_negative seed=50008] max_diff=1.538391e-01, mean_diff=1.560010e-02, ref_range=[-2.5534e+02,3.0232e+02], orig_range=[-2.5538e+02,3.0225e+02]
+  - [all_negative seed=50009] max_diff=1.573486e-01, mean_diff=1.547786e-02, ref_range=[-2.7452e+02,2.9130e+02], orig_range=[-2.7450e+02,2.9125e+02]
+  - [all_positive seed=50010] max_diff=1.432190e-01, mean_diff=1.580984e-02, ref_range=[-2.8466e+02,2.7864e+02], orig_range=[-2.8475e+02,2.7875e+02]
+  - [all_positive seed=50011] max_diff=1.715698e-01, mean_diff=1.691027e-02, ref_range=[-2.8605e+02,2.9755e+02], orig_range=[-2.8600e+02,2.9750e+02]
+  ... and 18 more failures
+
+### training_stress (26 failures)
+  - [large_magnitude seed=70000] max_diff=1.705811e+00, mean_diff=1.581954e-01, ref_range=[-3.5826e+03,3.3797e+03], orig_range=[-3.5820e+03,3.3800e+03]
+  - [large_magnitude seed=70001] max_diff=1.667480e+00, mean_diff=1.606403e-01, ref_range=[-3.4033e+03,3.4851e+03], orig_range=[-3.4040e+03,3.4840e+03]
+  - [near_overflow seed=70002] max_diff=nan, mean_diff=nan, ref_range=[-3.6446e+30,3.3765e+30], orig_range=[nan,nan]
+  - [near_overflow seed=70003] max_diff=nan, mean_diff=nan, ref_range=[-3.4499e+30,3.7337e+30], orig_range=[nan,nan]
+  - [all_negative seed=70008] max_diff=1.815186e-01, mean_diff=1.576431e-02, ref_range=[-3.5801e+02,3.0639e+02], orig_range=[-3.5800e+02,3.0625e+02]
+  - [all_negative seed=70009] max_diff=1.752319e-01, mean_diff=1.648405e-02, ref_range=[-3.1519e+02,3.3493e+02], orig_range=[-3.1525e+02,3.3500e+02]
+  - [all_positive seed=70010] max_diff=1.491394e-01, mean_diff=1.506176e-02, ref_range=[-2.7507e+02,2.6245e+02], orig_range=[-2.7500e+02,2.6250e+02]
+  - [all_positive seed=70011] max_diff=1.389923e-01, mean_diff=1.547197e-02, ref_range=[-2.7496e+02,2.6254e+02], orig_range=[-2.7500e+02,2.6250e+02]
+  ... and 18 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

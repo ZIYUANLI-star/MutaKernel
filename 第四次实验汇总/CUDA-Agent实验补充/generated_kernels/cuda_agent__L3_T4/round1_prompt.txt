@@ -1,0 +1,491 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+
+
+class Model(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(Model, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+        
+    def forward(self, x, mask=None):
+        """Aggregates feature maps into a fixed size representation.  In the following
+        notation, B = batch_size, N = num_features, K = num_clusters, D = feature_size.
+
+        Args:
+            x (th.Tensor): B x N x D
+
+        Returns:
+            (th.Tensor): B x DK
+        """
+        
+        assignment = self._compute_assignment(x)
+        vlad = self._compute_vlad(x, assignment)
+        
+        return vlad
+    
+    def _compute_assignment(self, x):
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+
+        assignment = th.matmul(x, self.clusters)  # (BN x D) x (D x (K+G)) -> BN x (K+G)
+        assignment = self.batch_norm(assignment)
+
+        assignment = F.softmax(assignment, dim=1)  # BN x (K+G) -> BN x (K+G)
+        # remove ghost assigments
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)  # -> B x N x K
+        
+        return assignment
+    
+    def _compute_vlad(self, x, assignment):
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)  # B x N x D -> BN x D
+        
+        a_sum = th.sum(assignment, dim=1, keepdim=True)  # B x N x K -> B x 1 x K
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)  # B x N x K -> B x K x N
+
+        x = x.view(-1, max_sample, self.feature_size)  # BN x D -> B x N x D
+        vlad = th.matmul(assignment, x)  # (B x K x N) x (B x N x D) -> B x K x D
+        vlad = vlad.transpose(1, 2)  # -> B x D x K
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = F.normalize(vlad)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)  # -> B x DK
+        vlad = F.normalize(vlad)
+        return vlad  # B x DK
+
+
+batch_size = 2048
+num_features = 100
+num_clusters = 32
+feature_size = 512
+ghost_clusters = 16
+
+
+def get_inputs():
+    return [torch.rand(batch_size, num_features, feature_size)]
+
+
+def get_init_inputs():
+    return [num_clusters, feature_size, ghost_clusters]
+
+
+def initialize_model():
+    model = Model(*get_init_inputs())
+    model.eval()
+    return model
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_flatten_norm.cu ===
+#include <cuda_runtime.h>
+
+__global__ void fused_flatten_norm_kernel(float* output, const float* input) {
+    int tid = blockIdx.x;
+    
+    if (tid < 2048) {
+        float sum = 0.0f;
+        
+        // Calculate L2 norm
+        for (int i = 0; i < 512 * 32; i++) {
+            int idx = tid * 512 * 32 + i;
+            float val = input[idx];
+            sum += val * val;
+        }
+        
+        float inv_norm = rsqrt(sum + 1e-8);
+        
+        // Normalize each element
+        for (int i = 0; i < 512 * 32; i++) {
+            int idx = tid * 512 * 32 + i;
+            output[idx] = input[idx] * inv_norm;
+        }
+    }
+}
+
+extern "C" void fused_flatten_norm_launcher(float* output, const float* input) {
+    int blocks = 2048;
+    fused_flatten_norm_kernel<<<blocks, 256>>>(output, input);
+}
+
+
+// === fused_kernel.cu ===
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void fused_assignment_kernel(float* output, const float* assignment, const float* clusters2, int batch_size) {
+    int tid = blockIdx.x * 256 + threadIdx.x;
+    
+    if (tid < batch_size * 512 * 32) {
+        int batch = tid / (512 * 32);
+        int feature = (tid % (512 * 32)) / 32;
+        int cluster = tid % 32;
+        
+        float sum = 0.0f;
+        for (int n = 0; n < 100; n++) {
+            int idx = batch * 100 * 32 + n * 32 + cluster;
+            sum += assignment[idx];
+        }
+        
+        output[tid] = sum * clusters2[feature * 32 + cluster];
+    }
+}
+
+extern "C" void fused_assignment_launcher(float* output, const float* assignment, const float* clusters2, int batch_size) {
+    int blocks = (batch_size * 512 * 32 + 256 - 1) / 256;
+    fused_assignment_kernel<<<blocks, 256>>>(output, assignment, clusters2, batch_size);
+}
+
+
+// === vlad_normalization.cu ===
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void normalize_kernel(float* output, const float* input, int batch_size, int feature_size, int cluster_size) {
+    int tid = blockIdx.x * 256 + threadIdx.x;
+    
+    if (tid < batch_size * feature_size) {
+        int batch = tid / feature_size;
+        int feature = tid % feature_size;
+        
+        float sum = 0.0f;
+        for (int k = 0; k < cluster_size; k++) {
+            int idx = batch * feature_size * cluster_size + feature * cluster_size + k;
+            sum += input[idx] * input[idx];
+        }
+        float inv_norm = rsqrt(sum + 1e-8);
+        
+        for (int k = 0; k < cluster_size; k++) {
+            int idx = batch * feature_size * cluster_size + feature * cluster_size + k;
+            output[idx] = input[idx] * inv_norm;
+        }
+    }
+}
+
+__global__ void flatten_normalize_kernel(float* output, const float* input, int batch_size, int feature_size, int cluster_size) {
+    int tid = blockIdx.x * 256 + threadIdx.x;
+    
+    if (tid < batch_size) {
+        float sum = 0.0f;
+        int total_elements = feature_size * cluster_size;
+        
+        // Calculate L2 norm
+        for (int i = 0; i < total_elements; i++) {
+            int idx = tid * total_elements + i;
+            sum += input[idx] * input[idx];
+        }
+        float inv_norm = rsqrt(sum + 1e-8);
+        
+        // Normalize each element
+        for (int i = 0; i < total_elements; i++) {
+            int idx = tid * total_elements + i;
+            output[idx] = input[idx] * inv_norm;
+        }
+    }
+}
+
+extern "C" void vlad_normalization_launcher(float* output, const float* input, int batch_size) {
+    int feature_size = 512;
+    int cluster_size = 32;
+    
+    int blocks = (batch_size * feature_size + 256 - 1) / 256;
+    normalize_kernel<<<blocks, 256>>>(output, input, batch_size, feature_size, cluster_size);
+}
+
+extern "C" void flatten_normalization_launcher(float* output, const float* input, int batch_size) {
+    int blocks = batch_size;
+    flatten_normalize_kernel<<<blocks, 256>>>(output, input, batch_size, 512, 32);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_flatten_norm_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_flatten_norm_launcher(float* output, const float* input);
+
+torch::Tensor fused_flatten_norm_forward(torch::Tensor input) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(input.size(0) == 2048, "Input batch size must be 2048");
+    TORCH_CHECK(input.size(1) == 512, "Input feature size must be 512");
+    TORCH_CHECK(input.size(2) == 32, "Input cluster size must be 32");
+    
+    auto output = torch::empty({2048, 512 * 32}, input.options());
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    fused_flatten_norm_launcher(output.data_ptr<float>(), input.data_ptr<float>());
+    
+    return output;
+}
+
+void register_fused_flatten_norm(pybind11::module& m) {
+    m.def("fused_flatten_norm_forward", &fused_flatten_norm_forward,
+          "Fused flatten and normalization forward",
+          py::arg("input"));
+}
+
+
+
+
+// === fused_kernel_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_assignment_launcher(float* output, const float* assignment, const float* clusters2, int batch_size);
+
+torch::Tensor fused_assignment_forward(torch::Tensor assignment, torch::Tensor clusters2, int batch_size) {
+    TORCH_CHECK(assignment.is_cuda(), "Assignment must be a CUDA tensor");
+    TORCH_CHECK(clusters2.is_cuda(), "Clusters2 must be a CUDA tensor");
+    TORCH_CHECK(assignment.is_contiguous(), "Assignment must be contiguous");
+    TORCH_CHECK(clusters2.is_contiguous(), "Clusters2 must be contiguous");
+    TORCH_CHECK(assignment.dtype() == torch::kFloat32, "Assignment must be float32");
+    TORCH_CHECK(clusters2.dtype() == torch::kFloat32, "Clusters2 must be float32");
+    
+    auto output = torch::empty({batch_size, 512, 32}, assignment.options());
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    fused_assignment_launcher(output.data_ptr<float>(), assignment.data_ptr<float>(), clusters2.data_ptr<float>(), batch_size);
+    
+    return output;
+}
+
+void register_fused_kernel(pybind11::module& m) {
+    m.def("fused_assignment_forward", &fused_assignment_forward,
+          "Fused assignment forward",
+          py::arg("assignment"),
+          py::arg("clusters2"),
+          py::arg("batch_size"));
+}
+
+
+
+
+// === vlad_normalization_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void vlad_normalization_launcher(float* output, const float* input, int batch_size);
+extern "C" void flatten_normalization_launcher(float* output, const float* input, int batch_size);
+
+torch::Tensor vlad_normalization_forward(torch::Tensor input, int batch_size) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    
+    auto output = torch::empty_like(input);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    vlad_normalization_launcher(output.data_ptr<float>(), input.data_ptr<float>(), batch_size);
+    
+    return output;
+}
+
+torch::Tensor flatten_normalization_forward(torch::Tensor input, int batch_size) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    
+    auto output = torch::empty_like(input);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    flatten_normalization_launcher(output.data_ptr<float>(), input.data_ptr<float>(), batch_size);
+    
+    return output;
+}
+
+void register_vlad_normalization(pybind11::module& m) {
+    m.def("vlad_normalization_forward", &vlad_normalization_forward,
+          "Vlad normalization forward",
+          py::arg("input"),
+          py::arg("batch_size"));
+    
+    m.def("flatten_normalization_forward", &flatten_normalization_forward,
+          "Flatten normalization forward",
+          py::arg("input"),
+          py::arg("batch_size"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_flatten_norm_forward", "fused_assignment_forward", "vlad_normalization_forward", "flatten_normalization_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super().__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        clusters = cluster_size + ghost_clusters
+        
+        # Initialize parameters to match original model
+        self.clusters = nn.Parameter(torch.empty(feature_size, clusters))
+        
+        # Batch norm parameters (will be loaded from state dict)
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        
+        self.clusters2 = nn.Parameter(torch.empty(1, feature_size, cluster_size))
+        
+        self.out_dim = self.cluster_size * feature_size
+
+    @torch.compile(backend='inductor', options={'max_autotune': False})
+    def _forward_without_custom_kernel(self, x):
+        batch_size = x.size(0)
+        max_sample = x.size(1)
+        
+        # Step 1: Reshape and matrix multiply for assignment
+        assignment = x.reshape(-1, self.feature_size).matmul(self.clusters)
+        
+        # Step 2: Batch norm with running stats
+        gamma = self.batch_norm.weight
+        beta = self.batch_norm.bias
+        running_mean = self.batch_norm.running_mean
+        running_var = self.batch_norm.running_var
+        eps = self.batch_norm.eps
+        
+        inv_std = torch.rsqrt(running_var + eps)
+        assignment = (assignment - running_mean) * inv_std * gamma + beta
+        
+        # Step 3: Softmax, remove ghosts, reshape
+        assignment = assignment.softmax(dim=1)[:, :self.cluster_size].reshape(batch_size, max_sample, self.cluster_size)
+        
+        # Step 4: Compute a_sum
+        a_sum = assignment.sum(dim=1, keepdim=True)
+        
+        # Step 5: Compute a
+        a = a_sum * self.clusters2
+        
+        # Step 6: Compute vlad using TF32
+        vlad = assignment.transpose(1, 2).matmul(x).transpose(1, 2) - a
+        
+        # Step 7: Reshape for normalization
+        vlad_transposed = vlad.permute(0, 2, 1).reshape(batch_size * self.cluster_size, self.feature_size)
+        vlad_normalized = vlad_transposed.div(vlad_transposed.norm(dim=1, keepdim=True))
+        vlad_normalized = vlad_normalized.reshape(batch_size, self.cluster_size, self.feature_size).permute(0, 2, 1)
+        
+        # Step 8: Flatten and normalize
+        vlad_flat = vlad_normalized.reshape(batch_size, -1)
+        vlad_final = vlad_flat.div(vlad_flat.norm(dim=-1, keepdim=True))
+        
+        return vlad_final
+
+    def forward(self, x, mask=None):
+        # Set TF32 globally
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        try:
+            output = self._forward_without_custom_kernel(x)
+            return output
+        finally:
+            # Reset TF32
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 54
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (26 failures)
+  - [large_magnitude seed=50000] max_diff=nan, mean_diff=nan, ref_range=[-4.5239e-02,4.3723e-02], orig_range=[nan,nan]
+  - [large_magnitude seed=50001] max_diff=nan, mean_diff=nan, ref_range=[-4.4908e-02,4.2817e-02], orig_range=[nan,nan]
+  - [near_overflow seed=50002] max_diff=nan, mean_diff=nan, ref_range=[0.0000e+00,0.0000e+00], orig_range=[nan,nan]
+  - [near_overflow seed=50003] max_diff=nan, mean_diff=nan, ref_range=[-0.0000e+00,-0.0000e+00], orig_range=[nan,nan]
+  - [all_negative seed=50008] max_diff=nan, mean_diff=nan, ref_range=[-6.6423e-02,1.4961e-05], orig_range=[nan,nan]
+  - [all_negative seed=50009] max_diff=nan, mean_diff=nan, ref_range=[-5.9628e-02,1.5384e-05], orig_range=[nan,nan]
+  - [all_positive seed=50010] max_diff=nan, mean_diff=nan, ref_range=[-1.5195e-05,6.4777e-02], orig_range=[nan,nan]
+  - [all_positive seed=50011] max_diff=nan, mean_diff=nan, ref_range=[-1.6332e-05,6.1616e-02], orig_range=[nan,nan]
+  ... and 18 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=3.664644e-02, mean_diff=3.998696e-03, ref_range=[-4.0994e-02,4.4029e-02], orig_range=[-4.3929e-02,4.1461e-02]
+  - [large_magnitude seed=70001] max_diff=3.384729e-02, mean_diff=3.995733e-03, ref_range=[-3.9979e-02,4.0797e-02], orig_range=[-4.0964e-02,4.5541e-02]
+  - [all_negative seed=70008] max_diff=2.467480e-02, mean_diff=1.933873e-03, ref_range=[-1.5501e-02,-3.5336e-03], orig_range=[-3.7767e-02,-2.3915e-06]
+  - [all_negative seed=70009] max_diff=2.687175e-02, mean_diff=1.834956e-03, ref_range=[-1.7327e-02,-3.6844e-03], orig_range=[-3.7685e-02,7.3680e-07]
+  - [all_positive seed=70010] max_diff=2.383622e-02, mean_diff=1.673355e-03, ref_range=[3.6254e-03,1.7060e-02], orig_range=[1.6819e-05,3.5395e-02]
+  - [all_positive seed=70011] max_diff=2.508341e-02, mean_diff=1.934240e-03, ref_range=[3.7297e-03,1.6891e-02], orig_range=[1.5882e-05,3.6155e-02]
+  - [mixed_extremes seed=70012] max_diff=3.779282e-02, mean_diff=3.955347e-03, ref_range=[-5.0142e-02,5.1048e-02], orig_range=[-5.2038e-02,5.4145e-02]
+  - [mixed_extremes seed=70013] max_diff=4.124337e-02, mean_diff=3.957149e-03, ref_range=[-5.0838e-02,5.2302e-02], orig_range=[-5.5912e-02,5.3755e-02]
+  ... and 20 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

@@ -1,0 +1,293 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Kullback-Leibler Divergence for comparing two distributions.
+
+    Parameters:
+        None
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, predictions, targets):
+        return torch.nn.functional.kl_div(torch.log(predictions), targets, reduction='batchmean')
+
+batch_size = 128
+input_shape = (4096, )
+dim = 1
+
+def get_inputs():
+    return [torch.randn(batch_size, *input_shape).softmax(dim=-1), torch.randn(batch_size, *input_shape).softmax(dim=-1)]
+
+def get_init_inputs():
+    return []
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define optimized CUDA kernel for fused KL divergence
+kl_div_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
+
+namespace cg = cooperative_groups;
+
+template<typename scalar_t>
+__global__ void fused_kl_div_kernel(
+    const scalar_t* __restrict__ predictions,
+    const scalar_t* __restrict__ targets,
+    scalar_t* __restrict__ output,
+    int batch_size,
+    int seq_len
+) {
+    // Each block processes one batch element
+    int batch_idx = blockIdx.x;
+    if (batch_idx >= batch_size) return;
+    
+    const scalar_t* pred_batch = predictions + batch_idx * seq_len;
+    const scalar_t* target_batch = targets + batch_idx * seq_len;
+    
+    // Thread block and warp setup
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads in block
+    int tid = threadIdx.x;
+    int total_threads = blockDim.x;
+    
+    for (int idx = tid; idx < seq_len; idx += total_threads) {
+        float p = static_cast<float>(pred_batch[idx]);
+        float t = static_cast<float>(target_batch[idx]);
+        
+        // KL divergence: t * log(t / p) = t * (log(t) - log(p))
+        // But we compute directly to match PyTorch's kl_div
+        if (t > 0.0f && p > 0.0f) {
+            thread_sum += t * (__logf(t) - __logf(p));
+        }
+        // Note: PyTorch's kl_div expects log(predictions) as input,
+        // but we're computing the full KL divergence here
+    }
+    
+    // Warp reduction
+    float warp_sum = cg::reduce(warp, thread_sum, cg::plus<float>());
+    
+    // First thread in warp writes to shared memory
+    __shared__ float block_sums[32];
+    if (warp.thread_rank() == 0) {
+        block_sums[warp.meta_group_rank()] = warp_sum;
+    }
+    block.sync();
+    
+    // First warp reduces all warp sums
+    if (warp.meta_group_rank() == 0) {
+        float block_sum = 0.0f;
+        int num_warps = (total_threads + 31) / 32;
+        if (warp.thread_rank() < num_warps) {
+            block_sum = block_sums[warp.thread_rank()];
+        }
+        
+        float final_sum = cg::reduce(warp, block_sum, cg::plus<float>());
+        
+        if (warp.thread_rank() == 0) {
+            // Store per-batch result
+            output[batch_idx] = static_cast<scalar_t>(final_sum);
+        }
+    }
+}
+
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    // Ensure inputs are on GPU and contiguous
+    predictions = predictions.contiguous();
+    targets = targets.contiguous();
+    
+    auto batch_size = predictions.size(0);
+    auto seq_len = predictions.size(1);
+    
+    // Create output tensor for per-batch results
+    auto output = torch::zeros({batch_size}, predictions.options());
+    
+    // Optimized kernel launch configuration
+    int threads = 256;
+    int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(predictions.scalar_type(), "fused_kl_div_kernel", ([&] {
+        fused_kl_div_kernel<scalar_t><<<blocks, threads>>>(
+            predictions.data_ptr<scalar_t>(),
+            targets.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            seq_len
+        );
+    }));
+    
+    // Return batchmean reduction
+    return output.mean();
+}
+"""
+
+kl_div_cpp_source = """
+torch::Tensor fused_kl_div_cuda(torch::Tensor predictions, torch::Tensor targets);
+"""
+
+# Compile the inline CUDA code
+fused_kl_div = load_inline(
+    name="fused_kl_div",
+    cpp_sources=kl_div_cpp_source,
+    cuda_sources=kl_div_source,
+    functions=["fused_kl_div_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_cuda_cflags=["-O3", "--use_fast_math"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that computes Kullback-Leibler Divergence using fused CUDA kernels.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fused_kl_div = fused_kl_div
+        
+    def forward(self, predictions, targets):
+        # Input validation and preprocessing
+        predictions = predictions.contiguous()
+        targets = targets.contiguous()
+        
+        # Ensure numerical stability (matching PyTorch's behavior)
+        predictions = torch.clamp(predictions, min=1e-12)
+        targets = torch.clamp(targets, min=1e-12)
+        
+        # Normalize to probability distributions
+        predictions = predictions / predictions.sum(dim=-1, keepdim=True)
+        targets = targets / targets.sum(dim=-1, keepdim=True)
+        
+        # Use fused CUDA kernel
+        return self.fused_kl_div.fused_kl_div_cuda(predictions, targets)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 30)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=all_positive, seed=57, mode=eval_value:
+      max_diff=2.265750e+05, mean_diff=2.265750e+05, ref_range=[2.2658e+05,2.2658e+05], orig_range=[6.9418e-01,6.9418e-01]
+[2] policy=all_positive, seed=58, mode=eval_value:
+      max_diff=2.274880e+05, mean_diff=2.274880e+05, ref_range=[2.2749e+05,2.2749e+05], orig_range=[6.9561e-01,6.9561e-01]
+[3] policy=all_positive, seed=59, mode=eval_value:
+      max_diff=2.255402e+05, mean_diff=2.255402e+05, ref_range=[2.2554e+05,2.2554e+05], orig_range=[6.9001e-01,6.9001e-01]
+[4] policy=near_epsilon, seed=75, mode=eval_value:
+      max_diff=4.417616e-01, mean_diff=4.417616e-01, ref_range=[8.5106e-03,8.5106e-03], orig_range=[4.5027e-01,4.5027e-01]
+[5] policy=near_epsilon, seed=76, mode=eval_value:
+      max_diff=4.418659e-01, mean_diff=4.418659e-01, ref_range=[8.4644e-03,8.4644e-03], orig_range=[4.5033e-01,4.5033e-01]
+[6] policy=near_epsilon, seed=77, mode=eval_value:
+      max_diff=4.410992e-01, mean_diff=4.410992e-01, ref_range=[8.4633e-03,8.4633e-03], orig_range=[4.4956e-01,4.4956e-01]
+[7] policy=init_sensitive, seed=81, mode=eval_value:
+      max_diff=2.263912e+05, mean_diff=2.263912e+05, ref_range=[2.2639e+05,2.2639e+05], orig_range=[6.9369e-01,6.9369e-01]
+[8] policy=dense_nonzero, seed=84, mode=eval_value:
+      max_diff=7.719700e+02, mean_diff=7.719700e+02, ref_range=[7.7207e+02,7.7207e+02], orig_range=[1.0457e-01,1.0457e-01]
+[9] policy=dense_nonzero, seed=85, mode=eval_value:
+      max_diff=7.716058e+02, mean_diff=7.716058e+02, ref_range=[7.7171e+02,7.7171e+02], orig_range=[1.0468e-01,1.0468e-01]
+[10] policy=dense_nonzero, seed=86, mode=eval_value:
+      max_diff=7.672070e+02, mean_diff=7.672070e+02, ref_range=[7.6731e+02,7.6731e+02], orig_range=[1.0470e-01,1.0470e-01]
+[11] policy=all_positive, seed=67, mode=eval_value:
+      max_diff=2.270667e+05, mean_diff=2.270667e+05, ref_range=[2.2707e+05,2.2707e+05], orig_range=[6.9523e-01,6.9523e-01]
+[12] policy=all_positive, seed=68, mode=eval_value:
+      max_diff=2.274562e+05, mean_diff=2.274562e+05, ref_range=[2.2746e+05,2.2746e+05], orig_range=[6.9437e-01,6.9437e-01]
+[13] policy=all_positive, seed=69, mode=eval_value:
+      max_diff=2.264790e+05, mean_diff=2.264790e+05, ref_range=[2.2648e+05,2.2648e+05], orig_range=[6.9307e-01,6.9307e-01]
+[14] policy=all_positive, seed=70, mode=eval_value:
+      max_diff=2.268018e+05, mean_diff=2.268018e+05, ref_range=[2.2680e+05,2.2680e+05], orig_range=[6.9298e-01,6.9298e-01]
+[15] policy=all_positive, seed=71, mode=eval_value:
+      max_diff=2.261780e+05, mean_diff=2.261780e+05, ref_range=[2.2618e+05,2.2618e+05], orig_range=[6.9479e-01,6.9479e-01]
+[16] policy=near_epsilon, seed=97, mode=eval_value:
+      max_diff=4.421853e-01, mean_diff=4.421853e-01, ref_range=[8.4854e-03,8.4854e-03], orig_range=[4.5067e-01,4.5067e-01]
+[17] policy=near_epsilon, seed=98, mode=eval_value:
+      max_diff=4.404777e-01, mean_diff=4.404777e-01, ref_range=[8.4548e-03,8.4548e-03], orig_range=[4.4893e-01,4.4893e-01]
+[18] policy=near_epsilon, seed=99, mode=eval_value:
+      max_diff=4.414799e-01, mean_diff=4.414799e-01, ref_range=[8.4387e-03,8.4387e-03], orig_range=[4.4992e-01,4.4992e-01]
+[19] policy=near_epsilon, seed=100, mode=eval_value:
+      max_diff=4.405293e-01, mean_diff=4.405293e-01, ref_range=[8.4043e-03,8.4043e-03], orig_range=[4.4893e-01,4.4893e-01]
+[20] policy=near_epsilon, seed=101, mode=eval_value:
+      max_diff=4.429554e-01, mean_diff=4.429554e-01, ref_range=[8.4989e-03,8.4989e-03], orig_range=[4.5145e-01,4.5145e-01]
+[21] policy=init_sensitive, seed=107, mode=eval_value:
+      max_diff=2.267024e+05, mean_diff=2.267024e+05, ref_range=[2.2670e+05,2.2670e+05], orig_range=[6.9538e-01,6.9538e-01]
+[22] policy=init_sensitive, seed=108, mode=eval_value:
+      max_diff=2.254225e+05, mean_diff=2.254225e+05, ref_range=[2.2542e+05,2.2542e+05], orig_range=[6.9269e-01,6.9269e-01]
+[23] policy=dense_nonzero, seed=112, mode=eval_value:
+      max_diff=7.815333e+02, mean_diff=7.815333e+02, ref_range=[7.8164e+02,7.8164e+02], orig_range=[1.0478e-01,1.0478e-01]
+[24] policy=dense_nonzero, seed=113, mode=eval_value:
+      max_diff=7.683287e+02, mean_diff=7.683287e+02, ref_range=[7.6843e+02,7.6843e+02], orig_range=[1.0457e-01,1.0457e-01]
+[25] policy=dense_nonzero, seed=114, mode=eval_value:
+      max_diff=7.638750e+02, mean_diff=7.638750e+02, ref_range=[7.6398e+02,7.6398e+02], orig_range=[1.0458e-01,1.0458e-01]
+[26] policy=dense_nonzero, seed=115, mode=eval_value:
+      max_diff=7.728215e+02, mean_diff=7.728215e+02, ref_range=[7.7293e+02,7.7293e+02], orig_range=[1.0449e-01,1.0449e-01]
+[27] policy=dense_nonzero, seed=116, mode=eval_value:
+      max_diff=7.662486e+02, mean_diff=7.662486e+02, ref_range=[7.6635e+02,7.6635e+02], orig_range=[1.0457e-01,1.0457e-01]
+[28] policy=all_positive, seed=54, mode=eval_value:
+      max_diff=2.261457e+05, mean_diff=2.261457e+05, ref_range=[2.2615e+05,2.2615e+05], orig_range=[6.9104e-01,6.9104e-01]
+[29] policy=all_positive, seed=55, mode=eval_value:
+      max_diff=2.272366e+05, mean_diff=2.272366e+05, ref_range=[2.2724e+05,2.2724e+05], orig_range=[6.9313e-01,6.9313e-01]
+[30] policy=all_positive, seed=56, mode=eval_value:
+      max_diff=2.267342e+05, mean_diff=2.267342e+05, ref_range=[2.2673e+05,2.2673e+05], orig_range=[6.9206e-01,6.9206e-01]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

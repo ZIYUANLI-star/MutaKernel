@@ -1,0 +1,136 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a single matrix multiplication (C = A * B) with A and B being symmetric matrices.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A, B):
+        """
+        Performs matrix multiplication of two symmetric matrices.
+
+        Args:
+            A (torch.Tensor): Input matrix A, shape (N, N), symmetric.
+            B (torch.Tensor): Input matrix B, shape (N, N), symmetric.
+
+        Returns:
+            torch.Tensor: Output matrix C, shape (N, N).
+        """
+        return torch.matmul(A, B)
+
+N = 4096
+
+def get_inputs():
+    """
+    Generates a pair of random symmetric matrices for testing.
+
+    Returns:
+        list: List containing two symmetric tensors A and B.
+    """
+    A = torch.rand(N, N)
+    A = (A + A.T) / 2  # Ensure symmetry
+    B = torch.rand(N, N)
+    B = (B + B.T) / 2  # Ensure symmetry
+    return [A, B]
+
+def get_init_inputs():
+    """
+    No specific initialization inputs needed for this model.
+
+    Returns:
+        list: Empty list.
+    """
+    return []
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model for matrix multiplication of two symmetric matrices.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, A, B):
+        """
+        Performs optimized matrix multiplication of two symmetric matrices.
+
+        Args:
+            A (torch.Tensor): Input matrix A, shape (N, N), symmetric.
+            B (torch.Tensor): Input matrix B, shape (N, N), symmetric.
+
+        Returns:
+            torch.Tensor: Output matrix C, shape (N, N).
+        """
+        # Enable TF32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Perform matrix multiplication
+        C = torch.matmul(A, B)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return C
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 40
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (20 failures)
+  - [large_magnitude seed=50000] max_diff=1.031839e+05, mean_diff=1.500602e+04, ref_range=[-3.3391e+08,3.2885e+08], orig_range=[-3.3393e+08,3.2884e+08]
+  - [large_magnitude seed=50001] max_diff=1.032480e+05, mean_diff=1.500568e+04, ref_range=[-3.2425e+08,3.2356e+08], orig_range=[-3.2423e+08,3.2356e+08]
+  - [mixed_extremes seed=50012] max_diff=5.167104e+06, mean_diff=7.488102e+05, ref_range=[-1.7461e+10,1.7225e+10], orig_range=[-1.7463e+10,1.7224e+10]
+  - [mixed_extremes seed=50013] max_diff=5.089792e+06, mean_diff=7.488882e+05, ref_range=[-1.6585e+10,1.6916e+10], orig_range=[-1.6586e+10,1.6915e+10]
+  - [alternating_sign seed=50014] max_diff=1.014688e+03, mean_diff=1.502141e+02, ref_range=[-2.6120e+06,2.7008e+06], orig_range=[-2.6119e+06,2.7006e+06]
+  - [alternating_sign seed=50015] max_diff=1.127656e+03, mean_diff=1.485462e+02, ref_range=[-2.5824e+06,2.6074e+06], orig_range=[-2.5822e+06,2.6073e+06]
+  - [sparse seed=50016] max_diff=1.338359e+02, mean_diff=1.457701e+01, ref_range=[-3.9764e+05,4.0760e+05], orig_range=[-3.9763e+05,4.0757e+05]
+  - [sparse seed=50017] max_diff=1.360547e+02, mean_diff=1.458060e+01, ref_range=[-3.8915e+05,3.9964e+05], orig_range=[-3.8913e+05,3.9969e+05]
+  ... and 12 more failures
+
+### training_stress (20 failures)
+  - [large_magnitude seed=70000] max_diff=1.011545e+05, mean_diff=1.500594e+04, ref_range=[-3.5818e+08,3.5734e+08], orig_range=[-3.5818e+08,3.5736e+08]
+  - [large_magnitude seed=70001] max_diff=1.055506e+05, mean_diff=1.500515e+04, ref_range=[-3.5564e+08,3.5753e+08], orig_range=[-3.5563e+08,3.5751e+08]
+  - [mixed_extremes seed=70012] max_diff=5.411584e+06, mean_diff=7.488317e+05, ref_range=[-1.9577e+10,1.7279e+10], orig_range=[-1.9577e+10,1.7279e+10]
+  - [mixed_extremes seed=70013] max_diff=5.473024e+06, mean_diff=7.492663e+05, ref_range=[-1.6856e+10,1.6815e+10], orig_range=[-1.6856e+10,1.6816e+10]
+  - [alternating_sign seed=70014] max_diff=1.043719e+03, mean_diff=1.484958e+02, ref_range=[-2.4814e+06,2.8344e+06], orig_range=[-2.4811e+06,2.8342e+06]
+  - [alternating_sign seed=70015] max_diff=1.033414e+03, mean_diff=1.499924e+02, ref_range=[-2.6348e+06,2.5158e+06], orig_range=[-2.6350e+06,2.5158e+06]
+  - [sparse seed=70016] max_diff=1.500938e+02, mean_diff=1.460960e+01, ref_range=[-4.6130e+05,4.3850e+05], orig_range=[-4.6126e+05,4.3853e+05]
+  - [sparse seed=70017] max_diff=1.449453e+02, mean_diff=1.459965e+01, ref_range=[-3.9553e+05,4.1556e+05], orig_range=[-3.9552e+05,4.1548e+05]
+  ... and 12 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

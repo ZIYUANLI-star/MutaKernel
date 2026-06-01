@@ -1,0 +1,287 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs matrix multiplication, applies dropout, and then applies softmax.
+    """
+    def __init__(self, in_features, out_features, dropout_p):
+        super(Model, self).__init__()
+        self.matmul = nn.Linear(in_features, out_features)
+        self.dropout = nn.Dropout(dropout_p)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.matmul(x)
+        x = self.dropout(x)
+        x = torch.softmax(x, dim=1)  # Softmax over features
+        return x
+
+batch_size = 128
+in_features = 16384
+out_features = 16384
+dropout_p = 0.2
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, dropout_p]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_bias_dropout_softmax.cu ===
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void fused_bias_dropout_softmax_kernel(
+    float* output,
+    const float* input,
+    const float* bias,
+    float dropout_p,
+    int batch_size,
+    int features) {
+
+    __shared__ float shared_max[128];
+    __shared__ float shared_sum[128];
+
+    int tid = threadIdx.x;
+    int row = blockIdx.x;
+
+    if (blockIdx.x < batch_size && threadIdx.x < 128) {
+        // Step 1: Compute max value for the row using reduction
+        float max_val = -INFINITY;
+        for (int i = tid; i < features; i += 128) {
+            int idx = row * features + i;
+            max_val = max(max_val, input[idx] + bias[i]);
+        }
+        shared_max[tid] = max_val;
+        __syncthreads();
+
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) {
+                shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
+            }
+            __syncthreads();
+        }
+
+        max_val = shared_max[0];
+        __syncthreads();
+
+        // Step 2: Compute sum of exponentials using reduction
+        float sum_exp_val = 0.0f;
+        for (int i = tid; i < features; i += 128) {
+            int idx = row * features + i;
+            float val = input[idx] + bias[i];
+            sum_exp_val += exp(val - max_val);
+        }
+        shared_sum[tid] = sum_exp_val;
+        __syncthreads();
+
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) {
+                shared_sum[tid] = shared_sum[tid] + shared_sum[tid + s];
+            }
+            __syncthreads();
+        }
+
+        float sum_exp = shared_sum[0];
+        float log_sum = log(sum_exp);
+        __syncthreads();
+
+        // Step 3: Compute softmax for each feature in the row
+        for (int i = tid; i < features; i += 128) {
+            int idx = row * features + i;
+            float val = input[idx] + bias[i];
+            output[idx] = exp(val - max_val - log_sum);
+        }
+    }
+}
+
+extern "C" void fused_bias_dropout_softmax_launcher(
+    float* output,
+    const float* input,
+    const float* bias,
+    float dropout_p,
+    int batch_size,
+    int features,
+    cudaStream_t stream) {
+
+    int block_size = 128;
+    int grid_size = batch_size;
+
+    fused_bias_dropout_softmax_kernel<<<grid_size, block_size, 0, stream>>>(
+        output, input, bias, dropout_p, batch_size, features);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_bias_dropout_softmax_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+// Declare launcher from .cu file
+extern "C" void fused_bias_dropout_softmax_launcher(
+    float* output,
+    const float* input,
+    const float* bias,
+    float dropout_p,
+    int batch_size,
+    int features,
+    cudaStream_t stream);
+
+// PyTorch wrapper
+torch::Tensor fused_bias_dropout_softmax_forward(
+    torch::Tensor input,
+    torch::Tensor bias,
+    float dropout_p) {
+
+    // Input validation
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(input.ndimension() == 2, "Input must be 2D (batch_size, features)");
+
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    TORCH_CHECK(bias.ndimension() == 1, "Bias must be 1D (features)");
+    TORCH_CHECK(bias.numel() == input.size(1), "Bias size must match input features");
+
+    auto output = torch::empty_like(input);
+
+    // Get current CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    // Call CUDA launcher
+    fused_bias_dropout_softmax_launcher(
+        output.data_ptr<float>(),
+        input.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        dropout_p,
+        static_cast<int>(input.size(0)),
+        static_cast<int>(input.size(1)),
+        stream
+    );
+
+    return output;
+}
+
+// Registration function
+void register_fused_bias_dropout_softmax(pybind11::module& m) {
+    m.def("fused_bias_dropout_softmax_forward", 
+          &fused_bias_dropout_softmax_forward, 
+          "Fused bias + dropout + softmax forward",
+          py::arg("input"),
+          py::arg("bias"),
+          py::arg("dropout_p"));
+}
+
+// Auto-register
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_bias_dropout_softmax_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that fuses bias addition, dropout, and softmax into a single kernel.
+    Also uses TensorFloat32 (TF32) for faster matrix multiplication.
+    """
+    def __init__(self, in_features, out_features, dropout_p):
+        super(ModelNew, self).__init__()
+        # Initialize parameters to match the original model
+        self.matmul = nn.Linear(in_features, out_features)
+        self.dropout_p = dropout_p
+
+    def forward(self, x):
+        # Use TensorFloat32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # First do the matrix multiplication using torch's matmul (which uses cuBLAS with TF32)
+        x = x.matmul(self.matmul.weight.transpose(0, 1))
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # Then apply fused bias + dropout + softmax
+        x = cuda_extension.fused_bias_dropout_softmax_forward(x, self.matmul.bias, self.dropout_p)
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 40
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (7 failures)
+  - [large_magnitude seed=50000] max_diff=1.105191e-01, mean_diff=1.469282e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [large_magnitude seed=50001] max_diff=7.794237e-02, mean_diff=1.411987e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [mixed_extremes seed=50012] max_diff=4.058270e-02, mean_diff=3.872751e-08, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [tail_heavy seed=50027] max_diff=2.073973e-01, mean_diff=1.978504e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [extreme_magnitude seed=50031] max_diff=1.000000e+00, mean_diff=9.536743e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [sparse_extreme seed=50040] max_diff=3.905596e-02, mean_diff=5.399884e-08, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [sparse_extreme seed=50041] max_diff=4.214740e-02, mean_diff=4.052819e-08, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+
+### training_stress (33 failures)
+  - [large_magnitude seed=70000] max_diff=1.000000e+00, mean_diff=2.513666e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [large_magnitude seed=70001] max_diff=1.000000e+00, mean_diff=2.865475e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [near_overflow seed=70002] max_diff=1.000000e+00, mean_diff=2.193451e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [near_overflow seed=70003] max_diff=1.000000e+00, mean_diff=1.907349e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_negative seed=70008] max_diff=1.000000e+00, mean_diff=3.108088e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_negative seed=70009] max_diff=1.000000e+00, mean_diff=2.714614e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_positive seed=70010] max_diff=1.000000e+00, mean_diff=2.088203e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_positive seed=70011] max_diff=1.000000e+00, mean_diff=2.767518e-05, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  ... and 25 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

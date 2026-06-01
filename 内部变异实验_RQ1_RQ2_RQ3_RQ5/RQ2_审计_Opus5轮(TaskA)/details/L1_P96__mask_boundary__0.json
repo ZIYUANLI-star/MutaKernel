@@ -1,0 +1,94 @@
+{
+  "mutant_id": "L1_P96__mask_boundary__0",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P96",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6309,
+        "completion_tokens": 5211,
+        "total_tokens": 11520,
+        "reasoning_tokens": 2407
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "total_elements=524288, mutant skips idx=524287. With distributed random values, missing 1/524288 of loss is ~0.0002% change—within tolerance. But concentrating 100% of loss at last element yields: original_mean=99999.5/524288≈0.1907, mutant_mean≈0 (uninitialized→0), diff=0.1907 > threshold≈0.012",
+      "survival_reason": "The mutation skips processing the last element (index 524287), leaving it uninitialized in the element_losses buffer. For random/distributed test inputs, each element contributes approximately 1/524288 of the total loss. Missing one element changes the result by roughly 0.0002%, which falls well within the allclose tolerance of atol=0.01, rtol=0.01. The previous tests (including 'boundary_last_element') likely still used distributed values rather than concentrating 100% of the loss at the last position. Memory allocation via torch::empty typically returns zeroed memory on first allocation, making the uninitialized value 0.0f rather than random garbage.",
+      "killable": true,
+      "kill_strategy": "Concentrate ALL loss at the last element (index 524287) by setting predictions[-1,-1] to a large value (e.g., 100000) while keeping all other elements identical between predictions and targets (zero loss). This makes the last element's contribution dominate, causing a ~19% difference when the mutant skips it.",
+      "recommendations": "Boundary mutation tests should explicitly test with loss/signal concentrated at the exact boundary element being modified, not just 'near' the boundary. The 'boundary_last_element' policy likely targeted values at the end but with distributed loss—future policies should include 'isolated_last_element' that places 100% of the computed value at the final index.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    # Put all loss at the very last element (flat index 524287)\n    # For beta=1.0, diff=100000 gives loss = |100000| - 0.5 = 99999.5\n    predictions[-1, -1] = 100000.0\n    targets[-1, -1] = 0.0\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5902,
+        "completion_tokens": 5390,
+        "total_tokens": 11292,
+        "reasoning_tokens": 2386
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Previous tests failed because CUDA memory pools may retain values from prior original model executions at the same memory address. The mutant reads this 'stale' correct value instead of true garbage. Using NaN guarantees the original produces NaN output while mutant produces non-NaN (garbage cannot be exactly NaN bit pattern 0x7FC00000).",
+      "survival_reason": "The mutation skips the last element (index 524287), leaving element_losses[524287] uninitialized. However, CUDA's memory allocator may return memory that still contains the correct value from a prior original model execution on the same memory address. Standard numeric tests fail because the 'garbage' coincidentally matches the expected value. NaN/Inf propagation bypasses this by creating values that cannot reasonably exist in uninitialized memory.",
+      "killable": true,
+      "kill_strategy": "Use NaN at the last element position. The original kernel computes NaN loss (since diff=NaN → fabsf(NaN)=NaN → output=NaN), which propagates to the final mean. The mutant's uninitialized element_losses[524287] cannot be exactly NaN, so its mean will be finite. NaN vs finite is always detected.",
+      "recommendations": "When testing boundary mutations in GPU kernels that use uninitialized memory (torch::empty), memory pool reuse can mask bugs. Testing frameworks should either (1) use torch::zeros for intermediate buffers, (2) explicitly poison memory between runs, or (3) use special values (NaN/Inf) that cannot accidentally match garbage.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    # Place NaN at the LAST element (flat index 524287)\n    # This is position [127, 4095] in the 2D tensor\n    predictions[127, 4095] = float('nan')\n    # targets[127, 4095] stays 0 - diff will be NaN\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6195,
+        "completion_tokens": 4403,
+        "total_tokens": 10598,
+        "reasoning_tokens": 2125
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Shape [128,4096] = 524288 elements. Mutation skips element 524287. element_losses allocated via torch::empty() (uninitialized). The test harness runs original then mutant sequentially. CUDA memory pooling returns the same memory region for identical-sized allocations. Original writes correct value to element_losses[524287], releases memory; mutant allocates same region, reads original's value. Single element contribution = L/524288 where L is per-element loss. Even if memory were zeroed, difference = L/524288 vs tolerance = 0.01 + 0.01*mean. For any reasonable L, L/524288 < tolerance.",
+      "survival_reason": "The mutant survives due to CUDA memory pool caching. When torch::empty() allocates element_losses for the mutant, it receives the same memory region just used by the original kernel. The original wrote the correct loss value at index 524287 before deallocation. The mutant's 'uninitialized' memory thus contains the exact correct value. Additionally, even if memory were truly uninitialized (zeros), a single element's contribution (1/524288 ≈ 0.0002%) to the mean falls well within the relative tolerance of 1%. Both effects combine to make this mutant practically unkillable through value changes alone.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable under the testing contract. Two independent reasons: (1) CUDA memory pooling causes same-sized allocations to reuse memory, so the 'uninitialized' element contains the correct value written by the original's prior execution. (2) Even with true garbage values, a single element represents only 1/524288 of the mean, which is negligible compared to the 1% relative tolerance. The combination of fixed tensor size (524288 elements) and tolerant comparison (rtol=1e-2) mathematically guarantees the mutation cannot be detected through value changes. Required to kill: either smaller tensor sizes (to increase single-element significance) or tighter tolerances, or control over test execution order/memory management.",
+      "recommendations": "For mutation testing on reduction kernels with boundary guards, use tensor sizes small enough that a single element's contribution exceeds the comparison tolerance. For N elements with rtol tolerance, ensure 1/N > rtol (here would require N < 100 elements). Alternatively, implement memory-sanitizing test harnesses that explicitly zero or poison allocations between original and mutant runs to expose uninitialized-memory bugs.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 3
+  },
+  "elapsed_sec": 311.75
+}

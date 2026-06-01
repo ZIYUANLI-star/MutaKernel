@@ -1,0 +1,239 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs L2 normalization.
+    """
+    def __init__(self):
+        """
+        Initializes the L2Norm layer.
+
+        Args:
+            dim (int): Dimension along which to normalize.
+        """
+        super(Model, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L2 normalization to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (*, dim, *).
+
+        Returns:
+            torch.Tensor: Output tensor with L2 normalization applied, same shape as input.
+        """
+        return x / torch.norm(x, p=2, dim=1, keepdim=True)
+
+batch_size = 16
+dim = 16384
+
+def get_inputs():
+    x = torch.randn(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized L2 normalization
+l2_norm_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <math.h>
+
+template<typename T>
+__global__ void l2_norm_kernel(const T* __restrict__ input, T* __restrict__ output, 
+                               int batch_size, int dim) {
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    
+    // Use 256 threads per block (power of 2 for reduction)
+    const int threads = 256;
+    
+    // Shared memory for reduction
+    __shared__ float sdata[256];
+    
+    // Each thread processes multiple elements
+    float thread_sum = 0.0f;
+    
+    // Process elements with stride equal to total threads
+    for (int i = tid; i < dim; i += threads) {
+        int idx = batch_idx * dim + i;
+        float val = static_cast<float>(input[idx]);
+        thread_sum += val * val;
+    }
+    
+    // Parallel reduction
+    sdata[tid] = thread_sum;
+    __syncthreads();
+    
+    // Tree reduction
+    for (int stride = threads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sdata[tid] += sdata[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Compute reciprocal of L2 norm (1 / sqrt(sum))
+    float scale = 0.0f;
+    if (tid == 0) {
+        float norm = sqrtf(sdata[0] + 1e-8f);
+        scale = 1.0f / norm;
+        sdata[0] = scale;
+    }
+    __syncthreads();
+    
+    scale = sdata[0];
+    
+    // Normalize elements
+    for (int i = tid; i < dim; i += threads) {
+        int idx = batch_idx * dim + i;
+        float val = static_cast<float>(input[idx]);
+        output[idx] = static_cast<T>(val * scale);
+    }
+}
+
+torch::Tensor l2_norm_cuda(torch::Tensor input) {
+    auto batch_size = input.size(0);
+    auto dim = input.size(1);
+    auto output = torch::empty_like(input);
+    
+    const int threads = 256;
+    const int blocks = batch_size;
+    
+    AT_DISPATCH_FLOATING_TYPES(input.scalar_type(), "l2_norm_cuda", ([&] {
+        l2_norm_kernel<scalar_t><<<blocks, threads>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            batch_size,
+            dim
+        );
+    }));
+    
+    cudaDeviceSynchronize();
+    return output;
+}
+"""
+
+l2_norm_cpp_source = "torch::Tensor l2_norm_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code for L2 normalization
+l2_norm_module = load_inline(
+    name="l2_norm",
+    cpp_sources=l2_norm_cpp_source,
+    cuda_sources=l2_norm_source,
+    functions=["l2_norm_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized L2 normalization model with custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies L2 normalization using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, dim).
+            
+        Returns:
+            torch.Tensor: L2 normalized tensor, same shape as input.
+        """
+        # Ensure tensor is on CUDA device
+        if not x.is_cuda:
+            x = x.cuda()
+            
+        return l2_norm_module.l2_norm_cuda(x)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 9)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=near_zero, seed=42, mode=eval_value:
+      max_diff=3.145413e-02, mean_diff=5.438403e-03, ref_range=[-3.5704e-02,3.6046e-02], orig_range=[-4.5530e-03,4.5914e-03]
+[2] policy=near_zero, seed=43, mode=eval_value:
+      max_diff=3.071239e-02, mean_diff=5.444687e-03, ref_range=[-3.5147e-02,3.4455e-02], orig_range=[-4.4349e-03,4.4142e-03]
+[3] policy=near_zero, seed=44, mode=eval_value:
+      max_diff=3.572808e-02, mean_diff=5.442708e-03, ref_range=[-4.0870e-02,3.3621e-02], orig_range=[-5.1420e-03,4.2503e-03]
+[4] policy=near_zero, seed=354, mode=train_value:
+      max_diff=3.341551e-02, mean_diff=5.444459e-03, ref_range=[-3.5692e-02,3.8305e-02], orig_range=[-4.4902e-03,4.8899e-03]
+[5] policy=near_zero, seed=355, mode=train_value:
+      max_diff=3.225754e-02, mean_diff=5.439220e-03, ref_range=[-3.4609e-02,3.6939e-02], orig_range=[-4.3740e-03,4.6816e-03]
+[6] policy=near_zero, seed=356, mode=train_value:
+      max_diff=3.090225e-02, mean_diff=5.442732e-03, ref_range=[-3.5392e-02,3.4909e-02], orig_range=[-4.4900e-03,4.4238e-03]
+[7] policy=near_zero, seed=342, mode=train_value:
+      max_diff=3.196305e-02, mean_diff=5.440056e-03, ref_range=[-3.5505e-02,3.6615e-02], orig_range=[-4.5388e-03,4.6516e-03]
+[8] policy=near_zero, seed=343, mode=train_value:
+      max_diff=3.360978e-02, mean_diff=5.439787e-03, ref_range=[-3.6211e-02,3.8489e-02], orig_range=[-4.5517e-03,4.8792e-03]
+[9] policy=near_zero, seed=344, mode=train_value:
+      max_diff=3.297616e-02, mean_diff=5.440270e-03, ref_range=[-3.5416e-02,3.7751e-02], orig_range=[-4.5461e-03,4.7749e-03]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

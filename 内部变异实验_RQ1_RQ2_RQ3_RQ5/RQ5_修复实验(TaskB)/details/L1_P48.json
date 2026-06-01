@@ -1,0 +1,107 @@
+{
+  "kernel_name": "L1_P48",
+  "level": "L1",
+  "problem_id": "48",
+  "executed": true,
+  "trigger": "task_b_regenerate_opus45",
+  "max_rounds": 3,
+  "n_failing_inputs": 1,
+  "round0_stats": {
+    "n_total": 1,
+    "n_confirmed_buggy": 1,
+    "n_ref_failed": 0,
+    "n_unexpected_pass": 0
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 2590,
+        "completion_tokens": 5302,
+        "total_tokens": 7892,
+        "reasoning_tokens": 2386
+      },
+      "reasoning_chars": 9546,
+      "llm_elapsed_sec": 60.17,
+      "v_stress_elapsed_sec": 39.68,
+      "v_kb_elapsed_sec": 12.31,
+      "new_kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\n# Define the custom CUDA kernel for optimized mean reduction with improved numerical stability\nmean_reduction_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n\ntemplate<typename T>\n__global__ void mean_reduction_kernel(\n    const T* __restrict__ input,\n    T* __restrict__ output,\n    const int reduction_dim_size,\n    const int outer_size,\n    const int inner_size\n) {\n    // Each thread block handles one output position\n    const int tid = threadIdx.x;\n    const int bid = blockIdx.x;\n    \n    // Calculate which output position this block handles\n    const int outer_idx = bid / inner_size;\n    const int inner_idx = bid % inner_size;\n    \n    // Use double precision for accumulation for better numerical stability\n    // This is critical for near-overflow values\n    __shared__ double shared_sums[256];\n    \n    // Each thread accumulates its portion using double precision\n    double sum = 0.0;\n    for (int i = tid; i < reduction_dim_size; i += blockDim.x) {\n        int idx = (outer_idx * reduction_dim_size + i) * inner_size + inner_idx;\n        sum += static_cast<double>(input[idx]);\n    }\n    \n    shared_sums[tid] = sum;\n    __syncthreads();\n    \n    // Parallel reduction within block using double precision\n    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {\n        if (tid < stride) {\n            shared_sums[tid] += shared_sums[tid + stride];\n        }\n        __syncthreads();\n    }\n    \n    // Write final result, converting back to original type\n    if (tid == 0) {\n        double mean_val = shared_sums[0] / static_cast<double>(reduction_dim_size);\n        output[bid] = static_cast<T>(mean_val);\n    }\n}\n\ntorch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim) {\n    // Ensure contiguous tensor for correct memory access pattern\n    if (!input.is_contiguous()) {\n        input = input.contiguous();\n    }\n    \n    auto input_sizes = input.sizes().vec();\n    \n    // Handle negative dimension\n    if (dim < 0) {\n        dim = input.dim() + dim;\n    }\n    \n    // Calculate output shape\n    std::vector<int64_t> output_sizes;\n    for (int64_t i = 0; i < input.dim(); i++) {\n        if (i != dim) {\n            output_sizes.push_back(input_sizes[i]);\n        }\n    }\n    \n    auto output = torch::empty(output_sizes, input.options());\n    \n    // Calculate dimensions for kernel\n    int64_t outer_size = 1;\n    for (int64_t i = 0; i < dim; i++) {\n        outer_size *= input_sizes[i];\n    }\n    \n    int64_t reduction_dim_size = input_sizes[dim];\n    \n    int64_t inner_size = 1;\n    for (int64_t i = dim + 1; i < input.dim(); i++) {\n        inner_size *= input_sizes[i];\n    }\n    \n    int64_t total_positions = outer_size * inner_size;\n    \n    // Handle empty tensor case\n    if (total_positions == 0 || reduction_dim_size == 0) {\n        return output;\n    }\n    \n    // Configure kernel launch\n    const int block_size = 256;\n    int grid_size = total_positions;\n    \n    AT_DISPATCH_FLOATING_TYPES(\n        input.scalar_type(),\n        \"mean_reduction\",\n        [&] {\n            mean_reduction_kernel<scalar_t><<<grid_size, block_size>>>(\n                input.data_ptr<scalar_t>(),\n                output.data_ptr<scalar_t>(),\n                reduction_dim_size,\n                outer_size,\n                inner_size\n            );\n        }\n    );\n    \n    return output;\n}\n\"\"\"\n\nmean_reduction_cpp_source = \"\"\"\ntorch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim);\n\"\"\"\n\n# Compile the inline CUDA code\nmean_reduction_module = load_inline(\n    name=\"mean_reduction_v2\",\n    cpp_sources=mean_reduction_cpp_source,\n    cuda_sources=mean_reduction_source,\n    functions=[\"mean_reduction_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"-lcudart\"],\n    with_cuda=True,\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model that performs mean reduction over a specific dimension\n    using custom CUDA kernels with improved numerical stability.\n    \"\"\"\n    def __init__(self, dim: int):\n        \"\"\"\n        Initializes the model with the dimension to reduce over.\n\n        Args:\n            dim (int): The dimension to reduce over.\n        \"\"\"\n        super(ModelNew, self).__init__()\n        self.dim = dim\n        self.mean_reduction = mean_reduction_module\n\n    def forward(self, x: torch.Tensor) -> torch.Tensor:\n        \"\"\"\n        Reduces the input tensor along the specified dimension by taking the mean\n        using optimized CUDA kernel.\n\n        Args:\n            x (torch.Tensor): Input tensor of arbitrary shape.\n\n        Returns:\n            torch.Tensor: Output tensor with reduced dimension.\n        \"\"\"\n        # Use CUDA kernel if tensor is on GPU\n        if x.is_cuda:\n            return self.mean_reduction.mean_reduction_cuda(x, self.dim)\n        else:\n            # Fallback to PyTorch for CPU tensors\n            return torch.mean(x, dim=self.dim)",
+      "extraction_ok": true,
+      "v_stress": {
+        "n_total": 1,
+        "n_pass": 1,
+        "n_fail": 0,
+        "n_ref_failed_skipped": 0,
+        "all_pass": true,
+        "per_input": [
+          {
+            "policy": "near_overflow",
+            "seed": 348,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 37958.57381820679,
+            "status": "pass"
+          }
+        ],
+        "still_failing": []
+      },
+      "v_kb": {
+        "n_total": 5,
+        "n_pass": 5,
+        "all_pass": true,
+        "per_seed": [
+          {
+            "seed": 42,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 1337,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 7,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 100,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 2024,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          }
+        ],
+        "regressed_seeds": []
+      },
+      "round_pass": true
+    }
+  ],
+  "final_status": "fixed_at_round_1",
+  "final_round": 1,
+  "elapsed_sec": 112.23
+}

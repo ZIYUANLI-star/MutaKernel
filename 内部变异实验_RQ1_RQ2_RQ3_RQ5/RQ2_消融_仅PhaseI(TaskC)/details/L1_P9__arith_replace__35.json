@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P9__arith_replace__35",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P9",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5618,
+        "completion_tokens": 3162,
+        "total_tokens": 8780,
+        "reasoning_tokens": 946
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Original grid_size.x = (16384+63)/64 = 256. Mutated grid_size.x = (16384+63)*64 = 1,052,608. This 4096× increase in blocks causes resource exhaustion, crash, or timeout. Reference output for all-ones input = 16.0 everywhere; mutant output = 0.0 (from zeros initialization on crash) or incomplete.",
+      "survival_reason": "The mutation changes division to multiplication in the grid size x-dimension calculation, increasing the number of blocks from 65,536 to 269,467,648. This astronomical increase causes CUDA resource exhaustion, as confirmed by the worker_timeout_or_crash error in EMD Layer 2. Even if the kernel somehow launches, the excessive blocks create massive overhead. The output tensor C is initialized to zeros via torch::zeros before the kernel launch, so a crash leaves zeros while the reference produces correct matrix multiplication results.",
+      "killable": true,
+      "kill_strategy": "Use any non-zero input values. The simplest approach is all-ones matrices, producing reference output of 16.0 everywhere. The mutant will crash/timeout due to launching 4096× too many blocks, leaving output as zeros or incomplete. The difference of 16.0 far exceeds the tolerance threshold of ~0.17.",
+      "recommendations": "Grid dimension calculations should be covered by static assertions or runtime validation. A test verifying grid_size matches expected values (e.g., ceil(N/TILE_N) for x-dimension) would catch arithmetic errors in launch configuration before deployment.",
+      "suggested_code": "def generate_inputs(device):\n    # All-ones input: expected C[i,j] = 16.0 for all i,j\n    # Mutant crashes due to 4096x too many CUDA blocks\n    A = torch.ones(16384, 16, dtype=torch.float32, device=device)\n    B = torch.ones(16, 16384, dtype=torch.float32, device=device)\n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5501,
+        "completion_tokens": 4483,
+        "total_tokens": 9984,
+        "reasoning_tokens": 1864
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes grid_size.x from (N+63)/64 = 256 to (N+63)*64 = 1,052,608 blocks. This launches 4096× more blocks but doesn't affect computation: (1) All valid blocks (blockIdx.x ∈ [0,255]) still execute identically, computing C[row,col] for all valid positions. (2) Extra blocks (blockIdx.x ≥ 256) have global_col ≥ 16384, so the bounds check 'if (row < M && col < N)' prevents them from writing to C. (3) B_tile loading also has bounds checking, filling with 0.0f when load_col ≥ N, so no out-of-bounds reads occur.",
+      "survival_reason": "The all-ones input attempt failed because the mutation is in grid dimensions, not computation logic. All 65,536 valid blocks (same as original) still run and produce correct output. The extra ~269 million blocks compute useless results but are prevented from writing by bounds checks (col < N). The kernel completed successfully because CUDA handled the large grid, and the output matched exactly since the same threads computed the same values for all valid output positions. Value changes cannot affect this because the computation path through valid blocks is identical regardless of input values.",
+      "killable": false,
+      "kill_strategy": "This mutant appears unkillable via value changes alone. The mutation only affects grid launch configuration, not the computation kernel itself. Bounds checking ensures extra blocks don't corrupt output. The only distinguishing characteristics would be execution time (much slower) or potential resource exhaustion, neither of which are captured by value-level output comparison. Killing would require either: (1) adding performance assertions, (2) testing with different M/N dimensions where the grid calculation matters differently, or (3) monitoring CUDA resource usage.",
+      "recommendations": "For grid/block dimension mutations, value-level testing is insufficient. Consider adding: (1) shape variation tests where dimension calculations have different effects, (2) performance regression tests to catch efficiency mutations, (3) CUDA resource monitoring to detect excessive grid sizes, or (4) coverage-guided testing that validates launch configurations directly.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 219.67
+}

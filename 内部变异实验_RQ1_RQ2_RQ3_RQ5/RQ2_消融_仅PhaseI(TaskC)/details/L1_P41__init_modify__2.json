@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P41__init_modify__2",
+  "operator_name": "init_modify",
+  "kernel_name": "L1_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8106,
+        "completion_tokens": 4801,
+        "total_tokens": 12907,
+        "reasoning_tokens": 1757
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "When total_elements >= 65536 (batch=16, channels=64, output_length>=64), the batch_channel_parallel kernel runs. With all input values = -1e15 < -1e10, the condition (val > max_val) evaluates TRUE for original (-1e15 > -INFINITY) but FALSE for mutant (-1e15 > -1e10). Original outputs -1e15, mutant outputs -1e10. Difference = ~1e15 >> tolerance.",
+      "survival_reason": "The mutation changes the identity element for max reduction from -INFINITY to -1e10f. Layer 2 testing passed because all tested value distributions had minimums > -1e10 (evidence shows min values around -4.3). The 'all_negative' stress test likely used moderately negative values. Values must be < -1e10 to expose the bug where the mutant never updates max_val because no input exceeds the -1e10 threshold.",
+      "killable": true,
+      "kill_strategy": "Fill the input tensor with extremely negative values below -1e10 (e.g., -1e15 or -1e20). This ensures all values in every pooling window fail the (val > max_val) check in the mutant, causing it to output -1e10 instead of the correct maximum.",
+      "recommendations": "Stress testing for reduction kernels should include extreme values near the floating-point limits (-FLT_MAX, FLT_MAX) to catch incorrect initialization of identity elements. The 'all_negative' policy should specifically test values below common sentinel values like -1e10.",
+      "suggested_code": "def generate_inputs(device):\n    # All values are -1e15, well below -1e10\n    # Original (correct): returns -1e15 (the actual max)\n    # Mutant (incorrect): returns -1e10 (because -1e15 never updates initial -1e10f)\n    x = torch.full((16, 64, 128), -1e15, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7986,
+        "completion_tokens": 3898,
+        "total_tokens": 11884,
+        "reasoning_tokens": 1803
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation is in `maxpool1d_forward_kernel_batch_channel_parallel`, which is only executed when `total_elements = batch_size * channels * output_length >= 65536`. With input shape [16, 64, 128] (batch=16, channels=64), output_length must be >= 64 (i.e., 16*64*64=65536). This requires kernel_size=2, stride=2 or similar. Standard configurations like kernel_size=4, stride=4 give output_length=32, so total_elements=32768 < 65536, routing to the UNMUTATED kernel `maxpool1d_forward_kernel`.",
+      "survival_reason": "Round 1 failed because the mutated kernel path is never executed for the fixed model configuration. Despite using extreme values (-1e15) that would clearly expose the bug if the mutated code ran (since -1e15 > -1e10 is FALSE), the output matched because the kernel selection condition `total_elements < 65536` evaluates TRUE, directing execution to `maxpool1d_forward_kernel` which still uses `-INFINITY` initialization. The EMD Layer 2 tests also couldn't distinguish the mutant because they test the same execution path. The mutation only affects `maxpool1d_forward_kernel_batch_channel_parallel`, but with typical model configurations (kernel_size=4, stride=4), the output_length=32 gives total_elements=32768, always selecting the unmutated kernel.",
+      "killable": false,
+      "kill_strategy": "This mutant requires changing the model configuration (kernel_size, stride, padding, dilation) to produce output_length >= 64, which would make total_elements >= 65536 and trigger the mutated kernel. With the fixed model parameters and fixed input shapes, only the unmutated kernel is ever executed, making this mutation unkillable through value changes alone.",
+      "recommendations": "Mutation testing frameworks should verify that mutations lie on reachable code paths given the fixed test configuration. When a kernel has multiple dispatch paths based on problem size, mutations in each path should be tested with configurations that exercise that specific path. Consider parameterizing tests to cover both small-problem (total_elements < 65536) and large-problem kernel variants.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 143.21
+}

@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P95__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P95",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4663,
+        "completion_tokens": 3102,
+        "total_tokens": 7765,
+        "reasoning_tokens": 1113
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "The mutation removes __syncthreads() after shared[tid]=val and before the reduction loop. With batch_size=4096, reduce_threads=256, reduce_blocks=16. Each block has 256 threads across 8 warps. In the first reduction iteration (stride=128), threads 0-127 (warps 0-3) read shared[128-255] written by threads 128-255 (warps 4-7). Without the sync barrier, warps 0-3 may read uninitialized/stale values before warps 4-7 complete writing.",
+      "survival_reason": "This is a classic shared memory race condition. The removed __syncthreads() was required to ensure all threads complete writing to shared memory before any thread reads from it during reduction. CUDA warps execute independently, so without synchronization, threads in earlier warps (0-3) may attempt to read shared memory locations (indices 128-255) before threads in later warps (4-7) have written to them. The EMD Layer 2 already detected divergence with seed 10002, confirming the race manifests in practice. The race is non-deterministic but highly likely to occur given 8 warps executing independently.",
+      "killable": true,
+      "kill_strategy": "Use inputs with large, distinct loss values per sample so that any missed contributions from the race condition cause a significant divergence in the final mean. Large positive values in non-target class logits and very negative values in target class logits maximize per-sample losses, making reduction errors more visible.",
+      "recommendations": "Always verify that parallel reduction patterns include synchronization barriers: (1) after initial shared memory writes, (2) after each reduction iteration. Mutation testing should include multiple runs for race-condition mutants since divergence is non-deterministic.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # Create logits where target class has very low probability\n    # This maximizes per-sample loss (~60 each)\n    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)\n    logits[:, 0] = -50.0  # Very negative logit for class 0\n    logits[:, 1:] = 10.0  # High logits for other classes\n    \n    # All targets are class 0 - the class with lowest logit\n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4605,
+        "completion_tokens": 5763,
+        "total_tokens": 10368,
+        "reasoning_tokens": 2463
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() inside the reduction loop causes race conditions when thread i reads shared[i+stride] before thread (i+stride) completes its write from the previous iteration. With stride=128->64, thread 0 reads shared[64] which thread 64 updated (shared[64]+=shared[192]). If positions 192-255 have high loss (~200) and positions 0-191 have near-zero loss, missing even a few updates creates error > tolerance. With 64 high-loss samples per block × 16 blocks = 1024 samples at ~200 loss each, even 1% race-induced error = ~2 in final mean vs tolerance ~0.01+0.01*~50 ≈ 0.5.",
+      "survival_reason": "Previous attempt used uniform high losses across all positions, making race condition errors additive with similar magnitudes—any missed partial sum was roughly compensated by other threads eventually reading updated values. The key insight is that the race specifically affects positions where shared[i] is read in iteration N+1 but written in iteration N. At stride=64, threads 0-63 read shared[64-127] which were written in stride=128 iteration. By concentrating large losses specifically at positions 192-255 (which contribute to shared[64-127] updates) and near-zero losses elsewhere, any stale read causes a large absolute error that accumulates across blocks.",
+      "killable": true,
+      "kill_strategy": "Create extreme value contrast between positions 0-191 (near-zero loss) and 192-255 (very high loss ~200) within each 256-thread block. This maximizes the impact of missed shared memory updates during the reduction, as thread 0-63 reading stale shared[64-127] values misses the large contributions from positions 192-255.",
+      "recommendations": "When testing parallel reduction kernels with removed synchronization, create inputs with extreme value gradients positioned specifically at the memory locations involved in cross-iteration dependencies (e.g., positions stride apart that interact in successive reduction iterations).",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)\n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    # Default: very low loss (target class has overwhelming probability)\n    logits[:, 0] = 100.0  # Target class 0\n    logits[:, 1:] = 0.0   # Others near zero\n    # Loss ≈ -100 + log(e^100 + 9) ≈ 0\n    \n    # Positions 192-255 within each 256-sample block: extremely high loss\n    # These feed into shared[64-127] during stride=128 reduction\n    positions = torch.arange(batch_size, device=device) % 256\n    high_loss_mask = positions >= 192\n    \n    logits[high_loss_mask, 0] = -100.0   # Target very unlikely\n    logits[high_loss_mask, 1:] = 100.0    # Others very likely\n    # Loss ≈ 100 + log(e^-200 + 9*e^0) ≈ 100 + log(9) ≈ 102\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5080,
+        "completion_tokens": 6037,
+        "total_tokens": 11117,
+        "reasoning_tokens": 2610
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The removed __syncthreads() before the reduction loop creates a race where threads 0-127 may read shared[128-255] before threads 128-255 have written. If positions 128-255 have loss≈162 and positions 0-127 have loss≈0, correct mean≈81. If race causes zero-reads, mean≈0. Difference of 81 >> atol+rtol*81 ≈ 1.8.",
+      "survival_reason": "Round 1 used uniform high losses, providing no asymmetry to exploit the race between thread groups 0-127 and 128-255. Round 2 targeted positions 192-255 only, but at stride=128, threads 0-127 read ALL of shared[128-255], not just 192-255. The partial targeting (192-255 high, 128-191 normal) diluted the effect. The correct strategy requires positions exactly at indices 128-255 (mod 256) to have maximally different values from positions 0-127 (mod 256), since this is precisely what threads 0-127 read from at the first reduction step (stride=128).",
+      "killable": true,
+      "kill_strategy": "Set positions 0-127 (mod 256) to have near-zero loss and positions 128-255 (mod 256) to have very high loss (~162). This maximizes the difference between correct execution (mean≈81) and race-affected execution where threads 0-127 read stale zeros (mean→0).",
+      "recommendations": "For reduction kernels, add explicit tests that place maximum values at thread indices that will be read across warp boundaries during the first reduction step (typically the upper half of the thread block), combined with minimum values in the lower half. This creates maximum sensitivity to missing synchronization barriers.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)\n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    positions = torch.arange(batch_size, device=device) % 256\n    high_loss_mask = positions >= 128\n    low_loss_mask = positions < 128\n    \n    # Positions 0-127: target class 0 has very high logit -> loss ≈ 0\n    logits[low_loss_mask, 0] = 80.0\n    logits[low_loss_mask, 1:] = -80.0\n    \n    # Positions 128-255: target class 0 has very low logit -> loss ≈ 162\n    logits[high_loss_mask, 0] = -80.0\n    logits[high_loss_mask, 1:] = 80.0\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5477,
+        "completion_tokens": 5003,
+        "total_tokens": 10480,
+        "reasoning_tokens": 2149
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The missing __syncthreads() before reduction causes thread i (i<128) to potentially read stale values from shared[i+128]. With batch_size=4096 and 256 threads/block, thread 128 in each block writes at exactly the position read by thread 0 during stride=128 reduction. If only position 128 (per block) has high loss (~400) and others ~0, missing this single value creates error of 400/4096≈0.098 per block, exceeding tolerance 0.01+0.01*ref.",
+      "survival_reason": "Previous attempts distributed high-loss values across positions 128-255, which dilutes the error if only some values are missed. The race condition at the missing sync is a narrow window - only affecting reads of positions 128-255 in the first reduction stride. By concentrating ALL loss contribution at exactly position 128 (the first position read by thread 0 from the upper half), we create maximum sensitivity: either thread 0 reads the correct ~400 loss, or reads stale ~0, causing a definitive difference. Previous patterns with uniform high values across 128-255 may have had partial synchronization hiding the bug.",
+      "killable": true,
+      "kill_strategy": "Concentrate the entire loss at position 128 within each 256-thread block (indices 128, 384, 640, ...). These are exactly the values that thread 0 reads from shared[128] in the first reduction stride before any in-loop __syncthreads() can correct the missing initial sync.",
+      "recommendations": "When testing synchronization removal mutations in reduction kernels, focus inputs on the exact indices that map to the first cross-partition read in the reduction tree, rather than spreading values across entire partitions.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # All samples: target class 0 has very high logit -> near-zero loss\n    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)\n    logits[:, 0] = 100.0\n    logits[:, 1:] = -100.0\n    # Loss ≈ -100 + log(exp(100) + 9*exp(-100)) ≈ 0\n    \n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    # At exactly position 128 in each 256-sample block: extreme loss\n    # These map to thread 128 which writes to shared[128]\n    # Thread 0 reads shared[128] in first reduction stride\n    critical_indices = torch.arange(128, batch_size, 256, device=device)\n    logits[critical_indices, 0] = -400.0  # Target class very unlikely\n    logits[critical_indices, 1:] = 0.0\n    # Loss ≈ 400 + log(9) ≈ 402\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5911,
+        "completion_tokens": 4250,
+        "total_tokens": 10161,
+        "reasoning_tokens": 2096
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The missing __syncthreads() before the reduction loop creates a race where threads 0-127 may read shared[128-255] before those values are written. Previous attempts used extreme but finite losses - the race is probabilistic and might not manifest consistently. Using special IEEE values (Inf/-Inf) creates a binary distinguisher: if positions 128-255 produce Inf loss, correct execution yields Inf while race-affected execution yields finite. This is an undeniable difference regardless of timing.",
+      "survival_reason": "Previous attempts used extreme finite loss values (±80, ±100, ±400 logits), but the race condition is non-deterministic - on modern GPUs, shared memory writes often complete before reads even without explicit sync. When the race does occur, the error might be within tolerance or partially masked by averaging across 16 blocks. The fundamental flaw was relying on magnitude differences that tolerance could absorb. Special IEEE floating-point values (Inf) create a categorical difference: any finite vs infinite comparison fails, making the test independent of race timing probability. If shared[128-255] contains Inf losses and the race skips them, result is finite; otherwise it's Inf - these never match under any tolerance.",
+      "killable": true,
+      "kill_strategy": "Use -Inf logits for target class in positions 128-255 (mod 256) to produce per-sample loss = Inf. Positions 0-127 produce normal finite loss. If race skips reading shared[128-255], result is finite; otherwise Inf. This categorical difference cannot be masked by tolerance.",
+      "recommendations": "When testing race conditions involving reduction operations, use special IEEE floating-point values (Inf, -Inf, NaN) as sentinels - they create categorical rather than magnitude-based differences that survive tolerance-based comparisons and provide deterministic kill signals regardless of race timing probability.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 4096\n    num_classes = 10\n    \n    # Default: moderate finite loss for all samples\n    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)\n    logits[:, 0] = 5.0   # Target class slightly higher\n    logits[:, 1:] = 0.0  # Other classes\n    # Loss ≈ -5 + log(exp(5) + 9) ≈ 0.01 (very small)\n    \n    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)\n    \n    # Positions 128-255 in each 256-sample block: Inf loss\n    # These are written to shared[128-255] by threads 128-255\n    # Thread 0-127 read these in first reduction stride\n    positions = torch.arange(batch_size, device=device) % 256\n    inf_mask = positions >= 128\n    \n    logits[inf_mask, 0] = float('-inf')  # Target class impossible\n    logits[inf_mask, 1:] = 0.0           # Others finite\n    # Loss = -(-inf) + log(9) = inf\n    \n    return [logits, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 441.38
+}

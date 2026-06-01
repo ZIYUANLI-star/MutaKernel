@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P33__epsilon_modify__0",
+  "operator_name": "epsilon_modify",
+  "kernel_name": "L1_P33",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8214,
+        "completion_tokens": 3976,
+        "total_tokens": 12190,
+        "reasoning_tokens": 1633
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "When input variance approaches 0, inv_std = rsqrt(var + eps). Original: rsqrt(~0 + 1e-5) ≈ 316. Mutant: rsqrt(~0 + 1e-2) = 10. This 31x difference propagates to outputs, exceeding tolerance.",
+      "survival_reason": "The EMD pipeline used random inputs which likely had normal variance (~1.0), where the epsilon difference is negligible. With var≈1, rsqrt(1+1e-5)≈1.0 vs rsqrt(1+1e-2)≈0.995, only 0.5% difference within rtol=1%. However, with carefully constructed near-constant inputs producing tiny variance, the epsilon becomes the dominant term and creates massive output differences.",
+      "killable": true,
+      "kill_strategy": "Run model in training mode (default) with input tensor where all values within each feature channel are nearly identical. This creates near-zero variance, making eps the dominant denominator term and causing 30x+ difference in normalization scale.",
+      "recommendations": "When mutating epsilon parameters in numerical stability guards, test with near-degenerate inputs (zero/tiny variance, near-zero denominators) where epsilon becomes computationally significant rather than just a safety margin.",
+      "suggested_code": "def generate_inputs(device):\n    # Create input with near-constant values per channel\n    # Small variance makes eps dominant in rsqrt(var + eps)\n    # Variance ~(1e-4)^2 = 1e-8, so eps=1e-5 vs 1e-2 hugely matters\n    base = torch.ones(16, 64, 256, 256, device=device)\n    tiny_noise = torch.randn(16, 64, 256, 256, device=device) * 1e-4\n    x = base + tiny_noise\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8108,
+        "completion_tokens": 4870,
+        "total_tokens": 12978,
+        "reasoning_tokens": 2085
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With variance=δ²=1e-6 and |x-mean|=δ=0.001: orig_out=0.001/sqrt(1e-6+1e-5)≈0.301, mut_out=0.001/sqrt(1e-6+1e-2)≈0.01. Diff=0.291 >> tol=0.01+0.01×0.301≈0.013",
+      "survival_reason": "The previous random noise approach had two problems: (1) random Gaussian noise creates values (x-mean) distributed around zero, so many elements had near-zero deviation contributing little to the observable difference, and (2) outliers in the random distribution inflated the actual variance beyond the intended 1e-8, diminishing the relative impact of eps. A deterministic bimodal pattern ensures ALL elements have maximal |x-mean|=δ with precisely controlled variance=δ², maximizing the output difference.",
+      "killable": true,
+      "kill_strategy": "Use deterministic bimodal input pattern where half spatial elements equal +δ and half equal -δ, giving mean=0, variance=δ², and |x-mean|=δ for ALL elements. With δ=0.001, the ~30x difference in normalization scale produces output difference far exceeding tolerance.",
+      "recommendations": "When testing numerical stability parameters like epsilon, use deterministic structured inputs rather than random noise to ensure precise control over variance and maximize the observable impact of the parameter difference.",
+      "suggested_code": "def generate_inputs(device):\n    delta = 0.001\n    x = torch.zeros(16, 64, 256, 256, device=device)\n    # Create exact bimodal pattern: half +delta, half -delta\n    # This gives mean=0, variance=delta^2=1e-6\n    x[:, :, :, :128] = delta   # First half of width\n    x[:, :, :, 128:] = -delta  # Second half of width\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8353,
+        "completion_tokens": 4958,
+        "total_tokens": 13311,
+        "reasoning_tokens": 2194
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With variance δ²=1e-4 (δ=0.01): original inv_std=1/sqrt(1e-4+1e-5)≈95.2, mutant inv_std=1/sqrt(1e-4+1e-2)≈9.95. For |x-mean|=δ=0.01: original output≈0.952, mutant output≈0.0995. Difference≈0.85 >> tolerance≈0.011.",
+      "survival_reason": "Previous attempts used very small δ values (1e-4, 1e-3) which may have encountered floating-point precision issues during variance computation in the CUDA kernel, especially with the two-pass formula sqsum/n - mean². With δ=0.001, the variance 1e-6 is near single-precision limits. Also, testing might inadvertently run in eval mode where running_var=1 dominates eps. Using larger δ=0.01 provides variance=1e-4 which is more numerically stable while still being dominated by eps difference (1e-5 vs 1e-2), producing clear ~10x scale difference in outputs that far exceeds tolerance.",
+      "killable": true,
+      "kill_strategy": "Use bimodal input with moderate magnitude δ=0.01 to ensure variance=1e-4 is numerically stable yet still small enough that eps difference matters. The 9.5x scaling difference produces output differences of ~0.85 which far exceeds the tolerance of ~0.011.",
+      "recommendations": "When testing eps-sensitive mutations, use moderate magnitudes (0.01 range) rather than extreme values (1e-4) to avoid floating-point precision issues in variance computation, while ensuring variance remains small enough to be dominated by eps differences.",
+      "suggested_code": "def generate_inputs(device):\n    delta = 0.01\n    x = torch.empty(16, 64, 256, 256, device=device)\n    # Create checkerboard pattern for numerical stability\n    # Half elements = +delta, half = -delta\n    # Mean = 0, Variance = delta^2 = 1e-4\n    x.fill_(delta)\n    x[:, :, ::2, :] = -delta  # Alternate rows negative\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8589,
+        "completion_tokens": 6025,
+        "total_tokens": 14614,
+        "reasoning_tokens": 2444
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With δ=1e-3: var=1e-6, scale_orig=1/sqrt(1.1e-5)≈301.5, scale_mut=1/sqrt(1.001e-2)≈10. Output diff = δ×(301.5-10) = 0.29 >> tolerance(0.013)",
+      "survival_reason": "Previous attempts failed because either (x-mean)≈0 when variance was tiny (Round 1), or δ was too large making variance comparable to eps_mut (Rounds 2-3). Using δ=1e-3 balances having variance (1e-6) much smaller than eps_mut (1e-2) while keeping |x-mean|=1e-3 large enough that the 30x scaling difference produces output difference of ~0.29, far exceeding the tolerance of ~0.013.",
+      "killable": true,
+      "kill_strategy": "Use bimodal input with δ=1e-3 creating variance=1e-6, maximizing the ratio of (var+eps_mut)/(var+eps_orig) ≈ 1000, giving ~30x scaling difference that propagates through non-zero (x-mean) values.",
+      "recommendations": "Epsilon mutation tests should use inputs with variance several orders of magnitude smaller than the larger epsilon value, while ensuring (x - mean) remains numerically significant. Test with variance in range [1e-8, 1e-6] when comparing eps=1e-5 vs eps=1e-2.",
+      "suggested_code": "def generate_inputs(device):\n    delta = 1e-3\n    x = torch.empty(16, 64, 256, 256, device=device)\n    x.fill_(delta)\n    x[:, :, :, ::2] = -delta  # Every other column is negative\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8785,
+        "completion_tokens": 5937,
+        "total_tokens": 14722,
+        "reasoning_tokens": 2451
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With var=0.01 (delta=0.1 bimodal), scale_orig=9.995, scale_mut=7.07. Output diff=0.1*(9.995-7.07)=0.29. Tolerance=0.01+0.01*1.0=0.02. Since 0.29>0.02, mutation is detectable.",
+      "survival_reason": "Previous attempts used very small delta values (1e-3 to 1e-4) which either produced tiny absolute outputs swamped by atol, or the testing framework ran in eval mode where running_var=1 makes eps differences negligible (~0.5% < 1% rtol). Using delta=0.1 creates variance=0.01 where eps=1e-2 adds 100% to denominator while eps=1e-5 adds only 0.1%, yielding 41% output difference that overwhelms both tolerances.",
+      "killable": true,
+      "kill_strategy": "Use bimodal input with delta=0.1 (variance=0.01) where eps difference causes 41% scale difference, producing output difference 0.29 which exceeds tolerance 0.02.",
+      "recommendations": "Test batch normalization kernels with controlled variance inputs spanning multiple orders of magnitude (1e-6 to 1.0) to ensure eps parameter sensitivity is properly validated across both training and inference modes.",
+      "suggested_code": "def generate_inputs(device):\n    delta = 0.1\n    x = torch.empty(16, 64, 256, 256, device=device)\n    # Create bimodal: mean=0, variance=delta^2=0.01\n    # Half width = +delta, half width = -delta\n    x[:, :, :, :128] = delta\n    x[:, :, :, 128:] = -delta\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 450.5
+}

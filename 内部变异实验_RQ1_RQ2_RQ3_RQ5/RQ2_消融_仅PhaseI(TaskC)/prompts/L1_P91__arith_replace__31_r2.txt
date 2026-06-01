@@ -1,0 +1,456 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized reverse cumulative sum
+reverse_cumsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void reverse_cumsum_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    // Each thread handles one inner element across the entire dimension
+    const int64_t outer_idx = blockIdx.y;
+    const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+    
+    const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+    
+    // Direct computation without shared memory overhead
+    scalar_t sum = 0;
+    
+    // Process in reverse order for cumulative sum
+    for (int64_t dim_idx = dim_size - 1; dim_idx >= 0; --dim_idx) {
+        const int64_t input_offset = base_offset + dim_idx * inner_size;
+        sum += input[input_offset];
+        output[input_offset] = sum;
+    }
+}
+
+template<typename scalar_t>
+__global__ void reverse_cumsum_kernel_unrolled(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    const int64_t outer_idx = blockIdx.y;
+    const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+    
+    const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+    
+    scalar_t sum = 0;
+    int64_t dim_idx = dim_size - 1;
+    
+    // Unroll by 4 for better instruction-level parallelism
+    for (; dim_idx >= 3; dim_idx -= 4) {
+        const int64_t offset0 = base_offset + dim_idx * inner_size;
+        const int64_t offset1 = base_offset + (dim_idx - 1) * inner_size;
+        const int64_t offset2 = base_offset + (dim_idx - 2) * inner_size;
+        const int64_t offset3 = base_offset + (dim_idx - 3) * inner_size;
+        
+        const scalar_t val0 = input[offset0];
+        const scalar_t val1 = input[offset1];
+        const scalar_t val2 = input[offset2];
+        const scalar_t val3 = input[offset3];
+        
+        sum += val0;
+        output[offset0] = sum;
+        
+        sum += val1;
+        output[offset1] = sum;
+        
+        sum += val2;
+        output[offset2] = sum;
+        
+        sum += val3;
+        output[offset3] = sum;
+    }
+    
+    // Handle remaining elements
+    for (; dim_idx >= 0; --dim_idx) {
+        const int64_t offset = base_offset + dim_idx * inner_size;
+        sum += input[offset];
+        output[offset] = sum;
+    }
+}
+
+torch::Tensor reverse_cumsum_cuda_optimized(torch::Tensor input, int64_t dim) {
+    auto input_contiguous = input.contiguous();
+    auto output = torch::empty_like(input_contiguous);
+    
+    const int64_t ndim = input_contiguous.dim();
+    dim = dim < 0 ? ndim + dim : dim;
+    
+    // Calculate sizes
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= input_contiguous.size(i);
+    }
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) {
+        inner_size *= input_contiguous.size(i);
+    }
+    
+    const int64_t dim_size = input_contiguous.size(dim);
+    
+    // Configure kernel launch
+    const int block_size = 256;
+    const int grid_x = (inner_size + block_size - 1) / block_size;
+    const dim3 grid(grid_x, outer_size);
+    
+    AT_DISPATCH_FLOATING_TYPES(
+        input_contiguous.scalar_type(),
+        "reverse_cumsum_cuda_optimized",
+        ([&] {
+            if (dim_size >= 32) {
+                // Use unrolled kernel for better performance
+                reverse_cumsum_kernel_unrolled<scalar_t><<<grid, block_size>>>(
+                    input_contiguous.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    outer_size,
+                    dim_size,
+                    inner_size
+                );
+            } else {
+                // Use simple kernel for small dimensions
+                reverse_cumsum_kernel<scalar_t><<<grid, block_size>>>(
+                    input_contiguous.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    outer_size,
+                    dim_size,
+                    inner_size
+                );
+            }
+        })
+    );
+    
+    return output;
+}
+"""
+
+reverse_cumsum_cpp_source = """
+torch::Tensor reverse_cumsum_cuda_optimized(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+reverse_cumsum_module = load_inline(
+    name="reverse_cumsum_optimized",
+    cpp_sources=reverse_cumsum_cpp_source,
+    cuda_sources=reverse_cumsum_source,
+    functions=["reverse_cumsum_cuda_optimized"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a reverse cumulative sum operation 
+    using a streamlined custom CUDA kernel.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the reverse cumulative sum.
+    """
+
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.reverse_cumsum = reverse_cumsum_module
+
+    def forward(self, x):
+        # Use optimized CUDA kernel
+        return self.reverse_cumsum.reverse_cumsum_cuda_optimized(x, self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized reverse cumulative sum
+reverse_cumsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void reverse_cumsum_kernel(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    // Each thread handles one inner element across the entire dimension
+    const int64_t outer_idx = blockIdx.y;
+    const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+    
+    const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+    
+    // Direct computation without shared memory overhead
+    scalar_t sum = 0;
+    
+    // Process in reverse order for cumulative sum
+    for (int64_t dim_idx = dim_size - 1; dim_idx >= 0; --dim_idx) {
+        const int64_t input_offset = base_offset + dim_idx * inner_size;
+        sum += input[input_offset];
+        output[input_offset] = sum;
+    }
+}
+
+template<typename scalar_t>
+__global__ void reverse_cumsum_kernel_unrolled(
+    const scalar_t* __restrict__ input,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    const int64_t outer_idx = blockIdx.y;
+    const int64_t inner_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (outer_idx >= outer_size || inner_idx >= inner_size) return;
+    
+    const int64_t base_offset = outer_idx * dim_size * inner_size + inner_idx;
+    
+    scalar_t sum = 0;
+    int64_t dim_idx = dim_size - 1;
+    
+    // Unroll by 4 for better instruction-level parallelism
+    for (; dim_idx >= 3; dim_idx -= 4) {
+        const int64_t offset0 = base_offset + dim_idx * inner_size;
+        const int64_t offset1 = base_offset + (dim_idx - 1) * inner_size;
+        const int64_t offset2 = base_offset + (dim_idx - 2) * inner_size;
+        const int64_t offset3 = base_offset + (dim_idx - 3) * inner_size;
+        
+        const scalar_t val0 = input[offset0];
+        const scalar_t val1 = input[offset1];
+        const scalar_t val2 = input[offset2];
+        const scalar_t val3 = input[offset3];
+        
+        sum += val0;
+        output[offset0] = sum;
+        
+        sum += val1;
+        output[offset1] = sum;
+        
+        sum += val2;
+        output[offset2] = sum;
+        
+        sum += val3;
+        output[offset3] = sum;
+    }
+    
+    // Handle remaining elements
+    for (; dim_idx >= 0; --dim_idx) {
+        const int64_t offset = base_offset + dim_idx * inner_size;
+        sum += input[offset];
+        output[offset] = sum;
+    }
+}
+
+torch::Tensor reverse_cumsum_cuda_optimized(torch::Tensor input, int64_t dim) {
+    auto input_contiguous = input.contiguous();
+    auto output = torch::empty_like(input_contiguous);
+    
+    const int64_t ndim = input_contiguous.dim();
+    dim = dim < 0 ? ndim + dim : dim;
+    
+    // Calculate sizes
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; ++i) {
+        outer_size *= input_contiguous.size(i);
+    }
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < ndim; ++i) {
+        inner_size *= input_contiguous.size(i);
+    }
+    
+    const int64_t dim_size = input_contiguous.size(dim);
+    
+    // Configure kernel launch
+    const int block_size = 256;
+    const int grid_x = (inner_size + block_size - 1) * block_size;
+    const dim3 grid(grid_x, outer_size);
+    
+    AT_DISPATCH_FLOATING_TYPES(
+        input_contiguous.scalar_type(),
+        "reverse_cumsum_cuda_optimized",
+        ([&] {
+            if (dim_size >= 32) {
+                // Use unrolled kernel for better performance
+                reverse_cumsum_kernel_unrolled<scalar_t><<<grid, block_size>>>(
+                    input_contiguous.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    outer_size,
+                    dim_size,
+                    inner_size
+                );
+            } else {
+                // Use simple kernel for small dimensions
+                reverse_cumsum_kernel<scalar_t><<<grid, block_size>>>(
+                    input_contiguous.data_ptr<scalar_t>(),
+                    output.data_ptr<scalar_t>(),
+                    outer_size,
+                    dim_size,
+                    inner_size
+                );
+            }
+        })
+    );
+    
+    return output;
+}
+"""
+
+reverse_cumsum_cpp_source = """
+torch::Tensor reverse_cumsum_cuda_optimized(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+reverse_cumsum_module = load_inline(
+    name="reverse_cumsum_optimized",
+    cpp_sources=reverse_cumsum_cpp_source,
+    cuda_sources=reverse_cumsum_source,
+    functions=["reverse_cumsum_cuda_optimized"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a reverse cumulative sum operation 
+    using a streamlined custom CUDA kernel.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the reverse cumulative sum.
+    """
+
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.reverse_cumsum = reverse_cumsum_module
+
+    def forward(self, x):
+        # Use optimized CUDA kernel
+        return self.reverse_cumsum.reverse_cumsum_cuda_optimized(x, self.dim)
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 110
+- Original fragment: `/`
+- node_type: cuda_Div
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[128, 4000], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 110
+- Original fragment: `/`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Error: worker_timeout_or_crash
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Any input values will expose the difference because the mutation causes an execution failure (timeout or crash) regardless of input values. The test framework will detect either a crash or that the uninitialized output differs from the correctly computed reference.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.randn(128, 4000, device=device, dtype=torch.float32)
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

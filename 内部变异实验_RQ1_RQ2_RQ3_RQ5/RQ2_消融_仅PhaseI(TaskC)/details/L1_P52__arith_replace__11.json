@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P52__arith_replace__11",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P52",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7708,
+        "completion_tokens": 4775,
+        "total_tokens": 12483,
+        "reasoning_tokens": 1896
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "For dim=2: spatial_idx ∈ [0,255], cols=256. Original computes spatial_idx*256 (0 to 65280), mutant computes spatial_idx/256 (always 0). All threads read row 0 instead of their assigned row.",
+      "survival_reason": "Layer 2 testing likely used dim=1 or dim=0, not dim=2, causing the mutated branch to never execute. Alternatively, random data coincidentally had identical argmin columns across all rows (extremely improbable for 112 seeds). The mutation fundamentally changes the memory access pattern, making all threads in a batch read from row 0 instead of their respective rows when dim=2 is used.",
+      "killable": true,
+      "kill_strategy": "Create a tensor where row i has its minimum value at column i. The original kernel will find argmin(row i) = i, while the mutant reads row 0 for all rows, outputting 0 everywhere. This creates differences of magnitude 1-255 for rows 1-255.",
+      "recommendations": "Mutation testing for GPU kernels should systematically test all branches (dim=0,1,2) independently, not just a single configuration. Index arithmetic mutations in CUDA kernels should trigger targeted tests with distinguishable per-element patterns.",
+      "suggested_code": "def generate_inputs(device):\n    batch, rows, cols = 16, 256, 256\n    # Start with uniform large values\n    x = torch.ones((batch, rows, cols), dtype=torch.float32, device=device) * 100.0\n    # Place minimum at diagonal: row i has minimum at column i\n    for row_idx in range(rows):\n        x[:, row_idx, row_idx] = -100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7584,
+        "completion_tokens": 4200,
+        "total_tokens": 11784,
+        "reasoning_tokens": 1625
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation on line 66 is inside `if (dim == 2)` branch. For input [16,256,256] with dim=1, kernel launches with grid(batch=16, (cols+255)/256) and executes the `else if (dim == 1)` branch instead. The mutated line `spatial_idx / cols` is never reached. 112 bitwise-identical rounds + failed diagonal test proves dim != 2.",
+      "survival_reason": "The mutation changes `spatial_idx * cols` to `spatial_idx / cols` in the dim==2 branch. For spatial_idx ∈ [0,255] and cols=256, the original computes offsets [0,256,512,...,65280] pointing to different rows, while the mutant computes [0,0,0,...,0] always pointing to row 0. This would cause massive output differences if executed. However, 112 rounds of exact bitwise matching and a targeted diagonal-minimum test both passed, proving the dim==2 branch is never entered. The test configuration uses dim=1 (or dim=0), making the mutation unreachable via value changes alone.",
+      "killable": false,
+      "kill_strategy": "Unkillable with value changes. The mutation is in a conditional branch (dim==2) that is not triggered by the current model configuration. Requires changing the model's dim parameter from 1 to 2 during initialization.",
+      "recommendations": "Mutation testing should ensure all conditional branches (especially dimension-specific code paths like dim=0/1/2) are covered by varying model configuration parameters, not just input values. Consider generating separate test cases for each valid dim value to achieve full branch coverage.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 221.48
+}

@@ -1,0 +1,230 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio):
+        """
+        MBConv block implementation.
+
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param kernel_size: Kernel size for the depthwise convolution.
+        :param stride: Stride for the depthwise convolution.
+        :param expand_ratio: Expansion ratio for the intermediate channels.
+        """
+        super(Model, self).__init__()
+        
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+        hidden_dim = in_channels * expand_ratio
+        
+        if expand_ratio != 1:
+            self.expand_conv = nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.ReLU6(inplace=True)
+            )
+        
+        self.depthwise_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride, padding=(kernel_size-1)//2, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.ReLU6(inplace=True)
+        )
+        
+        self.project_conv = nn.Sequential(
+            nn.Conv2d(hidden_dim, out_channels, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(out_channels)
+        )
+    
+    def forward(self, x):
+        """
+        Forward pass of the MBConv block.
+
+        :param x: The input tensor, shape (batch_size, in_channels, H, W)
+        :return: The output tensor, shape (batch_size, out_channels, H', W')
+        """
+        identity = x
+        
+        if hasattr(self, 'expand_conv'):
+            x = self.expand_conv(x)
+        
+        x = self.depthwise_conv(x)
+        x = self.project_conv(x)
+        
+        if self.use_residual:
+            x += identity
+        
+        return x
+
+# Test code
+batch_size = 10
+in_channels = 112
+out_channels = 192
+kernel_size = 5
+stride = 2
+expand_ratio = 6
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, 224, 224)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, expand_ratio]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride, expand_ratio):
+        """
+        MBConv block implementation optimized for PyTorch compilation.
+
+        :param in_channels: Number of input channels.
+        :param out_channels: Number of output channels.
+        :param kernel_size: Kernel size for the depthwise convolution.
+        :param stride: Stride for the depthwise convolution.
+        :param expand_ratio: Expansion ratio for the intermediate channels.
+        """
+        super(ModelNew, self).__init__()
+        
+        self.use_residual = (stride == 1 and in_channels == out_channels)
+        hidden_dim = in_channels * expand_ratio
+        
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        if expand_ratio != 1:
+            self.expand_conv = nn.Sequential()
+            self.expand_conv._modules['0'] = nn.Conv2d(in_channels, hidden_dim, kernel_size=1, stride=1, padding=0, bias=False)
+            self.expand_conv._modules['1'] = nn.BatchNorm2d(hidden_dim)
+            self.expand_conv._modules['2'] = nn.ReLU6(inplace=True)
+        
+        self.depthwise_conv = nn.Sequential()
+        self.depthwise_conv._modules['0'] = nn.Conv2d(hidden_dim, hidden_dim, kernel_size=kernel_size, stride=stride, padding=(kernel_size-1)//2, groups=hidden_dim, bias=False)
+        self.depthwise_conv._modules['1'] = nn.BatchNorm2d(hidden_dim)
+        self.depthwise_conv._modules['2'] = nn.ReLU6(inplace=True)
+        
+        self.project_conv = nn.Sequential()
+        self.project_conv._modules['0'] = nn.Conv2d(hidden_dim, out_channels, kernel_size=1, stride=1, padding=0, bias=False)
+        self.project_conv._modules['1'] = nn.BatchNorm2d(out_channels)
+    
+    @torch.compile(backend='inductor')
+    def forward(self, x):
+        """
+        Forward pass of the MBConv block.
+
+        :param x: The input tensor, shape (batch_size, in_channels, H, W)
+        :return: The output tensor, shape (batch_size, out_channels, H', W')
+        """
+        identity = x
+        
+        # Expand convolution
+        if hasattr(self, 'expand_conv'):
+            # 1x1 convolution with TF32
+            weight = self.expand_conv._modules['0'].weight
+            x = torch.conv2d(x, weight, None, stride=1, padding=0)
+            
+            # Batch norm + relu6 fusion
+            bn_weight = self.expand_conv._modules['1'].weight
+            bn_bias = self.expand_conv._modules['1'].bias
+            bn_running_mean = self.expand_conv._modules['1'].running_mean
+            bn_running_var = self.expand_conv._modules['1'].running_var
+            bn_eps = self.expand_conv._modules['1'].eps
+            
+            # Calculate batch norm constants once per channel
+            inv_std = torch.rsqrt(bn_running_var + bn_eps)
+            gamma = bn_weight * inv_std
+            beta = bn_bias - bn_weight * inv_std * bn_running_mean
+            
+            # Apply batch norm and relu6
+            x = x * gamma[:, None, None] + beta[:, None, None]
+            x = x.clamp_min(0.0).clamp_max(6.0)
+        
+        # Depthwise convolution
+        dw_weight = self.depthwise_conv._modules['0'].weight
+        x = torch.conv2d(x, dw_weight, None, stride=2, padding=2, groups=672)
+        
+        # Batch norm + relu6 fusion
+        bn_weight = self.depthwise_conv._modules['1'].weight
+        bn_bias = self.depthwise_conv._modules['1'].bias
+        bn_running_mean = self.depthwise_conv._modules['1'].running_mean
+        bn_running_var = self.depthwise_conv._modules['1'].running_var
+        bn_eps = self.depthwise_conv._modules['1'].eps
+        
+        inv_std = torch.rsqrt(bn_running_var + bn_eps)
+        gamma = bn_weight * inv_std
+        beta = bn_bias - bn_weight * inv_std * bn_running_mean
+        
+        x = x * gamma[:, None, None] + beta[:, None, None]
+        x = x.clamp_min(0.0).clamp_max(6.0)
+        
+        # Project convolution
+        proj_weight = self.project_conv._modules['0'].weight
+        x = torch.conv2d(x, proj_weight, None, stride=1, padding=0)
+        
+        # Batch norm
+        bn_weight = self.project_conv._modules['1'].weight
+        bn_bias = self.project_conv._modules['1'].bias
+        bn_running_mean = self.project_conv._modules['1'].running_mean
+        bn_running_var = self.project_conv._modules['1'].running_var
+        bn_eps = self.project_conv._modules['1'].eps
+        
+        inv_std = torch.rsqrt(bn_running_var + bn_eps)
+        gamma = bn_weight * inv_std
+        beta = bn_bias - bn_weight * inv_std * bn_running_mean
+        
+        x = x * gamma[:, None, None] + beta[:, None, None]
+        
+        # Residual connection - not used here as stride=2
+        if self.use_residual:
+            x += identity
+        
+        return x
+
+# Enable TF32 globally
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 38
+Failing dimensions: training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### training_stress (38 failures)
+  - [large_magnitude seed=70000] max_diff=4.094545e+00, mean_diff=6.026500e-01, ref_range=[-5.4122e+00,5.3769e+00], orig_range=[-2.9030e+00,2.7421e+00]
+  - [large_magnitude seed=70001] max_diff=4.306349e+00, mean_diff=6.136405e-01, ref_range=[-5.3448e+00,5.8257e+00], orig_range=[-2.5052e+00,2.8539e+00]
+  - [near_zero seed=70004] max_diff=1.101720e+00, mean_diff=1.623244e-01, ref_range=[-1.1017e+00,1.0715e+00], orig_range=[-1.6046e-04,1.1442e-04]
+  - [near_zero seed=70005] max_diff=1.093318e+00, mean_diff=1.623015e-01, ref_range=[-1.0933e+00,1.0913e+00], orig_range=[-1.0282e-04,1.0897e-04]
+  - [all_negative seed=70008] max_diff=5.522590e+00, mean_diff=8.166292e-01, ref_range=[-5.3933e+00,5.6595e+00], orig_range=[-3.3332e+00,2.9986e+00]
+  - [all_negative seed=70009] max_diff=5.625318e+00, mean_diff=8.444478e-01, ref_range=[-5.8734e+00,5.8510e+00], orig_range=[-3.7890e+00,3.4532e+00]
+  - [all_positive seed=70010] max_diff=5.961730e+00, mean_diff=8.287483e-01, ref_range=[-5.2168e+00,5.7315e+00], orig_range=[-2.9664e+00,3.8977e+00]
+  - [all_positive seed=70011] max_diff=5.612498e+00, mean_diff=8.027768e-01, ref_range=[-5.2150e+00,5.4186e+00], orig_range=[-3.3048e+00,3.3253e+00]
+  ... and 30 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

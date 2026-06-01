@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P97__const_perturb__0",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P97",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5529,
+        "completion_tokens": 4947,
+        "total_tokens": 10476,
+        "reasoning_tokens": 1798
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original stride sequence (128→64→32) correctly reduces 256 threads. Mutant stride sequence (85→42→stops at 21<32) only accumulates values from threads {i, i+42, i+85, i+127} for positions 0-31, missing 128 threads (32-41, 74-84, 117-126, 159-255). Half of all feature data is excluded from dot product and norm calculations.",
+      "survival_reason": "The mutation changes the initial stride from 256/2=128 to 256/3=85. This causes the block-level reduction to terminate prematurely (stride=21 fails the >=32 condition), leaving threads 32-41, 74-84, 117-126, and 159-255 completely unaccumulated. The warp-level reduction only operates on threads 0-31, which now contain incomplete sums. The final cosine similarity is computed from only half the feature values, producing incorrect dot products and norms for each batch element.",
+      "killable": true,
+      "kill_strategy": "Use any non-trivial random input. The mutant will compute cosine similarity using only ~50% of feature values per batch, causing significant numerical divergence. Values in thread indices 159-255 (feature indices like tid*4+base for base in {0,1024,2048,3072}) are completely ignored by the mutant.",
+      "recommendations": "Parallel reduction loop bounds should be validated against thread block size. The invariant stride=THREADS/2 and halving must maintain coverage of all threads before transitioning to warp-level reduction at stride=32.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    predictions = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.randn(128, 4096, device=device, dtype=torch.float32)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5381,
+        "completion_tokens": 4685,
+        "total_tokens": 10066,
+        "reasoning_tokens": 1826
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With random data, the ignored threads contribute proportionally to dot_product, pred_norm, and target_norm. Since cosine_sim = dot/(sqrt(pred_norm)*sqrt(target_norm)), halving all three still gives the same ratio. We need asymmetric contributions where included vs ignored threads contribute differently to the numerator vs denominator.",
+      "survival_reason": "The previous random input failed because cosine similarity is scale-invariant. When the mutant uses only half the threads (due to flawed reduction stride=85,42 instead of 128,64,32), it misses threads 32-41, 74-84, 117-126, and 159-255. With uniform random data, the missed half contributes proportionally to all three sums (dot, pred_norm, target_norm), so the cosine ratio remains approximately unchanged. To kill, we must make ignored threads contribute oppositely to included threads in the dot product while keeping norms similar.",
+      "killable": true,
+      "kill_strategy": "Set predictions=1 everywhere, but targets=+1 for included thread indices and targets=-1 for ignored thread indices. Original sees dot=0 (positive and negative cancel), cosine_sim=0, loss=1. Mutant sees only positive contributions: dot=2048, pred_norm=2048, target_norm=2048, cosine_sim=1, loss=0. Difference is 1.0, far exceeding tolerance.",
+      "recommendations": "When testing parallel reduction kernels, always verify with structured inputs where different thread ranges contribute opposing values, not just random data that maintains statistical invariants.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    \n    # Ignored thread ids from faulty reduction (stride=85,42 misses these)\n    ignored_tids = list(range(32, 42)) + list(range(74, 85)) + list(range(117, 127)) + list(range(159, 256))\n    \n    # Each thread tid processes indices: base + tid*4 + i, for base in {0,1024,2048,3072}, i in {0,1,2,3}\n    for tid in ignored_tids:\n        for base in [0, 1024, 2048, 3072]:\n            for i in range(4):\n                idx = base + tid * 4 + i\n                if idx < 4096:\n                    targets[:, idx] = -1.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.000000e+00, mean_diff=1.000000e+00, ref_range=[1.0000e+00,1.0000e+00], mut_range=[-1.1921e-07,-1.1921e-07]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Set predictions=1 everywhere, but targets=+1 for included thread indices and targets=-1 for ignored thread indices. Original sees dot=0 (positive and negative cancel), cosine_sim=0, loss=1. Mutant sees only positive contributions: dot=2048, pred_norm=2048, target_norm=2048, cosine_sim=1, loss=0. Difference is 1.0, far exceeding tolerance.",
+    "suggested_code": "def generate_inputs(device):\n    predictions = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.ones(128, 4096, device=device, dtype=torch.float32)\n    \n    # Ignored thread ids from faulty reduction (stride=85,42 misses these)\n    ignored_tids = list(range(32, 42)) + list(range(74, 85)) + list(range(117, 127)) + list(range(159, 256))\n    \n    # Each thread tid processes indices: base + tid*4 + i, for base in {0,1024,2048,3072}, i in {0,1,2,3}\n    for tid in ignored_tids:\n        for base in [0, 1024, 2048, 3072]:\n            for i in range(4):\n                idx = base + tid * 4 + i\n                if idx < 4096:\n                    targets[:, idx] = -1.0\n    \n    return [predictions, targets]"
+  },
+  "elapsed_sec": 191.96
+}

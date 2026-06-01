@@ -1,0 +1,254 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a GEMM (general matrix multiplication), applies scaling, 
+    and then batch normalization.
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x):
+        x = self.gemm(x)
+        x = x * self.scale
+        x = self.bn(x)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+scale_shape = (out_features,)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, scale_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_scale_batchnorm.cu ===
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void fused_scale_batchnorm_kernel(
+    const float* gemm_out,
+    const float* scale,
+    const float* bn_weight,
+    const float* bn_bias,
+    const float* running_mean,
+    const float* running_var,
+    float eps,
+    float* output) {
+    
+    int idx = blockIdx.x * 128 + threadIdx.x;
+    int batch_size = 1024;
+    int features = 8192;
+
+    if (idx < batch_size * features) {
+        int feature = idx % features;
+
+        float x = gemm_out[idx] * scale[feature];
+        float mean = running_mean[feature];
+        float var = running_var[feature];
+        float gamma = bn_weight[feature];
+        float beta = bn_bias[feature];
+
+        float inv_std = rsqrt(var + eps);
+        float val = gamma * (x - mean) * inv_std + beta;
+
+        output[idx] = val;
+    }
+}
+
+extern "C" void fused_scale_batchnorm_launcher(
+    const float* gemm_out,
+    const float* scale,
+    const float* bn_weight,
+    const float* bn_bias,
+    const float* running_mean,
+    const float* running_var,
+    float eps,
+    float* output,
+    cudaStream_t stream) {
+    
+    int blocks = (1024 * 8192 + 128 - 1) / 128;
+    fused_scale_batchnorm_kernel<<<blocks, 128, 0, stream>>>(
+        gemm_out, scale, bn_weight, bn_bias, running_mean, running_var, eps, output
+    );
+}
+
+"""
+
+_cpp_sources = """
+// === fused_scale_batchnorm_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_scale_batchnorm_launcher(
+    const float* gemm_out,
+    const float* scale,
+    const float* bn_weight,
+    const float* bn_bias,
+    const float* running_mean,
+    const float* running_var,
+    float eps,
+    float* output,
+    cudaStream_t stream);
+
+torch::Tensor fused_scale_batchnorm_forward(
+    torch::Tensor gemm_out,
+    torch::Tensor scale,
+    torch::Tensor bn_weight,
+    torch::Tensor bn_bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var,
+    float eps) {
+
+    TORCH_CHECK(gemm_out.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(scale.is_cuda(), "Scale must be a CUDA tensor");
+    TORCH_CHECK(bn_weight.is_cuda(), "BN weight must be a CUDA tensor");
+    TORCH_CHECK(bn_bias.is_cuda(), "BN bias must be a CUDA tensor");
+    TORCH_CHECK(running_mean.is_cuda(), "Running mean must be a CUDA tensor");
+    TORCH_CHECK(running_var.is_cuda(), "Running var must be a CUDA tensor");
+
+    auto output = torch::empty_like(gemm_out);
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    fused_scale_batchnorm_launcher(
+        gemm_out.data_ptr<float>(),
+        scale.data_ptr<float>(),
+        bn_weight.data_ptr<float>(),
+        bn_bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        eps,
+        output.data_ptr<float>(),
+        stream
+    );
+
+    return output;
+}
+
+void register_fused_scale_batchnorm(pybind11::module& m) {
+    m.def("fused_scale_batchnorm_forward", &fused_scale_batchnorm_forward,
+          "Fused scale and batch normalization forward",
+          py::arg("gemm_out"),
+          py::arg("scale"),
+          py::arg("bn_weight"),
+          py::arg("bn_bias"),
+          py::arg("running_mean"),
+          py::arg("running_var"),
+          py::arg("eps"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_scale_batchnorm_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that uses TF32 for GEMM and fused scaling + batch normalization.
+    """
+    def __init__(self, in_features, out_features, scale_shape, eps=1e-5, momentum=0.1):
+        super(ModelNew, self).__init__()
+        # Initialize parameters to preserve state_dict compatibility
+        self.gemm = nn.Linear(in_features, out_features)
+        self.scale = nn.Parameter(torch.randn(scale_shape))
+        self.bn = nn.BatchNorm1d(out_features, eps=eps, momentum=momentum)
+
+    def forward(self, x):
+        # Enable TF32 for faster GEMM
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Step 1: GEMM using PyTorch's optimized implementation with TF32
+        x = torch.addmm(self.gemm.bias, x, self.gemm.weight.T)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # Step 2: Fused scaling and batch normalization
+        x = cuda_extension.fused_scale_batchnorm_forward(
+            x, self.scale, self.bn.weight, self.bn.bias,
+            self.bn.running_mean, self.bn.running_var, self.bn.eps
+        )
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 68
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=2.771484e+00, mean_diff=1.098388e-01, ref_range=[-7.7518e+03,7.9034e+03], orig_range=[-7.7528e+03,7.9033e+03]
+  - [large_magnitude seed=50001] max_diff=3.237839e+00, mean_diff=1.100604e-01, ref_range=[-7.9808e+03,7.6396e+03], orig_range=[-7.9805e+03,7.6385e+03]
+  - [near_overflow seed=50002] max_diff=2.364659e+27, mean_diff=1.110201e+26, ref_range=[-7.6789e+30,7.5790e+30], orig_range=[-7.6780e+30,7.5787e+30]
+  - [near_overflow seed=50003] max_diff=2.607445e+27, mean_diff=1.091197e+26, ref_range=[-8.7775e+30,8.3085e+30], orig_range=[-8.7768e+30,8.3078e+30]
+  - [all_negative seed=50008] max_diff=2.337189e-01, mean_diff=1.104821e-02, ref_range=[-7.4749e+02,6.7876e+02], orig_range=[-7.4745e+02,6.7874e+02]
+  - [all_negative seed=50009] max_diff=2.568207e-01, mean_diff=1.106868e-02, ref_range=[-6.4331e+02,7.5219e+02], orig_range=[-6.4325e+02,7.5210e+02]
+  - [all_positive seed=50010] max_diff=2.037926e-01, mean_diff=1.101374e-02, ref_range=[-6.2951e+02,7.7604e+02], orig_range=[-6.2958e+02,7.7608e+02]
+  - [all_positive seed=50011] max_diff=2.393494e-01, mean_diff=1.082291e-02, ref_range=[-8.2353e+02,8.0633e+02], orig_range=[-8.2357e+02,8.0634e+02]
+  ... and 20 more failures
+
+### training_stress (40 failures)
+  - [large_magnitude seed=70000] max_diff=1.195216e+01, mean_diff=1.716420e+00, ref_range=[-4.9951e+00,5.6096e+00], orig_range=[-1.5705e+01,1.7562e+01]
+  - [large_magnitude seed=70001] max_diff=1.233851e+01, mean_diff=1.717212e+00, ref_range=[-5.6946e+00,5.5073e+00], orig_range=[-1.8029e+01,1.7236e+01]
+  - [near_zero seed=70004] max_diff=3.195832e-02, mean_diff=4.146855e-03, ref_range=[-3.4458e-04,2.5387e-04], orig_range=[-3.1785e-02,3.0933e-02]
+  - [near_zero seed=70005] max_diff=3.536240e-02, mean_diff=4.202048e-03, ref_range=[-2.8626e-04,2.4798e-04], orig_range=[-3.5146e-02,2.8056e-02]
+  - [denormals seed=70006] max_diff=3.587029e-02, mean_diff=4.195388e-03, ref_range=[-1.1780e-06,1.1780e-06], orig_range=[-3.5870e-02,3.4078e-02]
+  - [denormals seed=70007] max_diff=2.920705e-02, mean_diff=4.120029e-03, ref_range=[-5.8902e-07,5.8902e-07], orig_range=[-2.9206e-02,2.9013e-02]
+  - [all_negative seed=70008] max_diff=2.256918e+01, mean_diff=3.227611e+00, ref_range=[-5.3678e+00,5.0752e+00], orig_range=[-2.4341e+01,2.6296e+01]
+  - [all_negative seed=70009] max_diff=2.382819e+01, mean_diff=3.223696e+00, ref_range=[-5.2344e+00,5.2087e+00], orig_range=[-2.7405e+01,2.5522e+01]
+  ... and 32 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

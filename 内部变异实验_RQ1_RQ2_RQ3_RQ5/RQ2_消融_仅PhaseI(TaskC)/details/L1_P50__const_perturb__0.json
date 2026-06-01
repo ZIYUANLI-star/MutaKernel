@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P50__const_perturb__0",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P50",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6248,
+        "completion_tokens": 4154,
+        "total_tokens": 10402,
+        "reasoning_tokens": 1500
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "warp_reduce_product uses __shfl_down_sync with offset starting at 16 (original) vs 17 (mutant). With offset=17, lane 0 gets lane 17's value instead of lane 16's; lane 15 squares itself instead of multiplying by lane 31. For reduction_size=256 > 32, the optimized kernel executes, and incorrect warp reduction produces wrong products.",
+      "survival_reason": "The mutant survived some random tests because products of many values close to 1.0 can produce results within tolerance. However, with values that create distinct thread products, the incorrect shuffle pattern produces measurably different results. The mutation fundamentally breaks the binary tree reduction pattern - with offset 17, the first iteration misaligns the reduction lanes, causing lane 16's value to be excluded from the final reduction at lane 0.",
+      "killable": true,
+      "kill_strategy": "Use constant values slightly greater than 1.0 (like 1.5) across the reduction dimension. This ensures each thread computes a substantial product, and the incorrect warp reduction (missing lane 16, duplicating some lanes) produces a clearly different final value that exceeds the tolerance threshold.",
+      "recommendations": "Warp reduction shuffle offsets must follow the exact power-of-2 pattern (16, 8, 4, 2, 1) for correct binary tree reduction. Any deviation breaks the algorithm. Tests should verify reduction correctness with non-trivial values (not just 1.0 or 0.0) to catch shuffle pattern errors.",
+      "suggested_code": "def generate_inputs(device):\n    # Fill with 1.5 to create substantial products\n    # Product of 256 values of 1.5 is huge, but warp reduction\n    # operates on thread_products after the main loop\n    # The shuffle offset difference (16 vs 17) will cause\n    # different thread products to be combined\n    x = torch.full((16, 256, 256), 1.5, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6148,
+        "completion_tokens": 5022,
+        "total_tokens": 11170,
+        "reasoning_tokens": 2189
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes warp shuffle offset from 16 to 17. In original, lane 0 combines with lane 16; in mutant, lane 0 combines with lane 17. If thread 16 and thread 17 have different intermediate products, the final results differ. With reduction_size=256 and block_dim=256, each thread processes exactly one element, so thread i computes input[outer_idx, i, i] (due to the indexing pattern). Setting column 16 to value X and column 17 to value Y where X ≠ Y creates divergent products that get combined differently during the first shuffle step.",
+      "survival_reason": "The previous attempt with all 1.5 values caused overflow (1.5^256 → infinity), making both ref and mutant invalid. The key insight is that each thread handles exactly one reduction element in this configuration, so thread products equal single input values. The mutation affects which thread's value lane 0 combines with during the first shuffle iteration. By setting specific columns (16 vs 17) to different values while keeping others at 1.0, we avoid overflow while creating maximum divergence in the warp reduction path.",
+      "killable": true,
+      "kill_strategy": "Set all values to 1.0 except: input[:, :, 16] = 10.0 and input[:, :, 17] = 0.1. Thread 16 computes product of column 16 (across reduction dim) and thread 17 computes product of column 17. Due to indexing, the products will differ by factor of 100. Original combines lane 0 with lane 16's value (10.0); mutant combines lane 0 with lane 17's value (0.1). The 100x difference propagates through to final output.",
+      "recommendations": "When testing warp shuffle operations, design inputs where adjacent lanes (especially lanes 16 and 17 for warp reductions starting at offset 16) hold markedly different values to expose off-by-one errors in shuffle offsets.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)\n    # Set column 16 and 17 to different values\n    # Thread 16 will have product involving column 16's values\n    # Thread 17 will have product involving column 17's values\n    # Original shuffles lane 0 with lane 16, mutant with lane 17\n    x[:, :, 16] = 10.0  # Makes thread 16's product = 10^256 is too large\n    # Use a single element modification instead to avoid overflow\n    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)\n    x[:, 0, 16] = 100.0   # Thread 16's product = 100.0 * 1^255 = 100.0\n    x[:, 0, 17] = 0.01    # Thread 17's product = 0.01 * 1^255 = 0.01\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6591,
+        "completion_tokens": 4733,
+        "total_tokens": 11324,
+        "reasoning_tokens": 1984
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes warp shuffle offset from 16 to 17. In __shfl_down_sync, lane 0 reads from lane 16 (original) or lane 17 (mutant). Thread 16 computes product of column 16; thread 17 computes product of column 17. Setting column 16's product to 5.0 and column 17's product to 7.0 creates a direct 5.0 vs 7.0 difference in lane 0's first reduction step, which propagates to final output with ~40% relative error.",
+      "survival_reason": "Round 1 failed because 1.5^256 overflows to infinity, causing NaN in both versions. Round 2 attempted to modify columns 16 and 17 but set x[:, 0, 16]=100.0 and x[:, 0, 17]=0.01, which affects threads 16 and 17's products but NOT what thread 0 reads. The key insight is that thread 0 (which writes to output) reads from thread 16 in original (offset=16) vs thread 17 in mutant (offset=17) during the FIRST shuffle. We must ensure threads 16 and 17 have distinct, moderate products that directly affect thread 0's computation.",
+      "killable": true,
+      "kill_strategy": "Set input such that thread 16's product differs from thread 17's product. Thread 0 reads thread 16's value in original (shuffle offset 16) but thread 17's value in mutant (shuffle offset 17). Use moderate values to avoid overflow: x[:, 0, 16] = 5.0, x[:, 0, 17] = 7.0, rest 1.0. This creates 5.0 vs 7.0 initial difference that propagates through the reduction.",
+      "recommendations": "Test warp shuffle-based reductions with inputs where adjacent thread groups have distinct but non-extreme values, specifically targeting the shuffle offset boundaries (e.g., threads 15-17 for offset 16) to catch off-by-one errors in shuffle patterns.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)\n    # Thread i computes product of column i across reduction dim\n    # Thread 0 shuffles with lane 16 (original) or lane 17 (mutant)\n    # Set values so thread 16 product = 5.0, thread 17 product = 7.0\n    x[:, 0, 16] = 5.0  # Thread 16's product will be 5.0\n    x[:, 0, 17] = 7.0  # Thread 17's product will be 7.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6923,
+        "completion_tokens": 6555,
+        "total_tokens": 13478,
+        "reasoning_tokens": 2521
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Lane 15 with offset=17 reads lane 32 (invalid→self), squaring its value. If thread 15 product=2.0: original=2.0, mutant=4.0. |2.0-4.0|=2.0 > 0.01+0.01*4.0=0.05",
+      "survival_reason": "Previous attempts targeted lanes 16/17 which still read valid lanes in the mutant (lanes 17/18). The key difference is lane 15: original reads lane 31 (valid), mutant reads lane 32 (invalid→self-read). When lane 15 has value≠1.0, it squares itself in mutant vs multiplies with lane 31 in original. Rounds 2-3 didn't set column 15, so lane 15 had product=1.0, making 1×1=1=1×1 invisible.",
+      "killable": true,
+      "kill_strategy": "Set column 15 to a non-unity value (2.0) in one row so thread 15's product is 2.0. Mutant squares it (4.0), original multiplies with lane 31's product (2.0×1.0=2.0). The 2× difference exceeds tolerance.",
+      "recommendations": "Test warp shuffle reductions with non-unity values at boundary lanes (15, 16, 31) to catch off-by-one errors in shuffle offsets that cause invalid lane reads to fallback to self-reads.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)\n    # Thread 15 (inner_idx=15) computes product over reduction dim\n    # Mutant's shfl_down(17) makes lane 15 read itself (lane 32 invalid)\n    # Original: 2.0 * 1.0 = 2.0, Mutant: 2.0 * 2.0 = 4.0\n    x[:, 0, 15] = 2.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7193,
+        "completion_tokens": 4782,
+        "total_tokens": 11975,
+        "reasoning_tokens": 2000
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes warp shuffle offset from 16→17. In first shuffle: original lane 0 multiplies by lane 16's product, mutant lane 0 multiplies by lane 17's product. For warp 0 (threads 0-31), if thread_16_product >> thread_17_product, the warp reduction result differs massively. The key is that BOTH thread 16 AND thread 17 products must differ significantly (not just differ from 1.0), creating a ratio that exceeds tolerance.",
+      "survival_reason": "Previous attempts set column 16 or 17 to different values but failed because: (1) Round 1 used 1.5^256 causing overflow. (2-4) Set only one of columns 16/17 differently, but both threads' products need to differ from each other, not just from 1.0. The warp reduction combines products multiplicatively, so if p16≈p17, the first shuffle step produces similar results. Additionally, the small kernel (used when reduction_size≤32) has a bug where only threadIdx.x==0 writes output - but reduction_size=256>32 means optimized kernel runs. The fix: set thread 16's product to be LARGE (e.g., 1000) and thread 17's product to be SMALL (e.g., 0.001), creating a 10^6 ratio difference in first shuffle that propagates to final output.",
+      "killable": true,
+      "kill_strategy": "Set input values such that thread 16's product is very large (1000.0) and thread 17's product is very small (0.001). Original kernel multiplies by p16=1000 in first shuffle, mutant multiplies by p17=0.001, creating a million-fold difference that exceeds any tolerance.",
+      "recommendations": "Warp reduction tests should include cases where adjacent warp lanes (e.g., lanes 15-17) have dramatically different partial products to catch off-by-one errors in shuffle offsets. Test with ratios > 10^4 between neighboring lanes.",
+      "suggested_code": "def generate_inputs(device):\n    # Create tensor with all 1.0s\n    x = torch.ones((16, 256, 256), dtype=torch.float32, device=device)\n    # Set column 16 to a large value in one reduction row\n    # Thread 16 computes product across dim 1 for column 16\n    x[:, 0, 16] = 1000.0  # thread 16's product = 1000.0\n    # Set column 17 to a small value in same reduction row\n    x[:, 0, 17] = 0.001   # thread 17's product = 0.001\n    # Original: lane 0 shuffles with lane 16 (product 1000.0)\n    # Mutant: lane 0 shuffles with lane 17 (product 0.001)\n    # Ratio = 10^6 which massively exceeds tolerance\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 449.19
+}

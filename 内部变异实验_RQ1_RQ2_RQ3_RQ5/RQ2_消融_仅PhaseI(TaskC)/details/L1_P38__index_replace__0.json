@@ -1,0 +1,127 @@
+{
+  "mutant_id": "L1_P38__index_replace__0",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P38",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5172,
+        "completion_tokens": 2712,
+        "total_tokens": 7884,
+        "reasoning_tokens": 753
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Launch is <<<16, 256>>> (1D grid), so gridDim.y=1 and blockIdx.y=0 for all blocks. Original uses blockIdx.x (0-15) for batch indexing, mutant uses blockIdx.y (always 0). Rows 1-15 never get written to output.",
+      "survival_reason": "The mutation changes batch_idx from blockIdx.x to blockIdx.y. With a 1D grid launch of 16 blocks, blockIdx.x ranges from 0-15 (covering all batches), but blockIdx.y is always 0 (since gridDim.y=1). This causes all 16 blocks to process only batch 0, leaving rows 1-15 of the output tensor uninitialized (garbage from empty_like). The mutant produces completely wrong results for 15/16 of the output.",
+      "killable": true,
+      "kill_strategy": "Use any non-trivial input tensor. The mutant will correctly normalize only row 0; rows 1-15 will contain uninitialized memory values that differ drastically from the correct L1-normalized output. Using distinct values per row makes this obvious.",
+      "recommendations": "When mutating CUDA dimension indices (blockIdx.x/y/z), always verify the actual grid dimensions match the intended access pattern. Testing with batch_size > 1 with distinguishable row values catches such indexing bugs immediately.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    for i in range(16):\n        x[i] = float(i + 1)  # Row i contains value (i+1)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5000,
+        "completion_tokens": 6129,
+        "total_tokens": 11129,
+        "reasoning_tokens": 2614
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Row 0 L1-norm = (1/1000)*sum(1..16384) ≈ 134225.92. Row k L1-norm = (k+1)*134225.92. If mutant memory reuses reference row k values but they were computed with wrong normalization factor, max error scales with row index. For row 15: expected normalized value ≈ x/(16*134225.92), but if infected with row 0's factor: x/134225.92 → 16x difference >> tolerance.",
+      "survival_reason": "The previous test used uniform constant values per row, making all normalized rows structurally similar (uniform values). The CUDA memory allocator reused the reference output buffer for the mutant's empty_like allocation. Since row 0 was correctly computed in both and uniform rows look similar after normalization, the uninitialized rows 1-15 in the mutant accidentally contained values close enough to pass allclose. Using row-specific varying patterns ensures each row has a unique structure that cannot be matched by accident or memory reuse.",
+      "killable": true,
+      "kill_strategy": "Use spatially-varying patterns unique per row so that L1 norms differ dramatically between rows. The mutant normalizes only row 0 and leaves rows 1-15 uninitialized or with incorrect values. Even with memory reuse, normalized values from row 0's L1-norm applied to other rows' data produces large errors.",
+      "recommendations": "When testing CUDA kernels with indexing mutations, use non-uniform input patterns that give each batch element unique structure. Uniform inputs may accidentally pass due to memory reuse or symmetric normalization results.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    base = torch.arange(1, 16385, device=device, dtype=torch.float32)\n    for i in range(16):\n        x[i] = base * (i + 1) / 1000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5221,
+        "completion_tokens": 4401,
+        "total_tokens": 9622,
+        "reasoning_tokens": 1873
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "L1 normalization divides by sum of absolute values. Previous tests used uniform/scaled values where normalized outputs ≈ 1/dim ≈ 6e-5. With atol=1e-2, |0 - 6e-5| < 0.01 passes. By concentrating mass in ONE element per row at DIFFERENT positions, normalized output has value 1.0 at that position. For row k (k>0), expected output[k][pos_k]=1.0, but mutant leaves rows 1-15 uninitialized (zeros). Difference = |1.0 - 0| = 1.0 > 0.01 + 0.01*1.0 = 0.02, killing the mutant.",
+      "survival_reason": "Previous attempts used constant or scaled values across all elements. When normalized, these produce values ≈ 1/16384 ≈ 6.1e-5 everywhere. Even if the mutant outputs zeros (uninitialized memory) for rows 1-15, the tolerance check atol=1e-2 passes because |6.1e-5 - 0| << 0.01. The mutant changes blockIdx.x→blockIdx.y, causing all 16 blocks to process only row 0 (since gridDim.y=1). Rows 1-15 are never written, containing uninitialized zeros. To expose this, we need normalized outputs with magnitude >> 0.01. By placing a single large spike at different positions per row, the normalized output has exactly 1.0 at that position, making the difference from 0 detectably large.",
+      "killable": true,
+      "kill_strategy": "Place a single non-zero spike at a unique position for each row. Row i gets a spike at position i*1024. This creates normalized outputs where output[i][i*1024]=1.0. The mutant only writes row 0 correctly; rows 1-15 remain uninitialized (zeros), so output[1][1024] will be 0 instead of 1, causing |1-0|=1 > 0.02 tolerance.",
+      "recommendations": "When testing normalization kernels, include sparse inputs with concentrated mass at varying positions per batch item. Uniform-value tests can mask indexing bugs because normalized outputs become uniformly small, falling within loose tolerances.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    for i in range(16):\n        # Place a spike at position i*1024 for row i\n        # This ensures each row's normalized output has a 1.0 at a unique position\n        x[i, i * 1024] = 1000.0  # Magnitude doesn't matter, only position\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5490,
+        "completion_tokens": 4904,
+        "total_tokens": 10394,
+        "reasoning_tokens": 2007
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Row i with single spike x[i, i*1024] = s has L1-norm=|s|=1, normalized value = s/|s| = ±1.0. Mutant writes only row 0. Rows 1-15 are either zeros or cached positive values from row 0. For odd rows expecting -1.0, if actual ≈ 0 or +1.0, difference ≥ 1.0 >> 0.02 tolerance.",
+      "survival_reason": "Previous sparse spike tests failed because PyTorch's CUDA caching allocator can return memory containing previous correct values. All prior tests used positive values only. If cached memory from a correct row 0 computation bleeds into rows 1-15, values might accidentally match. By using NEGATIVE spikes for odd rows, any cached positive values or zeros produce differences of 1.0-2.0, far exceeding the 0.01 absolute tolerance.",
+      "killable": true,
+      "kill_strategy": "Use sparse input with single spike per row at unique positions (i*1024), with alternating signs: row 0 = +1.0, row 1 = -1.0, etc. Expected normalized output at spike positions: ±1.0. Mutant leaves rows 1-15 as zeros/cached-positives, causing |±1.0 - actual| ≥ 1.0.",
+      "recommendations": "When testing kernels with batch indexing, use signed patterns that cannot be produced by memory reuse or initialization artifacts - alternating positive/negative values across batches provide robust differentiation.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    for i in range(16):\n        sign = 1.0 if i % 2 == 0 else -1.0\n        x[i, i * 1024] = sign\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=2.000000e+00, mean_diff=6.103516e-05, ref_range=[-1.0000e+00,1.0000e+00], mut_range=[0.0000e+00,1.0000e+00]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 4,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Use sparse input with single spike per row at unique positions (i*1024), with alternating signs: row 0 = +1.0, row 1 = -1.0, etc. Expected normalized output at spike positions: ±1.0. Mutant leaves rows 1-15 as zeros/cached-positives, causing |±1.0 - actual| ≥ 1.0.",
+    "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 16384, device=device, dtype=torch.float32)\n    for i in range(16):\n        sign = 1.0 if i % 2 == 0 else -1.0\n        x[i, i * 1024] = sign\n    return [x]"
+  },
+  "elapsed_sec": 354.77
+}

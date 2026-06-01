@@ -1,0 +1,89 @@
+{
+  "mutant_id": "L1_P8__epsilon_modify__3",
+  "operator_name": "epsilon_modify",
+  "kernel_name": "L1_P8",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6136,
+        "completion_tokens": 5804,
+        "total_tokens": 11940,
+        "reasoning_tokens": 2474
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With atol=0, the check |diff| <= rtol*|ref| fails when ref≈0 even for tiny differences. With K=2949 terms that cancel to near-zero, accumulation order differences between CUDA tiled kernel and torch.matmul produce ~1e-4 level absolute errors. Original (atol=1e-4) accepts this; mutant (atol=0) rejects and returns different tensor.",
+      "survival_reason": "The mutation changes the tolerance threshold in torch.allclose from atol=1e-4 to atol=0. This affects which output tensor gets returned when the custom CUDA kernel and torch.matmul produce small numerical differences. For near-zero output values created through catastrophic cancellation, the relative tolerance (rtol*|ref|) becomes negligible, so the atol parameter becomes the deciding factor. With atol=0, even ~1e-5 differences at near-zero values cause the mutant to return torch_result instead of custom_result, producing a detectable output difference.",
+      "killable": true,
+      "kill_strategy": "Use alternating +1/-1 patterns in input matrices to create maximum cancellation in dot products, resulting in near-zero outputs. Add small random perturbations to break perfect symmetry. The different accumulation orders will produce measurable errors that pass original's atol=1e-4 but fail mutant's atol=0.",
+      "recommendations": "Numerical tolerance parameters (atol, rtol) in comparison functions should be explicitly tested with near-zero values and catastrophic cancellation scenarios. Mutation testing should include boundary cases where tolerance thresholds determine control flow decisions.",
+      "suggested_code": "def generate_inputs(device):\n    M, K, N = 8205, 2949, 5921\n    \n    # Create matrices with alternating signs for maximum cancellation\n    A = torch.zeros(M, K, device=device, dtype=torch.float32)\n    B = torch.zeros(K, N, device=device, dtype=torch.float32)\n    \n    # Alternating +1, -1 pattern creates near-zero sums\n    A[:, ::2] = 1.0\n    A[:, 1::2] = -1.0\n    B[::2, :] = 1.0  \n    B[1::2, :] = -1.0\n    \n    # Add small noise to break perfect cancellation and introduce numerical variation\n    torch.manual_seed(10100)\n    A = A + torch.randn(M, K, device=device, dtype=torch.float32) * 1e-4\n    B = B + torch.randn(K, N, device=device, dtype=torch.float32) * 1e-4\n    \n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6176,
+        "completion_tokens": 6921,
+        "total_tokens": 13097,
+        "reasoning_tokens": 2711
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With A alternating ±10000 and B structured for cancellation, intermediate sums ~1475*10000=1.475e7. Different accumulation orders cause ~1e-5 to 1e-4 errors. Final results ~0 where atol threshold difference (1e-4 vs 0) is decisive. Need |diff| in (rtol*0, 1e-4] = (0, 1e-4].",
+      "survival_reason": "Previous attempt used ±1 values with 1e-4 noise—too small for significant accumulation errors. The CUDA kernel and PyTorch produced nearly identical results because small-magnitude arithmetic has minimal floating-point divergence. The new approach uses ±10000 values creating intermediate sums of ~10^7, where different accumulation orders (tiled CUDA vs PyTorch's optimized BLAS) produce measurable differences ~1e-5 to 1e-4. The structured cancellation ensures final results are near-zero where the absolute tolerance difference between original (1e-4) and mutant (0) becomes decisive.",
+      "killable": true,
+      "kill_strategy": "Use large magnitude alternating values (±10000) with mathematically structured cancellation in B (compensate for odd K) to create near-zero outputs with large intermediate accumulations, maximizing numerical divergence between kernel implementations where atol dominates.",
+      "recommendations": "When testing numerical tolerance mutations in matrix operations, use inputs that maximize intermediate value magnitudes while targeting near-zero outputs—this amplifies floating-point accumulation order differences and makes absolute tolerance thresholds decisive.",
+      "suggested_code": "def generate_inputs(device):\n    M, K, N = 8205, 2949, 5921\n    \n    c = 10000.0  # Large value for numerical instability\n    \n    # A with alternating large values\n    A = torch.zeros(M, K, device=device, dtype=torch.float32)\n    A[:, ::2] = c\n    A[:, 1::2] = -c\n    \n    # B structured for cancellation: even indices 1475, odd indices 1474\n    # Alternating sum with all 1s = 1475 - 1474 = 1\n    # Compensate by increasing odd values: 1475 - 1474*(1+eps) = 0 when eps = 1/1474\n    epsilon = 1.0 / 1474.0\n    B = torch.ones(K, N, device=device, dtype=torch.float32)\n    B[1::2, :] = 1.0 + epsilon\n    \n    # Small noise to prevent exact zeros while keeping results tiny\n    torch.manual_seed(77777)\n    noise_scale = 1e-7\n    B = B + torch.randn(K, N, device=device, dtype=torch.float32) * noise_scale\n    \n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6598,
+        "completion_tokens": 4602,
+        "total_tokens": 11200,
+        "reasoning_tokens": 2094
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes atol from 1e-4 to 0 in the internal torch.allclose check. For different outputs to occur, original must pass (return custom_result) while mutant fails (return torch_result). This means |torch_result - custom_result| is in the range (rtol*|result|, rtol*|result|+1e-4]. The maximum output difference is thus bounded by ~1e-4. Testing uses tolerance atol=1e-2, rtol=1e-2, so |ref-mut| must exceed 1e-2 + 1e-2*|ref|. Since 1e-4 << 1e-2, the mutation cannot be detected.",
+      "survival_reason": "Previous attempts tried alternating patterns and large magnitudes to create near-zero outputs with numerical errors. However, the fundamental issue is that the mutation only affects the internal sanity check's absolute tolerance (1e-4 → 0). When the original passes but mutant fails this check, outputs differ by at most the numerical error threshold (~1e-4). The testing tolerance (atol=1e-2, rtol=1e-2) is 100x larger than this maximum difference. No value pattern can amplify a 1e-4 difference into a 1e-2 difference through this code path. The kernel code is identical in both versions - only the fallback decision threshold differs.",
+      "killable": false,
+      "kill_strategy": "UNKILLABLE: The mutation changes only the internal sanity-check tolerance from 1e-4 to 0. The maximum possible output difference is bounded by the original tolerance (~1e-4), which is 100x smaller than the testing tolerance (1e-2). No input values can bridge this gap.",
+      "recommendations": "When testing epsilon/tolerance mutations, ensure the testing tolerance is tighter than the mutated tolerance difference. For this mutation to be killable, the testing tolerance would need to be ≤1e-4 (e.g., atol=1e-5, rtol=1e-5). Alternatively, consider if such internal sanity-check tolerance mutations are truly worth testing, as they represent defensive programming thresholds rather than algorithmic correctness.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 328.74
+}

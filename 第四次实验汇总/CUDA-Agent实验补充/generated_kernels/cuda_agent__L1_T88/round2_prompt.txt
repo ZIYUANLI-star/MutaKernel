@@ -1,0 +1,188 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs mean reduction over a specific dimension.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension. The shape of the output is the same as the input except for the reduced dimension which is removed.
+        """
+        return torch.mean(x, dim=self.dim)
+
+batch_size = 128
+dim1 = 4096
+dim2 = 4095
+
+def get_inputs():
+    x = torch.rand(batch_size, dim1, dim2)
+    return [x]
+
+def get_init_inputs():
+    return [1]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs mean reduction using PyTorch's optimized operations.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension. The shape of the output is the same as the input except for the reduced dimension which is removed.
+        """
+        # Use PyTorch's built-in mean which handles numerical stability properly
+        # Convert to float64 for accumulation to handle near-overflow values
+        original_dtype = x.dtype
+        
+        # For numerical stability with extreme values, use float64 accumulation
+        if x.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            # Accumulate in float64 for better precision with extreme values
+            result = torch.mean(x.to(torch.float64), dim=self.dim)
+            # Convert back to original dtype if it was float32, otherwise keep float64
+            if original_dtype == torch.float32:
+                result = result.to(torch.float32)
+            elif original_dtype in (torch.float16, torch.bfloat16):
+                result = result.to(original_dtype)
+        else:
+            result = torch.mean(x, dim=self.dim)
+        
+        return result
+```
+
+## Test Failures (Round 2 input)
+Total discrepancies: 4
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (2 failures)
+  - [near_overflow seed=50002] max_diff=1.298651e+22, mean_diff=1.985063e+21, ref_range=[-7.2431e+28,7.2601e+28], orig_range=[-7.2431e+28,7.2601e+28]
+  - [near_overflow seed=50003] max_diff=1.416710e+22, mean_diff=1.988190e+21, ref_range=[-7.5385e+28,6.9663e+28], orig_range=[-7.5385e+28,6.9663e+28]
+
+### training_stress (2 failures)
+  - [near_overflow seed=70002] max_diff=1.416710e+22, mean_diff=1.984119e+21, ref_range=[-7.3818e+28,7.3096e+28], orig_range=[-7.3818e+28,7.3096e+28]
+  - [near_overflow seed=70003] max_diff=1.416710e+22, mean_diff=1.987494e+21, ref_range=[-7.9038e+28,7.5745e+28], orig_range=[-7.9038e+28,7.5745e+28]
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 4 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs mean reduction using PyTorch's optimized operations.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension. The shape of the output is the same as the input except for the reduced dimension which is removed.
+        """
+        # Use PyTorch's built-in mean which handles numerical stability properly
+        # Convert to float64 for accumulation to handle near-overflow values
+        original_dtype = x.dtype
+        
+        # For numerical stability with extreme values, use float64 accumulation
+        if x.dtype in (torch.float16, torch.bfloat16, torch.float32):
+            # Accumulate in float64 for better precision with extreme values
+            result = torch.mean(x.to(torch.float64), dim=self.dim)
+            # Convert back to original dtype if it was float32, otherwise keep float64
+            if original_dtype == torch.float32:
+                result = result.to(torch.float32)
+            elif original_dtype in (torch.float16, torch.bfloat16):
+                result = result.to(original_dtype)
+        else:
+            result = torch.mean(x, dim=self.dim)
+        
+        return result
+```
+
+### What still failed after Round 1
+
+### value_stress (2 failures)
+  - [near_overflow seed=50002] max_diff=1.298651e+22, mean_diff=1.985063e+21, ref_range=[-7.2431e+28,7.2601e+28], orig_range=[-7.2431e+28,7.2601e+28]
+  - [near_overflow seed=50003] max_diff=1.416710e+22, mean_diff=1.988190e+21, ref_range=[-7.5385e+28,6.9663e+28], orig_range=[-7.5385e+28,6.9663e+28]
+
+### training_stress (2 failures)
+  - [near_overflow seed=70002] max_diff=1.416710e+22, mean_diff=1.984119e+21, ref_range=[-7.3818e+28,7.3096e+28], orig_range=[-7.3818e+28,7.3096e+28]
+  - [near_overflow seed=70003] max_diff=1.416710e+22, mean_diff=1.987494e+21, ref_range=[-7.9038e+28,7.5745e+28], orig_range=[-7.9038e+28,7.5745e+28]
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

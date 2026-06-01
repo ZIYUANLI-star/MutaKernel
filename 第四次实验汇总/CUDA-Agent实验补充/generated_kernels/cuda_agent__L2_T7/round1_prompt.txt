@@ -1,0 +1,109 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a convolution, applies GELU, and then performs global average pooling.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor of shape (batch_size, in_channels, height, width)
+        Returns:
+            Output tensor of shape (batch_size, out_channels)
+        """
+        x = self.conv(x)
+        x = torch.nn.functional.gelu(x)
+        x = torch.nn.functional.adaptive_avg_pool2d(x, 1)
+        x = x.squeeze(-1).squeeze(-1)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size):
+        super().__init__()
+        self.conv = nn.Module()
+        self.conv.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size))
+        self.conv.bias = nn.Parameter(torch.zeros(out_channels))
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def forward(self, x):
+        # Enable TF32 for better performance on supported GPUs
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Use native convolution
+        x = torch.conv2d(x, self.conv.weight, self.conv.bias, stride=1, padding=0, dilation=1)
+        
+        # Apply manual GELU
+        cdf = 0.5 * (1.0 + torch.erf(x / 1.41421356237309504880))
+        x = x * cdf
+        
+        # Global average pooling
+        x = x.mean(dim=(2, 3))
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 2
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (1 failures)
+  - [reduction_adversarial seed=50035] max_diff=4.493164e+00, mean_diff=1.495754e+00, ref_range=[1.8469e+00,6.0856e+03], orig_range=[1.5959e+00,6.0811e+03]
+
+### training_stress (1 failures)
+  - [reduction_adversarial seed=70034] max_diff=5.180176e+00, mean_diff=1.561044e+00, ref_range=[9.5489e+00,7.3844e+03], orig_range=[9.6412e+00,7.3799e+03]
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

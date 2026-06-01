@@ -1,0 +1,514 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fused cross entropy with online softmax
+cross_entropy_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__global__ void fused_cross_entropy_kernel(
+    const T* __restrict__ logits,
+    const long* __restrict__ targets,
+    T* __restrict__ loss,
+    int batch_size,
+    int num_classes,
+    float label_smoothing
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= batch_size) return;
+    
+    const int target_idx = targets[idx];
+    const T* row_logits = &logits[idx * num_classes];
+    
+    // Online softmax computation
+    T max_val = row_logits[0];
+    for (int i = 1; i < num_classes; i++) {
+        if (row_logits[i] > max_val) {
+            max_val = row_logits[i];
+        }
+    }
+    
+    T sum_exp = 0;
+    for (int i = 0; i < num_classes; i++) {
+        sum_exp += expf(row_logits[i] - max_val);
+    }
+    
+    T log_sum_exp = logf(sum_exp) + max_val;
+    
+    // Compute loss for this sample with label smoothing
+    T sample_loss = 0;
+    T positive_weight = (1.0f - label_smoothing) + (label_smoothing / num_classes);
+    T negative_weight = label_smoothing / num_classes;
+    
+    for (int i = 0; i < num_classes; i++) {
+        T log_prob = row_logits[i] - log_sum_exp;
+        if (i == target_idx) {
+            sample_loss -= positive_weight * log_prob;
+        } else {
+            sample_loss -= negative_weight * log_prob;
+        }
+    }
+    
+    // Store per-sample loss for reduction
+    loss[idx] = sample_loss;
+}
+
+template<typename T>
+__global__ void reduce_loss_kernel(
+    const T* __restrict__ per_sample_loss,
+    T* __restrict__ final_loss,
+    int batch_size
+) {
+    __shared__ T shared[256];
+    
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    
+    T val = 0;
+    if (idx < batch_size) {
+        val = per_sample_loss[idx];
+    }
+    
+    shared[tid] = val;
+    __syncthreads();
+    
+    // Block reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        atomicAdd(final_loss, shared[0] / batch_size);
+    }
+}
+
+torch::Tensor fused_cross_entropy_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    float label_smoothing = 0.0
+) {
+    const int batch_size = logits.size(0);
+    const int num_classes = logits.size(1);
+    
+    // Allocate per-sample loss tensor
+    auto per_sample_loss = torch::empty({batch_size}, logits.options());
+    auto final_loss = torch::zeros({}, logits.options());  // Scalar tensor
+    
+    // Launch kernel for per-sample loss computation
+    const int threads_per_block = 256;
+    const int num_blocks = (batch_size + threads_per_block - 1) / threads_per_block;
+    
+    AT_DISPATCH_FLOATING_TYPES(logits.scalar_type(), "fused_cross_entropy", ([&] {
+        fused_cross_entropy_kernel<scalar_t><<<num_blocks, threads_per_block>>>(
+            logits.data_ptr<scalar_t>(),
+            targets.data_ptr<long>(),
+            per_sample_loss.data_ptr<scalar_t>(),
+            batch_size,
+            num_classes,
+            label_smoothing
+        );
+    }));
+    
+    // Launch reduction kernel
+    const int reduce_threads = 256;
+    const int reduce_blocks = (batch_size + reduce_threads - 1) / reduce_threads;
+    
+    AT_DISPATCH_FLOATING_TYPES(logits.scalar_type(), "reduce_loss", ([&] {
+        reduce_loss_kernel<scalar_t><<<reduce_blocks, reduce_threads>>>(
+            per_sample_loss.data_ptr<scalar_t>(),
+            final_loss.data_ptr<scalar_t>(),
+            batch_size
+        );
+    }));
+    
+    cudaDeviceSynchronize();
+    return final_loss;
+}
+"""
+
+cross_entropy_cpp_source = """
+torch::Tensor fused_cross_entropy_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    float label_smoothing = 0.0
+);
+"""
+
+# Compile the inline CUDA code
+fused_cross_entropy = load_inline(
+    name="fused_cross_entropy",
+    cpp_sources=cross_entropy_cpp_source,
+    cuda_sources=cross_entropy_source,
+    functions=["fused_cross_entropy_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused cross-entropy CUDA kernel.
+    """
+    def __init__(self, label_smoothing=0.0):
+        super(ModelNew, self).__init__()
+        self.label_smoothing = label_smoothing
+        self.fused_cross_entropy = fused_cross_entropy
+
+    def forward(self, predictions, targets):
+        return self.fused_cross_entropy.fused_cross_entropy_cuda(
+            predictions, 
+            targets, 
+            self.label_smoothing
+        )
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fused cross entropy with online softmax
+cross_entropy_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__global__ void fused_cross_entropy_kernel(
+    const T* __restrict__ logits,
+    const long* __restrict__ targets,
+    T* __restrict__ loss,
+    int batch_size,
+    int num_classes,
+    float label_smoothing
+) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx >= batch_size) return;
+    
+    const int target_idx = targets[idx];
+    const T* row_logits = &logits[idx * num_classes];
+    
+    // Online softmax computation
+    T max_val = row_logits[0];
+    for (int i = 1; i < num_classes; i++) {
+        if (row_logits[i] > max_val) {
+            max_val = row_logits[i];
+        }
+    }
+    
+    T sum_exp = 0;
+    for (int i = 0; i < num_classes; i++) {
+        sum_exp += expf(row_logits[i] - max_val);
+    }
+    
+    T log_sum_exp = logf(sum_exp) + max_val;
+    
+    // Compute loss for this sample with label smoothing
+    T sample_loss = 0;
+    T positive_weight = (1.0f - label_smoothing) + (label_smoothing / num_classes);
+    T negative_weight = label_smoothing / num_classes;
+    
+    for (int i = 0; i < num_classes; i++) {
+        T log_prob = row_logits[i] - log_sum_exp;
+        if (i == target_idx) {
+            sample_loss -= positive_weight * log_prob;
+        } else {
+            sample_loss -= negative_weight * log_prob;
+        }
+    }
+    
+    // Store per-sample loss for reduction
+    loss[idx] = sample_loss;
+}
+
+template<typename T>
+__global__ void reduce_loss_kernel(
+    const T* __restrict__ per_sample_loss,
+    T* __restrict__ final_loss,
+    int batch_size
+) {
+    __shared__ T shared[256];
+    
+    int tid = threadIdx.x;
+    int idx = blockIdx.x * blockDim.x + tid;
+    
+    T val = 0;
+    if (idx < batch_size) {
+        val = per_sample_loss[idx];
+    }
+    
+    shared[tid] = val;
+    
+    // Block reduction
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared[tid] += shared[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    if (tid == 0) {
+        atomicAdd(final_loss, shared[0] / batch_size);
+    }
+}
+
+torch::Tensor fused_cross_entropy_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    float label_smoothing = 0.0
+) {
+    const int batch_size = logits.size(0);
+    const int num_classes = logits.size(1);
+    
+    // Allocate per-sample loss tensor
+    auto per_sample_loss = torch::empty({batch_size}, logits.options());
+    auto final_loss = torch::zeros({}, logits.options());  // Scalar tensor
+    
+    // Launch kernel for per-sample loss computation
+    const int threads_per_block = 256;
+    const int num_blocks = (batch_size + threads_per_block - 1) / threads_per_block;
+    
+    AT_DISPATCH_FLOATING_TYPES(logits.scalar_type(), "fused_cross_entropy", ([&] {
+        fused_cross_entropy_kernel<scalar_t><<<num_blocks, threads_per_block>>>(
+            logits.data_ptr<scalar_t>(),
+            targets.data_ptr<long>(),
+            per_sample_loss.data_ptr<scalar_t>(),
+            batch_size,
+            num_classes,
+            label_smoothing
+        );
+    }));
+    
+    // Launch reduction kernel
+    const int reduce_threads = 256;
+    const int reduce_blocks = (batch_size + reduce_threads - 1) / reduce_threads;
+    
+    AT_DISPATCH_FLOATING_TYPES(logits.scalar_type(), "reduce_loss", ([&] {
+        reduce_loss_kernel<scalar_t><<<reduce_blocks, reduce_threads>>>(
+            per_sample_loss.data_ptr<scalar_t>(),
+            final_loss.data_ptr<scalar_t>(),
+            batch_size
+        );
+    }));
+    
+    cudaDeviceSynchronize();
+    return final_loss;
+}
+"""
+
+cross_entropy_cpp_source = """
+torch::Tensor fused_cross_entropy_cuda(
+    torch::Tensor logits,
+    torch::Tensor targets,
+    float label_smoothing = 0.0
+);
+"""
+
+# Compile the inline CUDA code
+fused_cross_entropy = load_inline(
+    name="fused_cross_entropy",
+    cpp_sources=cross_entropy_cpp_source,
+    cuda_sources=cross_entropy_source,
+    functions=["fused_cross_entropy_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused cross-entropy CUDA kernel.
+    """
+    def __init__(self, label_smoothing=0.0):
+        super(ModelNew, self).__init__()
+        self.label_smoothing = label_smoothing
+        self.fused_cross_entropy = fused_cross_entropy
+
+    def forward(self, predictions, targets):
+        return self.fused_cross_entropy.fused_cross_entropy_cuda(
+            predictions, 
+            targets, 
+            self.label_smoothing
+        )
+```
+
+## Mutation Details
+- Operator: sync_remove — Remove a GPU synchronization barrier (__syncthreads)
+- Location: line 77
+- Original fragment: `__syncthreads();`
+- node_type: cuda_syncthreads
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[4096, 10], dtype=torch.float32
+  arg[1]: Tensor shape=[4096], dtype=torch.int64
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 77
+- Original fragment: `__syncthreads();`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002]
+- Divergence found: round_type=random, seed=10002, policy=None
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Use inputs with large, distinct loss values per sample so that any missed contributions from the race condition cause a significant divergence in the final mean. Large positive values in non-target class logits and very negative values in target class logits maximize per-sample losses, making reduction errors more visible.
+- Suggested code:
+```python
+def generate_inputs(device):
+    batch_size = 4096
+    num_classes = 10
+    
+    # Create logits where target class has very low probability
+    # This maximizes per-sample loss (~60 each)
+    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)
+    logits[:, 0] = -50.0  # Very negative logit for class 0
+    logits[:, 1:] = 10.0  # High logits for other classes
+    
+    # All targets are class 0 - the class with lowest logit
+    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    
+    return [logits, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Create extreme value contrast between positions 0-191 (near-zero loss) and 192-255 (very high loss ~200) within each 256-thread block. This maximizes the impact of missed shared memory updates during the reduction, as thread 0-63 reading stale shared[64-127] values misses the large contributions from positions 192-255.
+- Suggested code:
+```python
+def generate_inputs(device):
+    batch_size = 4096
+    num_classes = 10
+    
+    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)
+    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    
+    # Default: very low loss (target class has overwhelming probability)
+    logits[:, 0] = 100.0  # Target class 0
+    logits[:, 1:] = 0.0   # Others near zero
+    # Loss ≈ -100 + log(e^100 + 9) ≈ 0
+    
+    # Positions 192-255 within each 256-sample block: extremely high loss
+    # These feed into shared[64-127] during stride=128 reduction
+    positions = torch.arange(batch_size, device=device) % 256
+    high_loss_mask = positions >= 192
+    
+    logits[high_loss_mask, 0] = -100.0   # Target very unlikely
+    logits[high_loss_mask, 1:] = 100.0    # Others very likely
+    # Loss ≈ 100 + log(e^-200 + 9*e^0) ≈ 100 + log(9) ≈ 102
+    
+    return [logits, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 3
+- Strategy: Set positions 0-127 (mod 256) to have near-zero loss and positions 128-255 (mod 256) to have very high loss (~162). This maximizes the difference between correct execution (mean≈81) and race-affected execution where threads 0-127 read stale zeros (mean→0).
+- Suggested code:
+```python
+def generate_inputs(device):
+    batch_size = 4096
+    num_classes = 10
+    
+    logits = torch.zeros(batch_size, num_classes, dtype=torch.float32, device=device)
+    targets = torch.zeros(batch_size, dtype=torch.int64, device=device)
+    
+    positions = torch.arange(batch_size, device=device) % 256
+    high_loss_mask = positions >= 128
+    low_loss_mask = positions < 128
+    
+    # Positions 0-127: target class 0 has very high logit -> loss ≈ 0
+    logits[low_loss_mask, 0] = 80.0
+    logits[low_loss_mask, 1:] = -80.0
+    
+    # Positions 128-255: target class 0 has very low logit -> loss ≈ 162
+    logits[high_loss_mask, 0] = -80.0
+    logits[high_loss_mask, 1:] = 80.0
+    
+    return [logits, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

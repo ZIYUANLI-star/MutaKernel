@@ -1,0 +1,471 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a GPU
+kernel, and the mutant has survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- Enhanced deterministic testing (5 dimensions, 126 rounds)
+- AND your previous suggested inputs (see below)
+
+Re-analyze with the failure information and try a fundamentally different approach.
+
+## Testing Contract
+
+### Main contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+### Auxiliary configuration-stress track
+- Alternative batch sizes were tested separately (see below).
+- This does NOT redefine the main contract.
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized mean reduction
+mean_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename T>
+__global__ void mean_reduction_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const int reduction_dim_size,
+    const int outer_size,
+    const int inner_size
+) {
+    // Each thread block handles one output position
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    
+    // Calculate which output position this block handles
+    const int outer_idx = bid / inner_size;
+    const int inner_idx = bid % inner_size;
+    
+    // Shared memory for block reduction
+    __shared__ T shared_sums[256];
+    
+    // Each thread accumulates its portion
+    T sum = static_cast<T>(0);
+    for (int i = tid; i < reduction_dim_size; i += blockDim.x) {
+        int idx = (outer_idx * reduction_dim_size + i) * inner_size + inner_idx;
+        sum += input[idx];
+    }
+    
+    shared_sums[tid] = sum;
+    __syncthreads();
+    
+    // Parallel reduction within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sums[tid] += shared_sums[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Write final result
+    if (tid == 0) {
+        output[bid] = shared_sums[0] / static_cast<T>(reduction_dim_size);
+    }
+}
+
+torch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim) {
+    auto input_sizes = input.sizes().vec();
+    
+    // Handle negative dimension
+    if (dim < 0) {
+        dim = input.dim() + dim;
+    }
+    
+    // Calculate output shape
+    std::vector<int64_t> output_sizes;
+    for (int64_t i = 0; i < input.dim(); i++) {
+        if (i != dim) {
+            output_sizes.push_back(input_sizes[i]);
+        }
+    }
+    
+    auto output = torch::empty(output_sizes, input.options());
+    
+    // Handle scalar case
+    if (output_sizes.empty()) {
+        output = output.view({1});
+    }
+    
+    // Calculate dimensions for kernel
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; i++) {
+        outer_size *= input_sizes[i];
+    }
+    
+    int64_t reduction_dim_size = input_sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); i++) {
+        inner_size *= input_sizes[i];
+    }
+    
+    int64_t total_positions = outer_size * inner_size;
+    
+    // Configure kernel launch
+    const int block_size = 256;
+    int grid_size = total_positions;
+    
+    AT_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(),
+        "mean_reduction",
+        [&] {
+            mean_reduction_kernel<scalar_t><<<grid_size, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                reduction_dim_size,
+                outer_size,
+                inner_size
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+mean_reduction_cpp_source = """
+torch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+mean_reduction_module = load_inline(
+    name="mean_reduction",
+    cpp_sources=mean_reduction_cpp_source,
+    cuda_sources=mean_reduction_source,
+    functions=["mean_reduction_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs mean reduction over a specific dimension
+    using custom CUDA kernels with improved memory access patterns.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.mean_reduction = mean_reduction_module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean
+        using optimized CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension.
+        """
+        # Use CUDA kernel if tensor is on GPU
+        if x.is_cuda:
+            return self.mean_reduction.mean_reduction_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch for CPU tensors
+            return torch.mean(x, dim=self.dim)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized mean reduction
+mean_reduction_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename T>
+__global__ void mean_reduction_kernel(
+    const T* __restrict__ input,
+    T* __restrict__ output,
+    const int reduction_dim_size,
+    const int outer_size,
+    const int inner_size
+) {
+    // Each thread block handles one output position
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+    
+    // Calculate which output position this block handles
+    const int outer_idx = bid / inner_size;
+    const int inner_idx = bid % inner_size;
+    
+    // Shared memory for block reduction
+    __shared__ T shared_sums[255];
+    
+    // Each thread accumulates its portion
+    T sum = static_cast<T>(0);
+    for (int i = tid; i < reduction_dim_size; i += blockDim.x) {
+        int idx = (outer_idx * reduction_dim_size + i) * inner_size + inner_idx;
+        sum += input[idx];
+    }
+    
+    shared_sums[tid] = sum;
+    __syncthreads();
+    
+    // Parallel reduction within block
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sums[tid] += shared_sums[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Write final result
+    if (tid == 0) {
+        output[bid] = shared_sums[0] / static_cast<T>(reduction_dim_size);
+    }
+}
+
+torch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim) {
+    auto input_sizes = input.sizes().vec();
+    
+    // Handle negative dimension
+    if (dim < 0) {
+        dim = input.dim() + dim;
+    }
+    
+    // Calculate output shape
+    std::vector<int64_t> output_sizes;
+    for (int64_t i = 0; i < input.dim(); i++) {
+        if (i != dim) {
+            output_sizes.push_back(input_sizes[i]);
+        }
+    }
+    
+    auto output = torch::empty(output_sizes, input.options());
+    
+    // Handle scalar case
+    if (output_sizes.empty()) {
+        output = output.view({1});
+    }
+    
+    // Calculate dimensions for kernel
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; i++) {
+        outer_size *= input_sizes[i];
+    }
+    
+    int64_t reduction_dim_size = input_sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); i++) {
+        inner_size *= input_sizes[i];
+    }
+    
+    int64_t total_positions = outer_size * inner_size;
+    
+    // Configure kernel launch
+    const int block_size = 256;
+    int grid_size = total_positions;
+    
+    AT_DISPATCH_FLOATING_TYPES(
+        input.scalar_type(),
+        "mean_reduction",
+        [&] {
+            mean_reduction_kernel<scalar_t><<<grid_size, block_size>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                reduction_dim_size,
+                outer_size,
+                inner_size
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+mean_reduction_cpp_source = """
+torch::Tensor mean_reduction_cuda(torch::Tensor input, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+mean_reduction_module = load_inline(
+    name="mean_reduction",
+    cpp_sources=mean_reduction_cpp_source,
+    cuda_sources=mean_reduction_source,
+    functions=["mean_reduction_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs mean reduction over a specific dimension
+    using custom CUDA kernels with improved memory access patterns.
+    """
+    def __init__(self, dim: int):
+        """
+        Initializes the model with the dimension to reduce over.
+
+        Args:
+            dim (int): The dimension to reduce over.
+        """
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.mean_reduction = mean_reduction_module
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Reduces the input tensor along the specified dimension by taking the mean
+        using optimized CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of arbitrary shape.
+
+        Returns:
+            torch.Tensor: Output tensor with reduced dimension.
+        """
+        # Use CUDA kernel if tensor is on GPU
+        if x.is_cuda:
+            return self.mean_reduction.mean_reduction_cuda(x, self.dim)
+        else:
+            # Fallback to PyTorch for CPU tensors
+            return torch.mean(x, dim=self.dim)
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 27
+- Original fragment: `256`
+- node_type: const:int-1
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 256, 256], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis may contain errors. Reason independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 27
+- Original fragment: `256`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Error: worker_timeout_or_crash
+
+## Enhanced Deterministic Testing Results (mutant survived ALL)
+### Value-Distribution Stress
+Tested 63 / 63 rounds. Result: ALL SURVIVED (bitwise identical)
+  - near_zero seed=42: survived
+  - near_zero seed=43: survived
+  - near_zero seed=44: survived
+  - large_magnitude seed=45: survived
+  - large_magnitude seed=46: survived
+  - large_magnitude seed=47: survived
+  - near_overflow seed=48: survived
+  - near_overflow seed=49: survived
+  - near_overflow seed=50: survived
+  - denormals seed=51: survived
+  - denormals seed=52: survived
+  - denormals seed=53: survived
+  - all_negative seed=54: survived
+  - all_negative seed=55: survived
+  - all_negative seed=56: survived
+  - all_positive seed=57: survived
+  - all_positive seed=58: survived
+  - all_positive seed=59: survived
+  - mixed_extremes seed=60: survived
+  - mixed_extremes seed=61: survived
+  - mixed_extremes seed=62: survived
+  - alternating_sign seed=63: survived
+  - alternating_sign seed=64: survived
+  - alternating_sign seed=65: survived
+  - sparse seed=66: survived
+  - sparse seed=67: survived
+  - sparse seed=68: survived
+  - uniform_constant seed=69: survived
+  - uniform_constant seed=70: survived
+  - uniform_constant seed=71: survived
+### Dtype Stress
+Result: ALL SURVIVED
+  - seed=142 dtypes=[float16, bfloat16]: survived
+  - seed=143 dtypes=[float16, bfloat16]: survived
+  - seed=144 dtypes=[float16, bfloat16]: survived
+### Repeated Execution
+Result: ALL CONSISTENT, inconsistency_detected=False
+### Training Mode
+Result: ALL SURVIVED
+### Configuration-Stress Track
+ALL SURVIVED. Tested batch_sizes: ['1', '2', '4', '8', '16', '32', '64']
+
+## Previous Attempts (all FAILED to kill the mutant)
+
+### Round 1
+- Strategy: Create input where ONLY element index 255 in the reduction dimension contains a significant value (e.g., 256.0) and all other elements are 0. Expected mean = 1.0. If thread 255's contribution is lost due to actual OOB issues on different hardware/runs, mean ≈ 0.0.
+- Suggested code:
+```python
+def generate_inputs(device):
+    x = torch.zeros(16, 256, 256, dtype=torch.float32, device=device)
+    x[:, 255, :] = 256.0  # Only last element in reduction dim has value
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Reachability**: Derive concrete variable ranges from code constants.
+Do NOT claim a boundary case is reachable without deriving it.
+
+**Step 2 — Why previous attempts failed**: For each failed round, explain
+the specific mathematical reason it could not expose a difference.
+
+**Step 3 — Novel strategy or conclusion**: Either identify a fundamentally
+different value-level approach, or conclude unkillable with proof.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation or path argument>",
+  "survival_reason": "<updated analysis — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<new VALUE-LEVEL strategy different from ALL previous, or why unkillable>",
+  "suggested_test": {
+    "description": "<what this NEW input tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... DIFFERENT from all previous>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- generate_inputs(device) must return a list with EXACTLY the same tensor count/shapes.
+- Shapes MUST EXACTLY MATCH Input Specification.
+- Use ONLY torch and math modules. Set "suggested_test" to null if unkillable.

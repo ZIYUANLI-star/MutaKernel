@@ -1,0 +1,343 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+
+A mutation testing tool applied a mutation to a GPU kernel. The 4-layer
+Equivalence-Mutant Detection (EMD) pipeline ran on this mutant:
+- Layer 0 — source-code normalization
+- Layer 1 — static equivalence rules
+- Layer 2 — multi-seed differential testing (112 total rounds, including baseline)
+- Layer 3 — LLM-based equivalence reasoning (if executed)
+
+EMD concluded this mutant is **possibly killable** (or has not been definitively
+declared equivalent). **NO downstream deterministic stress testing has been
+applied.** Your task is to either:
+1. Confirm the mutant is unkillable under the fixed-shape contract, OR
+2. Construct a value-level test input that exposes its behavioral difference.
+
+## Testing Contract (fixed-shape, variable-value)
+
+1. **Shape is FIXED**: Input tensor shapes from `get_inputs()` are NEVER changed.
+   Batch size is also fixed.
+2. **Values CAN vary**: diverse numerical values within the fixed shapes —
+   random seeds, extreme magnitudes, near-zero, sparse, boundary integers,
+   adversarial distributions, etc.
+3. **Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`** (NaN-aware: if
+   reference produces NaN/Inf, mutant must produce matching NaN/Inf at the
+   same positions). To kill the mutant, your input must produce a result
+   whose **maximum absolute element-wise difference vs reference exceeds
+   `atol + rtol * |ref|`** (with `atol=rtol=1e-2`). Differences below this
+   threshold will NOT count as a kill — design inputs with clear, large
+   divergences, not minimal ones.
+4. **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for LeakyReLU with vectorized memory access
+leaky_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+template<typename T>
+__global__ void leaky_relu_kernel(const T* input, T* output, float negative_slope, int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;
+    
+    if (idx + 3 < size) {
+        // Vectorized load and store for better memory bandwidth utilization
+        T in0 = input[idx];
+        T in1 = input[idx + 1];
+        T in2 = input[idx + 2];
+        T in3 = input[idx + 3];
+        
+        output[idx] = in0 > 0 ? in0 : static_cast<T>(negative_slope * in0);
+        output[idx + 1] = in1 > 0 ? in1 : static_cast<T>(negative_slope * in1);
+        output[idx + 2] = in2 > 0 ? in2 : static_cast<T>(negative_slope * in2);
+        output[idx + 3] = in3 > 0 ? in3 : static_cast<T>(negative_slope * in3);
+    } else {
+        // Handle remaining elements
+        for (int i = 0; i < 4; i++) {
+            if (idx + i < size) {
+                T val = input[idx + i];
+                output[idx + i] = val > 0 ? val : static_cast<T>(negative_slope * val);
+            }
+        }
+    }
+}
+
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope) {
+    auto output = torch::empty_like(input);
+    int64_t size = input.numel();
+    
+    // Optimize block size based on tensor size
+    const int block_size = 256;
+    const int num_blocks = (size + block_size * 4 - 1) / (block_size * 4);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "leaky_relu_cuda", ([&] {
+        leaky_relu_kernel<scalar_t><<<num_blocks, block_size>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            negative_slope,
+            size
+        );
+    }));
+    
+    return output;
+}
+"""
+
+leaky_relu_cpp_source = """
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope);
+"""
+
+# Compile the inline CUDA code
+leaky_relu_cuda_module = load_inline(
+    name="leaky_relu_cuda",
+    cpp_sources=leaky_relu_cpp_source,
+    cuda_sources=leaky_relu_source,
+    functions=["leaky_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+    extra_include_paths=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs LeakyReLU activation using custom CUDA kernel.
+    """
+    def __init__(self, negative_slope: float = 0.01):
+        """
+        Initializes the optimized LeakyReLU module.
+
+        Args:
+            negative_slope (float, optional): The negative slope of the activation function. Defaults to 0.01.
+        """
+        super(ModelNew, self).__init__()
+        self.negative_slope = negative_slope
+        self.leaky_relu_cuda = leaky_relu_cuda_module
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized LeakyReLU activation to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with LeakyReLU applied, same shape as input.
+        """
+        if x.is_cuda:
+            return self.leaky_relu_cuda.leaky_relu_cuda(x, self.negative_slope)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return torch.nn.functional.leaky_relu(x, negative_slope=self.negative_slope)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for LeakyReLU with vectorized memory access
+leaky_relu_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+
+template<typename T>
+__global__ void leaky_relu_kernel(const T* input, T* output, float negative_slope, int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x * 4 + threadIdx.x * 4;
+    
+    if (idx + 3 < size) {
+        // Vectorized load and store for better memory bandwidth utilization
+        T in0 = input[idx];
+        T in1 = input[idx + 1];
+        T in2 = input[idx + 2];
+        T in3 = input[idx + 3];
+        
+        output[idx] = in0 > 0 ? in0 : static_cast<T>(negative_slope * in0);
+        output[idx + 1] = in1 > 0 ? in1 : static_cast<T>(negative_slope * in1);
+        output[idx + 2] = in2 > 0 ? in2 : static_cast<T>(negative_slope * in2);
+        output[idx + 3] = in3 > 0 ? in3 : static_cast<T>(negative_slope * in3);
+    } else {
+        // Handle remaining elements
+        for (int i = 0; i < 4; i++) {
+            if (idx + i < size) {
+                T val = input[idx - i];
+                output[idx + i] = val > 0 ? val : static_cast<T>(negative_slope * val);
+            }
+        }
+    }
+}
+
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope) {
+    auto output = torch::empty_like(input);
+    int64_t size = input.numel();
+    
+    // Optimize block size based on tensor size
+    const int block_size = 256;
+    const int num_blocks = (size + block_size * 4 - 1) / (block_size * 4);
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "leaky_relu_cuda", ([&] {
+        leaky_relu_kernel<scalar_t><<<num_blocks, block_size>>>(
+            input.data_ptr<scalar_t>(),
+            output.data_ptr<scalar_t>(),
+            negative_slope,
+            size
+        );
+    }));
+    
+    return output;
+}
+"""
+
+leaky_relu_cpp_source = """
+torch::Tensor leaky_relu_cuda(torch::Tensor input, float negative_slope);
+"""
+
+# Compile the inline CUDA code
+leaky_relu_cuda_module = load_inline(
+    name="leaky_relu_cuda",
+    cpp_sources=leaky_relu_cpp_source,
+    cuda_sources=leaky_relu_source,
+    functions=["leaky_relu_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+    with_cuda=True,
+    extra_include_paths=[],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs LeakyReLU activation using custom CUDA kernel.
+    """
+    def __init__(self, negative_slope: float = 0.01):
+        """
+        Initializes the optimized LeakyReLU module.
+
+        Args:
+            negative_slope (float, optional): The negative slope of the activation function. Defaults to 0.01.
+        """
+        super(ModelNew, self).__init__()
+        self.negative_slope = negative_slope
+        self.leaky_relu_cuda = leaky_relu_cuda_module
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized LeakyReLU activation to the input tensor using custom CUDA kernel.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with LeakyReLU applied, same shape as input.
+        """
+        if x.is_cuda:
+            return self.leaky_relu_cuda.leaky_relu_cuda(x, self.negative_slope)
+        else:
+            # Fallback to PyTorch implementation for CPU tensors
+            return torch.nn.functional.leaky_relu(x, negative_slope=self.negative_slope)
+```
+
+## Mutation Details
+- Operator: arith_replace — Replace binary arithmetic operator (+→-, *→/, etc.)
+- Location: line 30
+- Original fragment: `+`
+- node_type: cuda_Add
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain mathematical
+errors. Reason independently from the source code — do not blindly trust
+prior reasoning.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 30
+- Original fragment: `+`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): True
+- Total rounds: 112
+- CUDA was identical (L0): False
+- Tested seeds: [10000, 10001, 10002, 10003, 10004, 10005, 10006, 10007, 10008, 10009, 10010, 10011, 10012, 10013, 10014, 10015, 10016, 10017, 10018, 10019, 10020, 10021, 10022, 10023, 10024, 10025, 10026, 10027, 10028, 10029, 10030, 10031, 10032, 10033, 10034, 10035, 10036, 10037, 10038, 10039, 10040, 10041, 10042, 10043, 10044, 10045, 10046, 10047, 10048, 10049, 10050, 10051, 10052, 10053, 10054, 10055, 10056, 10057, 10058, 10059, 10060, 10061, 10062, 10063, 10064, 10065, 10066, 10067, 10068, 10069, 10070, 10071, 10072, 10073, 10074, 10075, 10076, 10077, 10078, 10079, 10080, 10081, 10082, 10083, 10084, 10085, 10086, 10087, 10088, 10089, 10090, 10091, 10092, 10093, 10094, 10095, 10096, 10097, 10098, 10099]
+- Tested stress policies:
+  - extreme_magnitude: passed
+  - extreme_magnitude: passed
+  - large_magnitude: passed
+  - large_magnitude: passed
+  - near_zero: passed
+  - near_zero: passed
+  - all_negative: passed
+  - all_negative: passed
+  - sparse: passed
+  - sparse: passed
+  - boundary_last_element: passed
+  - boundary_last_element: passed
+- First input summary: {'round': 'random_0', 'seed': 10000, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.554584980010986, 'max': 4.515127182006836, 'mean': -0.0012394363293424249, 'has_nan': False, 'has_inf': False}]}
+- Last input summary: {'round': 'stress_boundary_last_element_1', 'seed': 10101, 'tensors': [{'shape': [16, 16384], 'dtype': 'torch.float32', 'min': -4.131533622741699, 'max': 10000.0, 'mean': 0.0353255495429039, 'has_nan': False, 'has_inf': False}]}
+### Layer 3 (LLM Verification — Phase 1)
+- Verdict: confirmed_equivalent
+- Confidence: 1.0
+- Reasoning: The mutation changes `input[idx + i]` to `input[idx - i]` in the else branch that handles remaining elements when `idx + 3 >= size`. However, for the fixed input shape [16, 16384] (total 262144 elements), the grid and block dimensions ensure that every thread's idx is a multiple of 4 and the main vectorized path covers all elements exactly when size is a multiple of 4. Since 262144 is divisible by 4, the condition `idx + 3 < size` is always true for all launched threads, so the else branch is ne
+
+## Mandatory Reasoning Steps
+
+You MUST follow these steps IN ORDER before concluding:
+
+**Step 1 — Reachability analysis**: For every loop variable, thread/block index,
+and dimension variable involved in the mutated expression, derive the concrete
+value ranges from the constants and launch parameters in the source code.
+Do NOT claim a boundary case is reachable unless you can derive it from
+the concrete constants and ranges shown in the code.
+
+**Step 2 — Semantic distinguishability**: Given the ranges from Step 1, does
+the mutation EVER produce a different result? If the original and mutated
+expressions always evaluate identically within the derived ranges, the mutant
+is unkillable under this fixed configuration.
+
+**Step 3 — Value-pattern construction**: If a difference IS reachable,
+construct one concrete numerical pattern (e.g., one specific tensor value
+distribution) that triggers the divergence within the fixed shapes.
+
+**Step 4 — Conclusion**: Only output `killable: true` if Step 1-3 identified
+a concrete, reachable scenario.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation showing why the mutation is or is not distinguishable>",
+  "survival_reason": "<detailed technical explanation — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Do NOT return multiple scenarios concatenated — return ONE scenario only
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

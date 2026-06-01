@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P8__epsilon_modify__0",
+  "operator_name": "epsilon_modify",
+  "kernel_name": "L1_P8",
+  "tier": 3,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7548,
+        "completion_tokens": 6072,
+        "total_tokens": 13620,
+        "reasoning_tokens": 2486
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes rtol in torch.allclose from 1e-4 to 1e-2. To kill: need custom_kernel error vs PyTorch in range (atol + 1e-4*|ref|, atol + 1e-2*|ref|]. For ref~1e4, thresholds are ~1.0 vs ~100. Catastrophic cancellation with large intermediates (±1e6) summing to small result (~1e4) creates accumulation errors ~O(sqrt(K)*v*eps) ≈ 54. This falls in (1.0, 100] range, causing original to return torch_result (check fails) while mutant returns custom_result (check passes).",
+      "survival_reason": "The mutant survived because standard test distributions (randn, uniform) produce well-behaved accumulations where the custom CUDA kernel closely matches PyTorch's matmul within 1e-4 relative tolerance. The key insight is that floating-point differences between the two implementations only become significant when catastrophic cancellation occurs: large positive and negative intermediate values that nearly cancel to a small result. With K=2949 accumulation terms, alternating ±1e6 values creates substantial rounding error (~54 absolute) relative to a target sum of 1e4, hitting the gray zone between 1e-4 and 1e-2 relative tolerance where the mutation changes behavior.",
+      "killable": true,
+      "kill_strategy": "Create inputs with catastrophic cancellation: A has alternating +1e6, -1e6 values that cancel to nearly zero, plus a small offset (1e4) in the last column. B is all ones. This maximizes floating-point accumulation error relative to the result magnitude, creating differences that exceed rtol=1e-4 but stay within rtol=1e-2, causing original to fallback to torch_result while mutant returns custom_result.",
+      "recommendations": "Add catastrophic cancellation tests to the test suite: inputs with large positive/negative values that nearly cancel to small results expose floating-point ordering sensitivity between different matmul implementations. This is critical for tolerance-based branching logic.",
+      "suggested_code": "def generate_inputs(device):\n    A = torch.zeros(8205, 2949, device=device, dtype=torch.float32)\n    B = torch.ones(2949, 5921, device=device, dtype=torch.float32)\n    \n    v = 1e6\n    delta = 1e4\n    \n    # 1474 positive values at even indices 0,2,4,...,2946\n    A[:, 0:2948:2] = v\n    # 1474 negative values at odd indices 1,3,5,...,2947 (cancel positives)\n    A[:, 1:2948:2] = -v\n    # Last element adds delta so true result is delta, not 0\n    A[:, 2948] = delta\n    \n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7222,
+        "completion_tokens": 4556,
+        "total_tokens": 11778,
+        "reasoning_tokens": 1702
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "For mutant to return custom_result: error ≤ atol + rtol_mut * |result| = 1e-4 + 0.01*|result|. For test to kill: error > 1e-2 + 0.01*|result|. Since 1e-4 + 0.01*|result| < 1e-2 + 0.01*|result| for all result values, any error that passes the mutant's check will also pass the test's comparison. The tolerance relationship makes killing mathematically impossible.",
+      "survival_reason": "The mutation relaxes the internal verification tolerance from rtol=1e-4 to rtol=1e-2. However, the external test comparison uses atol=1e-2, rtol=1e-2. The mutant's acceptance threshold (1e-4 + 0.01*|result|) is strictly less than the test's acceptance threshold (1e-2 + 0.01*|result|). Any error small enough for the mutant to return custom_result will automatically be small enough to pass the test comparison. Additionally, Layer 2 testing confirmed the custom kernel produces bitwise identical results to PyTorch's matmul, meaning no actual computation difference exists.",
+      "killable": false,
+      "kill_strategy": "Unkillable due to mathematical relationship between tolerances. The mutant's internal verification tolerance (allowing custom_result return) is strictly tighter than the test's comparison tolerance. No input values can create errors that satisfy both conditions simultaneously.",
+      "recommendations": "When testing tolerance mutations, verify that the test harness tolerance is not more permissive than the mutated tolerance. For mutation testing to be effective, test tolerances should be tighter than internal verification tolerances. Consider using exact equality or tighter tolerances in the test harness for epsilon mutations.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 2
+  },
+  "elapsed_sec": 243.54
+}

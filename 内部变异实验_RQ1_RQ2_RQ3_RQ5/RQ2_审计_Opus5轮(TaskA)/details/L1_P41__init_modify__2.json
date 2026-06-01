@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P41__init_modify__2",
+  "operator_name": "init_modify",
+  "kernel_name": "L1_P41",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8896,
+        "completion_tokens": 4838,
+        "total_tokens": 13734,
+        "reasoning_tokens": 2096
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With input shape [16,64,128] and typical kernel_size=2/stride=2, total_elements=65536 triggers mutated kernel. When max_val=-1e10f and all window values < -1e10f (e.g., -2e10), the comparison (val > max_val) is always false, returning -1e10f instead of true maximum.",
+      "survival_reason": "The mutation survived because all 112+ test rounds used input values in the range of approximately [-4.3, +4.5] or scaled extreme values that never went below -1e10. The standard test policies (all_negative, extreme_magnitude) use distributions based on randn which produce values nowhere near -1e10f. The Layer 3 analysis correctly identified this gap but no subsequent test actually filled tensors with values below -1e10f.",
+      "killable": true,
+      "kill_strategy": "Fill the entire input tensor with values less than -1e10f, such as -2e10 or -1e11. This ensures every pooling window contains only values below the mutant's initial threshold, causing the mutant to return -1e10f while the reference returns the actual maximum.",
+      "recommendations": "Add 'extreme_negative' stress policy that tests values below common finite initialization thresholds like -1e10, -1e20, -1e38. Any reduction operation initialized with a finite sentinel instead of -INFINITY is vulnerable to this class of input.",
+      "suggested_code": "def generate_inputs(device):\n    # All values set to -2e10, below the mutant's initial -1e10f threshold\n    # This ensures max_val is never updated in the mutant kernel\n    x = torch.full((16, 64, 128), -2e10, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8420,
+        "completion_tokens": 3957,
+        "total_tokens": 12377,
+        "reasoning_tokens": 1404
+      },
+      "reason_category": "predicate_unreachable",
+      "proof_sketch": "total_elements = batch_size × channels × output_length = 16 × 64 × output_length. For the mutated kernel (maxpool1d_forward_kernel_batch_channel_parallel) to execute, total_elements ≥ 65536, requiring output_length ≥ 64. With typical pooling params (kernel_size=4, stride=2, padding=0), output_length = (128-4)/2+1 = 63, giving total_elements = 64512 < 65536. The first (unmutated) kernel always executes.",
+      "survival_reason": "The mutation is located in maxpool1d_forward_kernel_batch_channel_parallel, which is only executed when total_elements >= 65536. With the fixed input shape [16, 64, 128] and the model's pooling parameters, total_elements evaluates to approximately 64512 (depending on exact kernel_size/stride), which is below the 65536 threshold. Consequently, only the first kernel (maxpool1d_forward_kernel) executes, and this kernel is NOT mutated. The mutation is dead code under the main testing contract's fixed configuration.",
+      "killable": false,
+      "kill_strategy": "The mutation cannot be killed under the main testing contract because it exists in a code path that is never executed for the fixed input shape [16, 64, 128]. To expose this mutation, one would need either: (1) a larger input shape such that total_elements >= 65536, or (2) different model parameters yielding higher output_length. Neither is permitted under the fixed-shape contract.",
+      "recommendations": "Mutation testing should ensure mutations are placed in reachable code paths for all tested configurations. This kernel has a branch selecting between two implementations based on problem size - mutations in the 'large problem' path may be unreachable when testing with smaller fixed shapes. Consider adding explicit path-coverage tracking to identify such dead-code mutations.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 3
+  },
+  "elapsed_sec": 231.89
+}

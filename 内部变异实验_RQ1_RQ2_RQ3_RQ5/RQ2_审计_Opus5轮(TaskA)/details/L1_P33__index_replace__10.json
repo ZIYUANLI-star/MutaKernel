@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P33__index_replace__10",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P33",
+  "tier": 3,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9862,
+        "completion_tokens": 4226,
+        "total_tokens": 14088,
+        "reasoning_tokens": 1811
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation `threadIdx.x → threadIdx.y` is in `compute_mean_var_kernel` (line 58). This kernel is ONLY called when `training=True` (see line 172-183 in the CUDA host code: `if (!training) {...} else { compute_mean_var_kernel<<<...>>>(...); }`). The kernel launch is `<<<num_features, 256>>>` which is 1D, making `blockDim.x=256` and `blockDim.y=1`. With the mutation, `tid=threadIdx.y=0` for ALL 256 threads. This causes: (1) all threads process only indices 0,256,512... (1/256th of data), (2) race conditions writing to shared_sum[0], (3) reduction reads uninitialized shared_sum[1..255]. The mutant survives because testing evidence shows 'Training Mode (.train()): SKIPPED: operator_not_applicable' - the mutated code path was never executed.",
+      "survival_reason": "The mutation affects only the `compute_mean_var_kernel` which is exclusively used in training mode. The test framework explicitly skipped training mode testing, marking it as 'operator_not_applicable'. In eval mode, the code branches to `batchnorm2d_forward_inference_kernel` which uses running statistics and bypasses the mutated kernel entirely. This is why 112 rounds of bitwise comparison showed identical results - the mutated code was never executed. The EMD Layer 3 analysis incorrectly concluded equivalence without recognizing that the training code path produces catastrophically wrong results (summing only 1/256th of elements).",
+      "killable": true,
+      "kill_strategy": "Run the model in training mode (.train()) before forward pass. With blockDim.y=1, all threads get tid=0, causing them to only process every 256th element (indices 0, 256, 512...) instead of all elements. The computed batch mean and variance will be based on only ~0.4% of the data, producing dramatically wrong normalization output. Any non-constant input distribution will expose this.",
+      "recommendations": "Always exercise BOTH training and inference code paths when testing BatchNorm-like operators. The 'operator_not_applicable' skip logic incorrectly excluded a critical code path where the mutation has catastrophic effects. Test frameworks should detect which code paths contain mutations and ensure those paths are exercised regardless of default heuristics.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 64, 256, 256]\n    # Create pattern where every 256th element (spatially) differs from others\n    # The spatial layout is H*W = 65536 elements per channel\n    # With stride=256 sampling, only elements at positions 0,256,512... are read\n    x = torch.zeros(16, 64, 256, 256, device=device, dtype=torch.float32)\n    \n    # Fill with large positive values\n    x.fill_(100.0)\n    \n    # At positions that would be sampled (every 256th in flattened spatial dim),\n    # put large negative values. This creates huge statistical difference.\n    # In training mode mutant: mean ≈ -100, var ≈ 0\n    # Correct: mean ≈ 99.6, var ≈ very small\n    x_flat = x.view(16, 64, -1)  # [16, 64, 65536]\n    x_flat[:, :, ::256] = -100.0  # Set every 256th to -100\n    \n    return [x.contiguous()]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9615,
+        "completion_tokens": 3751,
+        "total_tokens": 13366,
+        "reasoning_tokens": 1531
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation is on line 58 in compute_mean_var_kernel. This kernel is called only when training=True (line 170-180 in host code). The test framework runs model.eval() (confirmed by 'Training Mode: SKIPPED'). generate_inputs() cannot modify model.training state. Therefore: training=False → inference kernel runs → mutated kernel never executes → no observable difference possible.",
+      "survival_reason": "The mutation replaces threadIdx.x with threadIdx.y in compute_mean_var_kernel. This kernel only executes during training mode (when self.training=True). The testing framework runs the model in eval mode by default, and generate_inputs() has no mechanism to switch the model to training mode. Since the mutated code path is never executed in eval mode, the inference-mode kernel (batchnorm2d_forward_inference_kernel) runs instead, which is unaffected by this mutation. The bitwise-identical results across all 112+ test rounds confirm the mutated kernel was never invoked.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable under the current testing contract. The mutation affects training-mode-only code, but the test framework cannot exercise training mode through generate_inputs(). To kill this mutant, the testing framework would need to support: (1) model.train() calls before forward pass, or (2) a separate training-mode test track that actually invokes the training code path. The 'Training Mode: SKIPPED' result confirms this capability is missing.",
+      "recommendations": "For BatchNorm kernels with separate training/inference paths, mutation testing frameworks must explicitly test BOTH modes. Add a testing track that runs model.train() before forward pass to exercise training-specific kernels like compute_mean_var_kernel. The current 'operator_not_applicable' skip for training mode leaves the entire training codepath untested for mutations.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 222.61
+}

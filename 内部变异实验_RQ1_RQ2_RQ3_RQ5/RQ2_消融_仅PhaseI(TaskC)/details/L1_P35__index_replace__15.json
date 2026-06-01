@@ -1,0 +1,73 @@
+{
+  "mutant_id": "L1_P35__index_replace__15",
+  "operator_name": "index_replace",
+  "kernel_name": "L1_P35",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6337,
+        "completion_tokens": 1949,
+        "total_tokens": 8286,
+        "reasoning_tokens": 756
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The kernel launches with 1D thread blocks: `threads_per_block = 256` and `dim3 blocks(batch_size * num_groups)`. In 1D CUDA configurations, `threadIdx.z = 0` always for all threads. The mutation changes `shared_data[threadIdx.x]` to `shared_data[threadIdx.z]`, meaning ALL threads with `threadIdx.x < stride` (0 to 127 in first iteration) simultaneously write to `shared_data[0]` instead of their own positions. This creates a severe race condition that completely breaks the parallel reduction for computing the mean.",
+      "survival_reason": "The mutation replaces `threadIdx.x` with `threadIdx.z` on the left side of the reduction accumulation. Since threads are launched in a 1D configuration (256 threads per block), `threadIdx.z` is always 0 for every thread. In the original code, each thread writes to its own shared memory position during reduction; in the mutated code, all active threads race to write to position 0. This race condition produces an incorrect sum, leading to a wrong mean value. The wrong mean then propagates to the variance calculation (which subtracts the mean), and finally to the normalized output. Any input with non-constant values will expose this bug.",
+      "killable": true,
+      "kill_strategy": "Use any input tensor with varying values. The broken parallel reduction will compute an incorrect mean (due to race conditions), which cascades to incorrect variance and incorrect normalized outputs. Large magnitude values amplify the absolute difference.",
+      "recommendations": "When testing parallel reductions in CUDA kernels, verify that thread indexing is correct across all dimensions. Mutations to thread indices (x→y→z) in reduction operations are particularly dangerous as they can create race conditions that produce non-deterministic, incorrect results. Include explicit tests for reduction correctness with known-sum inputs.",
+      "suggested_code": "def generate_inputs(device):\n    # Large magnitude random values to amplify the effect of incorrect mean calculation\n    # The mutation causes a race condition where all threads write to shared_data[0]\n    # instead of their respective positions during reduction\n    torch.manual_seed(42)\n    x = torch.randn(16, 64, 256, 256, device=device, dtype=torch.float32) * 1000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6186,
+        "completion_tokens": 4816,
+        "total_tokens": 11002,
+        "reasoning_tokens": 2383
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes shared_data[threadIdx.x] to shared_data[threadIdx.z] where threadIdx.z=0 for all threads in 1D launch. This breaks parallel reduction - instead of proper tree reduction, all threads race to write to shared_data[0]. With 256 threads and 8 reduction steps, only ~9 partial sums get accumulated (those from positions 0,128,64,32,16,8,4,2,1) instead of all 256. Mean = broken_sum/group_elements ≈ (9/256)*correct_sum/group_elements ≈ 0.035*correct_mean.",
+      "survival_reason": "The previous attempt used random values where the infection (wrong mean) propagated but the relative error was masked by the also-wrong variance calculation and large absolute values. With random data, even with wrong statistics, the normalized output has similar distribution characteristics. The key insight is that CONSTANT input creates a pathological case: correct variance=0 (all values same), but with wrong mean, variance becomes (val-wrong_mean)² which is large. This transforms correct output=0 into broken output≈1, a massive absolute difference.",
+      "killable": true,
+      "kill_strategy": "Use constant-valued input tensor. With all values=C: correct_mean=C, correct_var=0, correct_normalized=0. With broken reduction: broken_mean≈0.035C, broken_var≈0.93C², broken_normalized≈1. The absolute difference exceeds tolerance threshold by orders of magnitude.",
+      "recommendations": "Parallel reduction kernels should be tested with constant inputs (zero variance case) to verify mean/variance calculations are mathematically correct, as the zero-variance case creates extreme sensitivity to mean computation errors.",
+      "suggested_code": "def generate_inputs(device):\n    # All-constant input: correct mean=100, variance=0, normalized=0\n    # Broken reduction computes mean≈3.5 (only ~9/256 partial sums)\n    # With wrong mean, variance becomes (100-3.5)²≈9312 instead of 0\n    # Correct output≈0, broken output≈(100-3.5)/96.5≈1.0\n    x = torch.full((16, 64, 256, 256), fill_value=100.0, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": true,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": false,
+        "diff_summary": "max_diff=1.000125e+00, mean_diff=1.000126e+00, ref_range=[-1.2207e-04,-1.2207e-04], mut_range=[1.0000e+00,1.0000e+00]",
+        "error": ""
+      },
+      "killed": true
+    }
+  ],
+  "killed": true,
+  "killing_round": 2,
+  "model_id": "claude-opus-4-5-20251101",
+  "test_construction_rule": {
+    "kill_strategy": "Use constant-valued input tensor. With all values=C: correct_mean=C, correct_var=0, correct_normalized=0. With broken reduction: broken_mean≈0.035C, broken_var≈0.93C², broken_normalized≈1. The absolute difference exceeds tolerance threshold by orders of magnitude.",
+    "suggested_code": "def generate_inputs(device):\n    # All-constant input: correct mean=100, variance=0, normalized=0\n    # Broken reduction computes mean≈3.5 (only ~9/256 partial sums)\n    # With wrong mean, variance becomes (100-3.5)²≈9312 instead of 0\n    # Correct output≈0, broken output≈(100-3.5)/96.5≈1.0\n    x = torch.full((16, 64, 256, 256), fill_value=100.0, device=device, dtype=torch.float32)\n    return [x]"
+  },
+  "elapsed_sec": 162.84
+}

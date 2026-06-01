@@ -1,0 +1,374 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a masked cumulative sum, only summing elements that satisfy a condition.
+
+    Parameters:
+        dim (int): The dimension along which to perform the masked cumulative sum.
+    """
+
+    def __init__(self, dim):
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        """
+        return torch.cumsum(x * mask, dim=self.dim)
+
+batch_size = 128
+input_shape = (4000,)
+dim = 1
+
+def get_inputs():
+    x = torch.randn(batch_size, *input_shape)
+    mask = torch.randint(0, 2, x.shape).bool()  # Random boolean mask
+    return [x, mask]
+
+def get_init_inputs():
+    return [dim]
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for optimized masked cumulative sum
+masked_cumsum_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<typename scalar_t>
+__global__ void masked_cumsum_kernel(
+    const scalar_t* __restrict__ input,
+    const bool* __restrict__ mask,
+    scalar_t* __restrict__ output,
+    const int64_t outer_size,
+    const int64_t dim_size,
+    const int64_t inner_size
+) {
+    // Each block handles one outer position
+    const int64_t outer_idx = blockIdx.x;
+    if (outer_idx >= outer_size) return;
+    
+    // Each thread handles multiple inner positions with vectorized loads
+    const int64_t base_offset = outer_idx * dim_size * inner_size;
+    
+    // Process inner positions in parallel
+    for (int64_t inner_idx = threadIdx.x; inner_idx < inner_size; inner_idx += blockDim.x) {
+        scalar_t cum_sum = 0;
+        
+        // Sequential scan along the cumulative dimension
+        for (int64_t dim_idx = 0; dim_idx < dim_size; dim_idx++) {
+            const int64_t offset = base_offset + dim_idx * inner_size + inner_idx;
+            if (mask[offset]) {
+                cum_sum += input[offset];
+            }
+            output[offset] = cum_sum;
+        }
+    }
+}
+
+torch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim) {
+    // Validate inputs
+    TORCH_CHECK(input.sizes() == mask.sizes(), "Input and mask must have same shape");
+    TORCH_CHECK(mask.scalar_type() == torch::kBool, "Mask must be boolean tensor");
+    TORCH_CHECK(dim >= 0 && dim < input.dim(), "Dimension out of range");
+    
+    auto output = torch::empty_like(input);
+    
+    // Get tensor dimensions
+    auto sizes = input.sizes();
+    
+    // Calculate dimensions for kernel launch
+    int64_t outer_size = 1;
+    for (int64_t i = 0; i < dim; i++) {
+        outer_size *= sizes[i];
+    }
+    
+    int64_t dim_size = sizes[dim];
+    
+    int64_t inner_size = 1;
+    for (int64_t i = dim + 1; i < input.dim(); i++) {
+        inner_size *= sizes[i];
+    }
+    
+    // Launch kernel with optimized configuration
+    // Use maximum threads per block for better occupancy
+    const int block_size = 256;
+    dim3 grid_size(outer_size);
+    dim3 block_size_dim(min(block_size, (int)inner_size));
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(
+        input.scalar_type(),
+        "masked_cumsum_kernel",
+        [&] {
+            masked_cumsum_kernel<scalar_t><<<grid_size, block_size_dim>>>(
+                input.data_ptr<scalar_t>(),
+                mask.data_ptr<bool>(),
+                output.data_ptr<scalar_t>(),
+                outer_size,
+                dim_size,
+                inner_size
+            );
+        }
+    );
+    
+    return output;
+}
+"""
+
+masked_cumsum_cpp_source = """
+torch::Tensor masked_cumsum_cuda(torch::Tensor input, torch::Tensor mask, int64_t dim);
+"""
+
+# Compile the inline CUDA code
+masked_cumsum = load_inline(
+    name="masked_cumsum",
+    cpp_sources=masked_cumsum_cpp_source,
+    cuda_sources=masked_cumsum_source,
+    functions=["masked_cumsum_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs a masked cumulative sum using custom CUDA kernel.
+    
+    Parameters:
+        dim (int): The dimension along which to perform the masked cumulative sum.
+    """
+    
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+        self.masked_cumsum = masked_cumsum
+    
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+            
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        """
+        return self.masked_cumsum.masked_cumsum_cuda(x, mask, self.dim)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 74)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=large_magnitude, seed=42, mode=eval_value:
+      max_diff=3.437500e-01, mean_diff=1.367750e-02, ref_range=[-1.4183e+05,1.1545e+05], orig_range=[-1.4183e+05,1.1545e+05]
+[2] policy=large_magnitude, seed=43, mode=eval_value:
+      max_diff=1.562500e-01, mean_diff=1.344710e-02, ref_range=[-1.2997e+05,1.3704e+05], orig_range=[-1.2997e+05,1.3704e+05]
+[3] policy=mixed_extremes, seed=45, mode=eval_value:
+      max_diff=8.125000e-01, mean_diff=7.036328e-02, ref_range=[-1.0921e+06,9.5679e+05], orig_range=[-1.0921e+06,9.5679e+05]
+[4] policy=mixed_extremes, seed=46, mode=eval_value:
+      max_diff=6.250000e-01, mean_diff=6.336457e-02, ref_range=[-1.0297e+06,8.5213e+05], orig_range=[-1.0297e+06,8.5213e+05]
+[5] policy=mixed_extremes, seed=47, mode=eval_value:
+      max_diff=8.750000e-01, mean_diff=6.434155e-02, ref_range=[-7.6986e+05,7.8038e+05], orig_range=[-7.6986e+05,7.8038e+05]
+[6] policy=near_overflow, seed=51, mode=eval_value:
+      max_diff=2.611280e+26, mean_diff=1.217253e+25, ref_range=[-1.1651e+32,1.7360e+32], orig_range=[-1.1651e+32,1.7360e+32]
+[7] policy=near_overflow, seed=52, mode=eval_value:
+      max_diff=1.837567e+26, mean_diff=1.305499e+25, ref_range=[-1.0946e+32,1.3850e+32], orig_range=[-1.0946e+32,1.3850e+32]
+[8] policy=near_overflow, seed=53, mode=eval_value:
+      max_diff=1.257283e+26, mean_diff=1.206333e+25, ref_range=[-1.1036e+32,1.5558e+32], orig_range=[-1.1036e+32,1.5558e+32]
+[9] policy=head_heavy, seed=81, mode=eval_value:
+      max_diff=1.187500e+00, mean_diff=3.024141e-02, ref_range=[-1.1197e+06,1.3903e+06], orig_range=[-1.1197e+06,1.3903e+06]
+[10] policy=head_heavy, seed=83, mode=eval_value:
+      max_diff=1.875000e+00, mean_diff=3.489204e-02, ref_range=[-1.2540e+06,1.1146e+06], orig_range=[-1.2540e+06,1.1146e+06]
+[11] policy=tail_heavy, seed=84, mode=eval_value:
+      max_diff=1.000000e+00, mean_diff=2.879737e-02, ref_range=[-1.1310e+06,8.7251e+05], orig_range=[-1.1310e+06,8.7251e+05]
+[12] policy=tail_heavy, seed=85, mode=eval_value:
+      max_diff=2.125000e+00, mean_diff=3.739204e-02, ref_range=[-9.8903e+05,9.8378e+05], orig_range=[-9.8903e+05,9.8378e+05]
+[13] policy=tail_heavy, seed=86, mode=eval_value:
+      max_diff=1.062500e+00, mean_diff=2.912188e-02, ref_range=[-8.3242e+05,1.0516e+06], orig_range=[-8.3242e+05,1.0516e+06]
+[14] policy=extreme_magnitude, seed=90, mode=eval_value:
+      max_diff=1.360000e+02, mean_diff=1.210165e+01, ref_range=[-1.2568e+08,1.1909e+08], orig_range=[-1.2568e+08,1.1909e+08]
+[15] policy=extreme_magnitude, seed=91, mode=eval_value:
+      max_diff=3.360000e+02, mean_diff=1.431343e+01, ref_range=[-1.6164e+08,1.6017e+08], orig_range=[-1.6164e+08,1.6017e+08]
+[16] policy=extreme_magnitude, seed=92, mode=eval_value:
+      max_diff=1.960000e+02, mean_diff=1.421629e+01, ref_range=[-1.2485e+08,1.3092e+08], orig_range=[-1.2485e+08,1.3092e+08]
+[17] policy=reduction_adversarial, seed=96, mode=eval_value:
+      max_diff=1.250000e+00, mean_diff=8.275311e-02, ref_range=[-9.4000e+05,9.7000e+05], orig_range=[-9.4000e+05,9.7000e+05]
+[18] policy=reduction_adversarial, seed=97, mode=eval_value:
+      max_diff=1.062500e+00, mean_diff=8.807115e-02, ref_range=[-1.0900e+06,9.2000e+05], orig_range=[-1.0900e+06,9.2000e+05]
+[19] policy=reduction_adversarial, seed=98, mode=eval_value:
+      max_diff=8.125000e-01, mean_diff=8.400545e-02, ref_range=[-9.7000e+05,9.3000e+05], orig_range=[-9.7000e+05,9.3000e+05]
+[20] policy=near_overflow, seed=42, mode=eval_value:
+      max_diff=1.644139e+26, mean_diff=1.250269e+25, ref_range=[-1.4183e+32,1.1545e+32], orig_range=[-1.4183e+32,1.1545e+32]
+[21] policy=near_overflow, seed=43, mode=eval_value:
+      max_diff=1.740853e+26, mean_diff=1.348081e+25, ref_range=[-1.2997e+32,1.3704e+32], orig_range=[-1.2997e+32,1.3704e+32]
+[22] policy=near_overflow, seed=44, mode=eval_value:
+      max_diff=1.257283e+26, mean_diff=1.392245e+25, ref_range=[-1.1527e+32,1.0393e+32], orig_range=[-1.1527e+32,1.0393e+32]
+[23] policy=near_overflow, seed=45, mode=eval_value:
+      max_diff=1.740853e+26, mean_diff=1.393295e+25, ref_range=[-1.4077e+32,1.2648e+32], orig_range=[-1.4077e+32,1.2648e+32]
+[24] policy=near_overflow, seed=46, mode=eval_value:
+      max_diff=1.450711e+26, mean_diff=1.294250e+25, ref_range=[-1.1266e+32,1.0981e+32], orig_range=[-1.1266e+32,1.0981e+32]
+[25] policy=mixed_extremes, seed=67, mode=eval_value:
+      max_diff=5.625000e-01, mean_diff=6.280249e-02, ref_range=[-1.0001e+06,7.6524e+05], orig_range=[-1.0001e+06,7.6524e+05]
+[26] policy=mixed_extremes, seed=68, mode=eval_value:
+      max_diff=7.500000e-01, mean_diff=7.032245e-02, ref_range=[-9.2442e+05,9.4546e+05], orig_range=[-9.2442e+05,9.4546e+05]
+[27] policy=mixed_extremes, seed=69, mode=eval_value:
+      max_diff=8.125000e-01, mean_diff=6.260923e-02, ref_range=[-8.5294e+05,8.9682e+05], orig_range=[-8.5294e+05,8.9682e+05]
+[28] policy=mixed_extremes, seed=70, mode=eval_value:
+      max_diff=1.062500e+00, mean_diff=7.295245e-02, ref_range=[-7.3858e+05,1.3456e+06], orig_range=[-7.3858e+05,1.3456e+06]
+[29] policy=mixed_extremes, seed=71, mode=eval_value:
+      max_diff=1.000000e+00, mean_diff=6.535471e-02, ref_range=[-8.9077e+05,9.7548e+05], orig_range=[-8.9077e+05,9.7548e+05]
+[30] policy=extreme_magnitude, seed=87, mode=eval_value:
+      max_diff=1.920000e+02, mean_diff=1.382724e+01, ref_range=[-1.1840e+08,1.2043e+08], orig_range=[-1.1840e+08,1.2043e+08]
+[31] policy=extreme_magnitude, seed=88, mode=eval_value:
+      max_diff=1.360000e+02, mean_diff=1.143234e+01, ref_range=[-1.2207e+08,1.2867e+08], orig_range=[-1.2207e+08,1.2867e+08]
+[32] policy=extreme_magnitude, seed=89, mode=eval_value:
+      max_diff=1.520000e+02, mean_diff=1.229751e+01, ref_range=[-1.2918e+08,1.1435e+08], orig_range=[-1.2918e+08,1.1435e+08]
+[33] policy=reduction_adversarial, seed=99, mode=eval_value:
+      max_diff=6.806641e-01, mean_diff=8.084807e-02, ref_range=[-8.3000e+05,8.7000e+05], orig_range=[-8.3000e+05,8.7000e+05]
+[34] policy=reduction_adversarial, seed=100, mode=eval_value:
+      max_diff=1.000000e+00, mean_diff=8.648165e-02, ref_range=[-9.9000e+05,1.1500e+06], orig_range=[-9.9000e+05,1.1500e+06]
+[35] policy=reduction_adversarial, seed=101, mode=eval_value:
+      max_diff=9.375000e-01, mean_diff=9.235692e-02, ref_range=[-9.1000e+05,9.7000e+05], orig_range=[-9.1000e+05,9.7000e+05]
+[36] policy=mixed_extremes, seed=57, mode=eval_value:
+      max_diff=5.625000e-01, mean_diff=6.419787e-02, ref_range=[-7.2231e+05,9.1129e+05], orig_range=[-7.2231e+05,9.1129e+05]
+[37] policy=mixed_extremes, seed=58, mode=eval_value:
+      max_diff=8.750000e-01, mean_diff=6.351155e-02, ref_range=[-8.1382e+05,7.6994e+05], orig_range=[-8.1382e+05,7.6994e+05]
+[38] policy=extreme_magnitude, seed=69, mode=eval_value:
+      max_diff=1.360000e+02, mean_diff=1.143618e+01, ref_range=[-1.2170e+08,1.2093e+08], orig_range=[-1.2170e+08,1.2093e+08]
+[39] policy=extreme_magnitude, seed=70, mode=eval_value:
+      max_diff=1.360000e+02, mean_diff=1.313306e+01, ref_range=[-1.0941e+08,1.3739e+08], orig_range=[-1.0941e+08,1.3739e+08]
+[40] policy=extreme_magnitude, seed=71, mode=eval_value:
+      max_diff=1.280000e+02, mean_diff=1.217497e+01, ref_range=[-1.3502e+08,1.4216e+08], orig_range=[-1.3502e+08,1.4216e+08]
+[41] policy=reduction_adversarial, seed=75, mode=eval_value:
+      max_diff=7.500000e-01, mean_diff=9.585478e-02, ref_range=[-8.8000e+05,7.6000e+05], orig_range=[-8.8000e+05,7.6000e+05]
+[42] policy=reduction_adversarial, seed=76, mode=eval_value:
+      max_diff=6.562500e-01, mean_diff=7.675989e-02, ref_range=[-7.4000e+05,8.3000e+05], orig_range=[-7.4000e+05,8.3000e+05]
+[43] policy=reduction_adversarial, seed=77, mode=eval_value:
+      max_diff=7.500000e-01, mean_diff=8.535659e-02, ref_range=[-1.0900e+06,1.0100e+06], orig_range=[-1.0900e+06,1.0100e+06]
+[44] policy=near_overflow, seed=47, mode=eval_value:
+      max_diff=1.547425e+26, mean_diff=1.223525e+25, ref_range=[-1.3465e+32,1.1719e+32], orig_range=[-1.3465e+32,1.1719e+32]
+[45] policy=near_overflow, seed=48, mode=eval_value:
+      max_diff=1.934281e+26, mean_diff=1.257251e+25, ref_range=[-1.8193e+32,1.2799e+32], orig_range=[-1.8193e+32,1.2799e+32]
+[46] policy=near_overflow, seed=49, mode=eval_value:
+      max_diff=1.740853e+26, mean_diff=1.226580e+25, ref_range=[-1.0477e+32,1.1202e+32], orig_range=[-1.0477e+32,1.1202e+32]
+[47] policy=near_overflow, seed=50, mode=eval_value:
+      max_diff=9.671407e+25, mean_diff=1.287314e+25, ref_range=[-1.0968e+32,1.1535e+32], orig_range=[-1.0968e+32,1.1535e+32]
+[48] policy=mixed_extremes, seed=72, mode=eval_value:
+      max_diff=1.000000e+00, mean_diff=6.793866e-02, ref_range=[-1.1770e+06,9.0998e+05], orig_range=[-1.1770e+06,9.0998e+05]
+[49] policy=mixed_extremes, seed=73, mode=eval_value:
+      max_diff=8.750000e-01, mean_diff=6.123287e-02, ref_range=[-1.2091e+06,8.1734e+05], orig_range=[-1.2091e+06,8.1734e+05]
+[50] policy=mixed_extremes, seed=74, mode=eval_value:
+      max_diff=1.187500e+00, mean_diff=6.803044e-02, ref_range=[-7.7256e+05,9.3563e+05], orig_range=[-7.7256e+05,9.3563e+05]
+[51] policy=mixed_extremes, seed=75, mode=eval_value:
+      max_diff=8.750000e-01, mean_diff=7.240289e-02, ref_range=[-1.1855e+06,1.1580e+06], orig_range=[-1.1855e+06,1.1580e+06]
+[52] policy=extreme_magnitude, seed=93, mode=eval_value:
+      max_diff=1.600000e+02, mean_diff=1.188662e+01, ref_range=[-1.4370e+08,1.0969e+08], orig_range=[-1.4370e+08,1.0969e+08]
+[53] policy=extreme_magnitude, seed=94, mode=eval_value:
+      max_diff=2.080000e+02, mean_diff=1.303357e+01, ref_range=[-1.3713e+08,1.0314e+08], orig_range=[-1.3713e+08,1.0314e+08]
+[54] policy=extreme_magnitude, seed=95, mode=eval_value:
+      max_diff=1.360000e+02, mean_diff=1.268048e+01, ref_range=[-1.2919e+08,1.1628e+08], orig_range=[-1.2919e+08,1.1628e+08]
+[55] policy=extreme_magnitude, seed=96, mode=eval_value:
+      max_diff=1.520000e+02, mean_diff=1.296021e+01, ref_range=[-1.4454e+08,1.0870e+08], orig_range=[-1.4454e+08,1.0870e+08]
+[56] policy=reduction_adversarial, seed=102, mode=eval_value:
+      max_diff=6.875000e-01, mean_diff=7.496011e-02, ref_range=[-9.9000e+05,8.2000e+05], orig_range=[-9.9000e+05,8.2000e+05]
+[57] policy=reduction_adversarial, seed=103, mode=eval_value:
+      max_diff=1.000000e+00, mean_diff=9.985033e-02, ref_range=[-8.0000e+05,1.0300e+06], orig_range=[-8.0000e+05,1.0300e+06]
+[58] policy=reduction_adversarial, seed=104, mode=eval_value:
+      max_diff=9.062500e-01, mean_diff=9.518398e-02, ref_range=[-8.5000e+05,7.5000e+05], orig_range=[-8.5000e+05,7.5000e+05]
+[59] policy=reduction_adversarial, seed=105, mode=eval_value:
+      max_diff=1.000000e+00, mean_diff=8.754757e-02, ref_range=[-8.6000e+05,9.2000e+05], orig_range=[-8.6000e+05,9.2000e+05]
+[60] policy=reduction_adversarial, seed=106, mode=eval_value:
+      max_diff=8.125000e-01, mean_diff=8.937644e-02, ref_range=[-1.0000e+06,1.0400e+06], orig_range=[-1.0000e+06,1.0400e+06]
+[61] policy=large_magnitude, seed=342, mode=train_value:
+      max_diff=1.640625e-01, mean_diff=1.245591e-02, ref_range=[-1.2481e+05,1.1448e+05], orig_range=[-1.2481e+05,1.1448e+05]
+[62] policy=large_magnitude, seed=343, mode=train_value:
+      max_diff=1.796875e-01, mean_diff=1.325319e-02, ref_range=[-1.7635e+05,1.2258e+05], orig_range=[-1.7635e+05,1.2258e+05]
+[63] policy=mixed_extremes, seed=347, mode=train_value:
+      max_diff=8.750000e-01, mean_diff=7.171001e-02, ref_range=[-9.3554e+05,9.1524e+05], orig_range=[-9.3554e+05,9.1524e+05]
+[64] policy=near_overflow, seed=351, mode=train_value:
+      max_diff=1.257283e+26, mean_diff=1.235533e+25, ref_range=[-1.3056e+32,1.3611e+32], orig_range=[-1.3056e+32,1.3611e+32]
+[65] policy=near_overflow, seed=352, mode=train_value:
+      max_diff=1.644139e+26, mean_diff=1.275656e+25, ref_range=[-1.4304e+32,1.0912e+32], orig_range=[-1.4304e+32,1.0912e+32]
+[66] policy=near_overflow, seed=353, mode=train_value:
+      max_diff=1.450711e+26, mean_diff=1.177202e+25, ref_range=[-1.4721e+32,1.0242e+32], orig_range=[-1.4721e+32,1.0242e+32]
+[67] policy=tail_heavy, seed=385, mode=train_value:
+      max_diff=1.000000e+00, mean_diff=2.779778e-02, ref_range=[-9.3531e+05,7.1455e+05], orig_range=[-9.3531e+05,7.1455e+05]
+[68] policy=tail_heavy, seed=386, mode=train_value:
+      max_diff=1.000000e+00, mean_diff=2.886595e-02, ref_range=[-1.1858e+06,7.9495e+05], orig_range=[-1.1858e+06,7.9495e+05]
+[69] policy=extreme_magnitude, seed=390, mode=train_value:
+      max_diff=2.080000e+02, mean_diff=1.224569e+01, ref_range=[-1.2311e+08,1.5440e+08], orig_range=[-1.2311e+08,1.5440e+08]
+[70] policy=extreme_magnitude, seed=391, mode=train_value:
+      max_diff=1.680000e+02, mean_diff=1.309737e+01, ref_range=[-1.0942e+08,1.3005e+08], orig_range=[-1.0942e+08,1.3005e+08]
+[71] policy=extreme_magnitude, seed=392, mode=train_value:
+      max_diff=1.440000e+02, mean_diff=1.337765e+01, ref_range=[-1.2178e+08,1.2590e+08], orig_range=[-1.2178e+08,1.2590e+08]
+[72] policy=reduction_adversarial, seed=396, mode=train_value:
+      max_diff=9.687500e-01, mean_diff=9.369320e-02, ref_range=[-8.8000e+05,9.7000e+05], orig_range=[-8.8000e+05,9.7000e+05]
+[73] policy=reduction_adversarial, seed=397, mode=train_value:
+      max_diff=8.750000e-01, mean_diff=9.575282e-02, ref_range=[-8.1000e+05,8.2000e+05], orig_range=[-8.1000e+05,8.2000e+05]
+[74] policy=reduction_adversarial, seed=398, mode=train_value:
+      max_diff=1.062500e+00, mean_diff=9.378819e-02, ref_range=[-8.9000e+05,8.4000e+05], orig_range=[-8.9000e+05,8.4000e+05]
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

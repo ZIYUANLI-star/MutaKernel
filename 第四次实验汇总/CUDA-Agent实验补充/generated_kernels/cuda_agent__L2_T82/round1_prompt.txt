@@ -1,0 +1,123 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a 3D convolution, applies LeakyReLU, sums with a tensor, clamps, and applies GELU activation.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = torch.nn.functional.leaky_relu(x, negative_slope=0.2)
+        x = x + self.sum_tensor
+        x = torch.clamp(x, min=-1.0, max=1.0)
+        x = torch.nn.functional.gelu(x)
+        return x
+
+batch_size = 128
+in_channels = 8
+out_channels = 64
+depth, height, width = 16, 64, 64
+kernel_size = 3
+sum_tensor_shape = (out_channels, 1, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, depth, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, sum_tensor_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using PyTorch Automatic Mixed Precision (AMP)
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, sum_tensor_shape):
+        super(ModelNew, self).__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.conv = nn.Conv3d(in_channels, out_channels, kernel_size)  # Keep for state_dict
+        self.sum_tensor = nn.Parameter(torch.randn(sum_tensor_shape))
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def forward(self, x):
+        # Enable Automatic Mixed Precision
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            # Use PyTorch's optimized convolution with AMP
+            x = torch.conv3d(x, self.conv.weight, self.conv.bias, self.conv.stride, self.conv.padding, self.conv.dilation)
+            
+            # Fused operations
+            x = x.clamp_min(0) + 0.2 * x.clamp_max(0)  # LeakyReLU
+            x = x + self.sum_tensor
+            x = x.clamp(-1.0, 1.0)
+            
+            # Manual Gelu
+            cdf = 0.5 * (1.0 + torch.erf(x / 1.41421356237309504880))
+            x = x * cdf
+        
+        # Convert back to FP32
+        x = x.to(torch.float32)
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 48
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (24 failures)
+  - [large_magnitude seed=50000] max_diff=6.448154e-01, mean_diff=9.465387e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [large_magnitude seed=50001] max_diff=6.352015e-01, mean_diff=9.492448e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [near_overflow seed=50002] max_diff=nan, mean_diff=nan, ref_range=[-1.5866e-01,8.4134e-01], orig_range=[nan,nan]
+  - [near_overflow seed=50003] max_diff=nan, mean_diff=nan, ref_range=[-1.5866e-01,8.4134e-01], orig_range=[nan,nan]
+  - [all_negative seed=50008] max_diff=8.906585e-02, mean_diff=1.007019e-04, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [all_negative seed=50009] max_diff=9.314984e-02, mean_diff=9.013338e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [all_positive seed=50010] max_diff=8.387280e-02, mean_diff=9.382267e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [all_positive seed=50011] max_diff=9.476739e-02, mean_diff=1.102840e-04, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  ... and 16 more failures
+
+### training_stress (24 failures)
+  - [large_magnitude seed=70000] max_diff=6.326063e-01, mean_diff=9.521066e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [large_magnitude seed=70001] max_diff=6.914450e-01, mean_diff=9.490765e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [near_overflow seed=70002] max_diff=nan, mean_diff=nan, ref_range=[-1.5866e-01,8.4134e-01], orig_range=[nan,nan]
+  - [near_overflow seed=70003] max_diff=nan, mean_diff=nan, ref_range=[-1.5866e-01,8.4134e-01], orig_range=[nan,nan]
+  - [all_negative seed=70008] max_diff=8.688876e-02, mean_diff=9.918686e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [all_negative seed=70009] max_diff=8.280319e-02, mean_diff=9.224693e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [all_positive seed=70010] max_diff=8.511591e-02, mean_diff=9.300237e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  - [all_positive seed=70011] max_diff=9.025317e-02, mean_diff=9.953988e-05, ref_range=[-1.6997e-01,8.4134e-01], orig_range=[-1.6997e-01,8.4134e-01]
+  ... and 16 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

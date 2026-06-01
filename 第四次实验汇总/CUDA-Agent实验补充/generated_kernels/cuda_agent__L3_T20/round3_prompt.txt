@@ -1,0 +1,318 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        """
+        :param in_channels: Number of input channels
+        :param out_channels: Number of output channels
+        :param stride: Stride for the first convolutional layer
+        :param downsample: Downsample layer for the shortcut connection
+        """
+        super(Model, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        """
+        :param x: Input tensor, shape (batch_size, in_channels, height, width)
+        :return: Output tensor, shape (batch_size, out_channels, height, width)
+        """
+        identity = x
+
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        if self.downsample is not None:
+            identity = self.downsample(x)
+
+        out += identity
+        out = self.relu(out)
+
+        return out
+    
+# Test code
+in_channels = 3
+out_channels = 64
+stride = 1
+batch_size = 10
+num_classes = 1000
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, 224, 224)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, stride]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        # Save original settings
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        old_cudnn_deterministic = torch.backends.cudnn.deterministic
+        old_cudnn_benchmark = torch.backends.cudnn.benchmark
+        
+        # Disable TF32 and enable deterministic mode for numerical stability
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
+        try:
+            identity = x
+
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = self.relu(out)
+
+            out = self.conv2(out)
+            out = self.bn2(out)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out = out + identity
+            out = self.relu(out)
+
+            return out
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+            torch.backends.cudnn.deterministic = old_cudnn_deterministic
+            torch.backends.cudnn.benchmark = old_cudnn_benchmark
+```
+
+## Test Failures (Round 3 input)
+Total discrepancies: 30
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=4.512939e-01, mean_diff=2.695398e-02, ref_range=[0.0000e+00,4.2374e+03], orig_range=[0.0000e+00,4.2374e+03]
+  - [large_magnitude seed=50001] max_diff=4.653168e-01, mean_diff=2.832810e-02, ref_range=[0.0000e+00,4.1060e+03], orig_range=[0.0000e+00,4.1060e+03]
+  - [near_overflow seed=50002] max_diff=4.371400e+26, mean_diff=2.716507e+25, ref_range=[0.0000e+00,4.4504e+30], orig_range=[0.0000e+00,4.4504e+30]
+  - [near_overflow seed=50003] max_diff=4.485493e+26, mean_diff=2.797262e+25, ref_range=[0.0000e+00,4.4231e+30], orig_range=[0.0000e+00,4.4232e+30]
+  - [all_negative seed=50008] max_diff=4.045105e-02, mean_diff=2.431752e-03, ref_range=[0.0000e+00,3.5342e+02], orig_range=[0.0000e+00,3.5342e+02]
+  - [all_negative seed=50009] max_diff=3.982544e-02, mean_diff=2.840645e-03, ref_range=[0.0000e+00,4.8324e+02], orig_range=[0.0000e+00,4.8325e+02]
+  - [all_positive seed=50010] max_diff=4.949951e-02, mean_diff=3.356208e-03, ref_range=[0.0000e+00,4.0940e+02], orig_range=[0.0000e+00,4.0938e+02]
+  - [all_positive seed=50011] max_diff=3.814697e-02, mean_diff=2.341388e-03, ref_range=[0.0000e+00,3.8140e+02], orig_range=[0.0000e+00,3.8141e+02]
+  ... and 20 more failures
+
+### training_stress (2 failures)
+  - [boundary_last_element seed=70022] max_diff=2.632904e-01, mean_diff=2.981217e-05, ref_range=[0.0000e+00,1.1766e+03], orig_range=[0.0000e+00,1.1767e+03]
+  - [boundary_last_element seed=70023] max_diff=2.456818e-01, mean_diff=3.347025e-05, ref_range=[0.0000e+00,1.1839e+03], orig_range=[0.0000e+00,1.1839e+03]
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 30 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        # Disable TF32 for numerical stability
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            identity = x
+
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = self.relu(out)
+
+            out = self.conv2(out)
+            out = self.bn2(out)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out = out + identity
+            out = self.relu(out)
+
+            return out
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+```
+
+### What still failed after Round 1
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=4.512939e-01, mean_diff=2.695398e-02, ref_range=[0.0000e+00,4.2374e+03], orig_range=[0.0000e+00,4.2374e+03]
+  - [large_magnitude seed=50001] max_diff=4.653168e-01, mean_diff=2.832810e-02, ref_range=[0.0000e+00,4.1060e+03], orig_range=[0.0000e+00,4.1060e+03]
+  - [near_overflow seed=50002] max_diff=4.371400e+26, mean_diff=2.716507e+25, ref_range=[0.0000e+00,4.4504e+30], orig_range=[0.0000e+00,4.4504e+30]
+  - [near_overflow seed=50003] max_diff=4.485493e+26, mean_diff=2.797262e+25, ref_range=[0.0000e+00,4.4231e+30], orig_range=[0.0000e+00,4.4232e+30]
+  - [all_negative seed=50008] max_diff=4.045105e-02, mean_diff=2.431752e-03, ref_range=[0.0000e+00,3.5342e+02], orig_range=[0.0000e+00,3.5342e+02]
+  - [all_negative seed=50009] max_diff=3.982544e-02, mean_diff=2.840645e-03, ref_range=[0.0000e+00,4.8324e+02], orig_range=[0.0000e+00,4.8325e+02]
+  - [all_positive seed=50010] max_diff=4.949951e-02, mean_diff=3.356208e-03, ref_range=[0.0000e+00,4.0940e+02], orig_range=[0.0000e+00,4.0938e+02]
+  - [all_positive seed=50011] max_diff=3.814697e-02, mean_diff=2.341388e-03, ref_range=[0.0000e+00,3.8140e+02], orig_range=[0.0000e+00,3.8141e+02]
+  ... and 20 more failures
+
+### training_stress (2 failures)
+  - [boundary_last_element seed=70022] max_diff=2.632904e-01, mean_diff=2.981217e-05, ref_range=[0.0000e+00,1.1766e+03], orig_range=[0.0000e+00,1.1767e+03]
+  - [boundary_last_element seed=70023] max_diff=2.456818e-01, mean_diff=3.347025e-05, ref_range=[0.0000e+00,1.1839e+03], orig_range=[0.0000e+00,1.1839e+03]
+
+## Previous Repair Attempt (Round 2)
+After round 2, still 30 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ModelNew(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_channels, out_channels, stride=1):
+        super(ModelNew, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.downsample = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels * self.expansion, kernel_size=1, stride=stride, bias=False),
+            nn.BatchNorm2d(out_channels * self.expansion),
+        )
+        self.stride = stride
+
+    def forward(self, x):
+        # Save original settings
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        old_cudnn_deterministic = torch.backends.cudnn.deterministic
+        old_cudnn_benchmark = torch.backends.cudnn.benchmark
+        
+        # Disable TF32 and enable deterministic mode for numerical stability
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        
+        try:
+            identity = x
+
+            out = self.conv1(x)
+            out = self.bn1(out)
+            out = self.relu(out)
+
+            out = self.conv2(out)
+            out = self.bn2(out)
+
+            if self.downsample is not None:
+                identity = self.downsample(x)
+
+            out = out + identity
+            out = self.relu(out)
+
+            return out
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+            torch.backends.cudnn.deterministic = old_cudnn_deterministic
+            torch.backends.cudnn.benchmark = old_cudnn_benchmark
+```
+
+### What still failed after Round 2
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=4.512939e-01, mean_diff=2.695398e-02, ref_range=[0.0000e+00,4.2374e+03], orig_range=[0.0000e+00,4.2374e+03]
+  - [large_magnitude seed=50001] max_diff=4.653168e-01, mean_diff=2.832810e-02, ref_range=[0.0000e+00,4.1060e+03], orig_range=[0.0000e+00,4.1060e+03]
+  - [near_overflow seed=50002] max_diff=4.371400e+26, mean_diff=2.716507e+25, ref_range=[0.0000e+00,4.4504e+30], orig_range=[0.0000e+00,4.4504e+30]
+  - [near_overflow seed=50003] max_diff=4.485493e+26, mean_diff=2.797262e+25, ref_range=[0.0000e+00,4.4231e+30], orig_range=[0.0000e+00,4.4232e+30]
+  - [all_negative seed=50008] max_diff=4.045105e-02, mean_diff=2.431752e-03, ref_range=[0.0000e+00,3.5342e+02], orig_range=[0.0000e+00,3.5342e+02]
+  - [all_negative seed=50009] max_diff=3.982544e-02, mean_diff=2.840645e-03, ref_range=[0.0000e+00,4.8324e+02], orig_range=[0.0000e+00,4.8325e+02]
+  - [all_positive seed=50010] max_diff=4.949951e-02, mean_diff=3.356208e-03, ref_range=[0.0000e+00,4.0940e+02], orig_range=[0.0000e+00,4.0938e+02]
+  - [all_positive seed=50011] max_diff=3.814697e-02, mean_diff=2.341388e-03, ref_range=[0.0000e+00,3.8140e+02], orig_range=[0.0000e+00,3.8141e+02]
+  ... and 20 more failures
+
+### training_stress (2 failures)
+  - [boundary_last_element seed=70022] max_diff=2.632904e-01, mean_diff=2.981217e-05, ref_range=[0.0000e+00,1.1766e+03], orig_range=[0.0000e+00,1.1767e+03]
+  - [boundary_last_element seed=70023] max_diff=2.456818e-01, mean_diff=3.347025e-05, ref_range=[0.0000e+00,1.1839e+03], orig_range=[0.0000e+00,1.1839e+03]
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

@@ -1,0 +1,107 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs batched matrix multiplication (C = A * B) where A, B, and C have the same batch dimension.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        """
+        Performs batched matrix multiplication.
+
+        Args:
+            A: Input tensor of shape (batch_size, m, k).
+            B: Input tensor of shape (batch_size, k, n).
+
+        Returns:
+            C: Output tensor of shape (batch_size, m, n).
+        """
+        return torch.bmm(A, B)
+
+batch_size = 128
+m = 128 * 4
+k = 256 * 4
+n = 512 * 4
+
+def get_inputs():
+    A = torch.rand(batch_size, m, k)
+    B = torch.rand(batch_size, k, n)
+    return [A, B]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+    
+    def forward(self, A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+        # Enable TensorFloat32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        result = torch.bmm(A, B)
+        torch.backends.cuda.matmul.allow_tf32 = False
+        return result
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 40
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (20 failures)
+  - [large_magnitude seed=50000] max_diff=5.894400e+04, mean_diff=7.492740e+03, ref_range=[-1.9391e+08,1.8003e+08], orig_range=[-1.9391e+08,1.8004e+08]
+  - [large_magnitude seed=50001] max_diff=5.887600e+04, mean_diff=7.491308e+03, ref_range=[-1.8083e+08,1.8539e+08], orig_range=[-1.8083e+08,1.8539e+08]
+  - [mixed_extremes seed=50012] max_diff=2.828032e+06, mean_diff=3.734091e+05, ref_range=[-9.7459e+09,9.7372e+09], orig_range=[-9.7459e+09,9.7383e+09]
+  - [mixed_extremes seed=50013] max_diff=3.069312e+06, mean_diff=3.734312e+05, ref_range=[-9.3547e+09,9.5526e+09], orig_range=[-9.3541e+09,9.5528e+09]
+  - [alternating_sign seed=50014] max_diff=5.704375e+02, mean_diff=7.468381e+01, ref_range=[-1.4821e+06,1.3867e+06], orig_range=[-1.4821e+06,1.3865e+06]
+  - [alternating_sign seed=50015] max_diff=5.859688e+02, mean_diff=7.470165e+01, ref_range=[-1.4313e+06,1.4021e+06], orig_range=[-1.4312e+06,1.4020e+06]
+  - [sparse seed=50016] max_diff=1.162500e+02, mean_diff=6.862659e+00, ref_range=[-2.7191e+05,2.9362e+05], orig_range=[-2.7190e+05,2.9364e+05]
+  - [sparse seed=50017] max_diff=1.205156e+02, mean_diff=6.862883e+00, ref_range=[-2.6402e+05,2.5518e+05], orig_range=[-2.6410e+05,2.5519e+05]
+  ... and 12 more failures
+
+### training_stress (20 failures)
+  - [large_magnitude seed=70000] max_diff=5.747700e+04, mean_diff=7.492165e+03, ref_range=[-1.9025e+08,1.9017e+08], orig_range=[-1.9024e+08,1.9017e+08]
+  - [large_magnitude seed=70001] max_diff=5.686600e+04, mean_diff=7.493201e+03, ref_range=[-1.8441e+08,1.9129e+08], orig_range=[-1.8441e+08,1.9129e+08]
+  - [mixed_extremes seed=70012] max_diff=2.819200e+06, mean_diff=3.734615e+05, ref_range=[-9.3461e+09,1.0320e+10], orig_range=[-9.3452e+09,1.0320e+10]
+  - [mixed_extremes seed=70013] max_diff=2.850304e+06, mean_diff=3.734852e+05, ref_range=[-9.4377e+09,9.3029e+09], orig_range=[-9.4382e+09,9.3043e+09]
+  - [alternating_sign seed=70014] max_diff=5.497344e+02, mean_diff=7.443829e+01, ref_range=[-1.4156e+06,1.5746e+06], orig_range=[-1.4153e+06,1.5747e+06]
+  - [alternating_sign seed=70015] max_diff=5.288320e+02, mean_diff=7.469174e+01, ref_range=[-1.4104e+06,1.4106e+06], orig_range=[-1.4103e+06,1.4105e+06]
+  - [sparse seed=70016] max_diff=1.210742e+02, mean_diff=6.867888e+00, ref_range=[-2.7537e+05,3.3552e+05], orig_range=[-2.7537e+05,3.3552e+05]
+  - [sparse seed=70017] max_diff=1.172656e+02, mean_diff=6.869439e+00, ref_range=[-2.6044e+05,2.6480e+05], orig_range=[-2.6042e+05,2.6479e+05]
+  ... and 12 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

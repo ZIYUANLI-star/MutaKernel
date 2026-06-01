@@ -1,0 +1,219 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        """
+        Initialize the LSTM model.
+
+        :param input_size: The number of expected features in the input `x`
+        :param hidden_size: The number of features in the hidden state `h`
+        :param num_layers: Number of recurrent layers
+        :param output_size: The number of output features
+        :param dropout: If non-zero, introduces a Dropout layer on the outputs of each LSTM layer except the last layer
+        """
+        super(Model, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout, bidirectional=False)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, h0=None, c0=None):
+        """
+        Forward pass through the LSTM model.
+
+        :param x: The input tensor, shape (batch_size, sequence_length, input_size)
+        :param h0: Optional initial hidden state (num_layers, batch_size, hidden_size)
+        :param c0: Optional initial cell state (num_layers, batch_size, hidden_size)
+        :return: The output tensor, shape (batch_size, output_size)
+        """
+        batch_size = x.size(0)
+
+        if h0 is None:
+            h0 = torch.randn(self.num_layers, batch_size, self.hidden_size, device=x.device)
+        if c0 is None:
+            c0 = torch.randn(self.num_layers, batch_size, self.hidden_size, device=x.device)
+
+        out, _ = self.lstm(x, (h0, c0))  # out: (batch_size, seq_length, hidden_size)
+        out = self.fc(out[:, -1, :])     # out: (batch_size, output_size)
+
+        return out
+
+# === Test configuration ===
+batch_size = 10
+sequence_length = 512
+input_size = 128
+hidden_size = 256
+num_layers = 6
+output_size = 10
+dropout = 0.0
+
+def get_inputs():
+    return [torch.rand(batch_size, sequence_length, input_size)]
+
+def get_init_inputs():
+    return [input_size, hidden_size, num_layers, output_size, dropout]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_slice_linear.cu ===
+#include <cuda_runtime.h>
+
+__global__ void fused_slice_linear_kernel(float* output, const float* lstm_out, const float* weight, const float* bias) {
+    int idx = blockIdx.x;  // each block processes one output element (10*10=100 blocks)
+    if (idx < 10 * 10) {
+        int batch = idx / 10;
+        int out_feature = idx % 10;
+        
+        float sum = 0.0f;
+        
+        // Each block uses 32 threads to accumulate the sum
+        for (int i = threadIdx.x; i < 256; i += 32) {
+            float lstm_val = lstm_out[batch * 512 * 256 + (512 - 1) * 256 + i];
+            float weight_val = weight[out_feature * 256 + i];
+            sum += lstm_val * weight_val;
+        }
+        
+        // Reduce sum across threads in the block
+        __shared__ float smem[32];
+        smem[threadIdx.x] = sum;
+        __syncthreads();
+        
+        for (int s = 16; s > 0; s >>= 1) {
+            if (threadIdx.x < s) {
+                smem[threadIdx.x] += smem[threadIdx.x + s];
+            }
+            __syncthreads();
+        }
+        
+        if (threadIdx.x == 0) {
+            output[idx] = smem[0] + bias[out_feature];
+        }
+    }
+}
+
+extern "C" void fused_slice_linear_launcher(float* output, const float* lstm_out, const float* weight, const float* bias, cudaStream_t stream) {
+    dim3 blocks(100);  // 100 output elements
+    dim3 threads(32);  // 32 threads per block
+    fused_slice_linear_kernel<<<blocks, threads, 0, stream>>>(output, lstm_out, weight, bias);
+}
+"""
+
+_cpp_sources = """
+// === fused_slice_linear_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_slice_linear_launcher(float* output, const float* lstm_out, const float* weight, const float* bias, cudaStream_t stream);
+
+torch::Tensor fused_slice_linear_forward(torch::Tensor lstm_out, torch::Tensor weight, torch::Tensor bias) {
+    TORCH_CHECK(lstm_out.is_cuda(), "lstm_out must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "bias must be a CUDA tensor");
+    TORCH_CHECK(lstm_out.is_contiguous(), "lstm_out must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "weight must be contiguous");
+    TORCH_CHECK(bias.is_contiguous(), "bias must be contiguous");
+    TORCH_CHECK(lstm_out.dtype() == torch::kFloat32, "lstm_out must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "weight must be float32");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "bias must be float32");
+
+    auto output = torch::empty({10, 10}, lstm_out.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    fused_slice_linear_launcher(output.data_ptr<float>(), lstm_out.data_ptr<float>(), weight.data_ptr<float>(), bias.data_ptr<float>(), stream);
+
+    return output;
+}
+
+void register_fused_slice_linear(pybind11::module& m) {
+    m.def("fused_slice_linear_forward", &fused_slice_linear_forward,
+          "Fused slice last sequence and linear layer",
+          py::arg("lstm_out"),
+          py::arg("weight"),
+          py::arg("bias"));
+}
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_slice_linear_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, output_size, dropout=0.0):
+        super(ModelNew, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True, dropout=dropout, bidirectional=False)
+        self.fc = nn.Linear(hidden_size, output_size)
+
+    def forward(self, x, h0=None, c0=None):
+        batch_size = x.size(0)
+
+        if h0 is None:
+            h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=x.device)
+        if c0 is None:
+            c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=x.device)
+
+        # Enable cuDNN for LSTM
+        torch.backends.cudnn.enabled = True
+        
+        out, _ = self.lstm(x, (h0, c0))
+        out = out.contiguous()
+        out = cuda_extension.fused_slice_linear_forward(out, self.fc.weight, self.fc.bias)
+        
+        # Disable cuDNN after
+        torch.backends.cudnn.enabled = False
+        return out
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 4
+Failing dimensions: config_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### config_stress (4 failures)
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

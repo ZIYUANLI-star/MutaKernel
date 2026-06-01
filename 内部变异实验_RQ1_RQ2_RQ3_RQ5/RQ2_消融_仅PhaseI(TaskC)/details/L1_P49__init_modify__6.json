@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P49__init_modify__6",
+  "operator_name": "init_modify",
+  "kernel_name": "L1_P49",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7133,
+        "completion_tokens": 3580,
+        "total_tokens": 10713,
+        "reasoning_tokens": 1136
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "block_size=256 → 8 warps → lanes 8-31 in warp 0 use fallback. With -FLT_MAX, any real data wins. With -1e10f, data < -1e10 loses to fallback. Input filled with -1e12 causes mutant to return -1e10 instead of -1e12.",
+      "survival_reason": "The mutation only affects max_reduction_dim2_kernel, and previous testing used random/stress values that never went below -1e10. Standard 'all_negative' stress tests typically use values like uniform(-100, 0), not extreme negatives. The mutation requires values below -1e10 to manifest, which wasn't covered in the 112 test rounds. The fallback identity value change from -FLT_MAX to -1e10f only matters when actual reduction data is more negative than -1e10.",
+      "killable": true,
+      "kill_strategy": "Use dim=2 reduction with input tensor filled entirely with values significantly less than -1e10 (e.g., -1e12 or -1e15). This causes the mutant's -1e10f fallback to incorrectly become the maximum instead of the actual data maximum.",
+      "recommendations": "Stress testing for reduction kernels should include extreme negative values (e.g., < -1e10, near -FLT_MAX) to verify identity elements are properly set. Identity element bugs only manifest at the extremes of the value range.",
+      "suggested_code": "def generate_inputs(device):\n    # Values significantly below -1e10 to expose the mutation\n    # If dim=2 is used, mutant returns -1e10 instead of -1e12\n    x = torch.full((16, 256, 256), -1e12, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6982,
+        "completion_tokens": 3099,
+        "total_tokens": 10081,
+        "reasoning_tokens": 1180
+      },
+      "reason_category": "predicate_unreachable",
+      "proof_sketch": "The mutation is in max_reduction_dim2_kernel (line 118), but the model's reduction dimension appears fixed to dim=1 based on test configuration. When dim=1, only max_reduction_dim1_kernel executes, never reaching the mutated code in dim2_kernel. The mutation changes the identity element only for warp 0 lanes >= 8 in the dim2 kernel's final reduction phase, which is architecturally unreachable when dim=1 is used.",
+      "survival_reason": "All 112 test rounds passed with bitwise equality because the model is initialized with dim=1, causing max_reduction_dim1_kernel to be called instead of max_reduction_dim2_kernel where the mutation exists. The previous attempt with -1e12 values would have killed the mutant IF the dim2 kernel was executed: -1e10 > -1e12 means the mutant would incorrectly return -1e10 instead of -1e12, a difference of ~1e12 which exceeds the tolerance. However, since dim=1 is used, the dim2_kernel containing the mutation is never invoked. The mutation site (line 118) is inside max_reduction_dim2_kernel's warp 0 final reduction block, which only executes when reduction_dim==2 in the kernel dispatch logic.",
+      "killable": false,
+      "kill_strategy": "The mutation is unkillable through value changes alone. The mutated code path (max_reduction_dim2_kernel) is only triggered when the model is initialized with dim=2, but the test configuration fixes dim=1. To kill this mutant would require changing the model's reduction dimension parameter, which violates the testing contract that only allows value changes.",
+      "recommendations": "Mutation testing frameworks should ensure mutants are placed in code paths that are reachable under the fixed test configuration. When testing GPU kernels with multiple dispatch paths (like dim1 vs dim2 kernels), the test harness should either: (1) test all dispatch paths, (2) only generate mutations in reachable paths given the fixed configuration, or (3) allow parameter variation for dispatch-controlling arguments.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 111.05
+}

@@ -1,0 +1,89 @@
+{
+  "mutant_id": "L1_P48__const_perturb__1",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P48",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4193,
+        "completion_tokens": 4096,
+        "total_tokens": 8289,
+        "reasoning_tokens": 1359
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "block_size=256 hardcoded, tid ranges 0-255. shared_sums[255] is out-of-bounds when array size is 255. Thread 255's write and thread 127's read (at stride=128) both access invalid memory, losing thread 255's contribution to the sum.",
+      "survival_reason": "The mutation reduces shared memory from 256 to 255 elements while the kernel launches 256 threads per block. Thread 255 writes to shared_sums[255] which is out-of-bounds, causing undefined behavior. During parallel reduction at stride=128, thread 127 reads from shared_sums[255], getting garbage. This corrupts the final mean calculation by losing or corrupting thread 255's accumulated values.",
+      "killable": true,
+      "kill_strategy": "Create an input where index 255 along the reduction dimension contains a significant value (e.g., 256.0) while all other indices are zero. The original kernel computes mean=1.0, but the mutant loses thread 255's contribution, producing mean≈0 or garbage.",
+      "recommendations": "Shared memory array sizes should be validated to match or exceed the block size at compile time. Consider adding a static_assert or runtime check that shared memory size >= blockDim.x to catch such off-by-one mutations.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 256, 256, dtype=torch.float32, device=device)\n    # Put value 256.0 at index 255 in dimension 1 (reduction dim)\n    # Expected mean = 256/256 = 1.0 per output element\n    x[:, 255, :] = 256.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4056,
+        "completion_tokens": 3763,
+        "total_tokens": 7819,
+        "reasoning_tokens": 1893
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes shared_sums array size from 256 to 255. Thread 255 writes to shared_sums[255] (out-of-bounds in mutant) and thread 127 reads from it during reduction. With regular numeric values, undefined behavior might coincidentally preserve the value. Using NaN at index 255 will definitively show if thread 255's contribution is lost: included → mean=NaN, lost → mean=0.",
+      "survival_reason": "Previous attempt with value 256.0 at position 255 failed because CUDA's undefined behavior for out-of-bounds shared memory access happened to preserve the value correctly. The write to shared_sums[255] and subsequent read might access the same actual memory location due to GPU memory layout or padding. To defeat this, we need a value that cannot be confused with uninitialized/garbage memory. NaN has the special property that any arithmetic involving NaN produces NaN, making it impossible for the result to be correct if thread 255's contribution is lost or read as garbage (typically 0 or random bits that aren't NaN).",
+      "killable": true,
+      "kill_strategy": "Use NaN at reduction index 255 (the position handled by thread 255). If thread 255's value is properly included in the sum, the mean will be NaN. If the out-of-bounds access causes the value to be lost or corrupted to non-NaN, the mean will be a finite number (0 or near 0). This is an absolute distinction that cannot survive torch.allclose comparison.",
+      "recommendations": "When testing GPU kernel mutations involving array bounds, use special floating-point values (NaN, Inf) that have distinctive propagation properties through arithmetic operations, as undefined behavior with regular numeric values may coincidentally produce correct results.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 256, 256, dtype=torch.float32, device=device)\n    # Thread 255 handles index 255 along dim=1\n    # If its contribution is included: mean = NaN (NaN propagates through sum)\n    # If lost due to OOB access: mean = 0/256 = 0 (finite number)\n    x[:, 255, :] = float('nan')\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4336,
+        "completion_tokens": 4755,
+        "total_tokens": 9091,
+        "reasoning_tokens": 2183
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation changes shared_sums[256] to shared_sums[255], causing thread 255 (tid=255) to write to shared_sums[255] out-of-bounds, and thread 127 to read from shared_sums[255] during reduction. However, in CUDA shared memory, both accesses reference the same physical address (base + 255*sizeof(T)), and __syncthreads() ensures the write is visible before read. The undefined behavior is benign - the memory exists and is consistently accessed.",
+      "survival_reason": "Round 1 failed because the out-of-bounds access at shared_sums[255] in the mutant actually works correctly - CUDA doesn't perform runtime bounds checking on shared memory, so index 255 accesses memory at offset 255*sizeof(T) from the array base regardless of declared size. Thread 255 writes its sum there, syncthreads ensures visibility, then thread 127 reads the same physical location. Round 2 failed because both ref and original produce NaN, causing validation failure. The mutation creates technically undefined behavior, but the specific access pattern (write then read same OOB location with sync) happens to produce correct results consistently.",
+      "killable": false,
+      "kill_strategy": "This mutation is likely unkillable through value changes alone. The shared memory out-of-bounds access at index 255 works correctly because: (1) CUDA doesn't bounds-check shared memory at runtime, (2) the write by thread 255 and read by thread 127 access the same physical memory location, (3) __syncthreads() ensures proper ordering. The only potential kill would require a configuration change (different block size or reduction dimension) that we cannot make.",
+      "recommendations": "When mutating shared memory array sizes, consider that CUDA's lack of bounds checking makes undersized arrays potentially equivalent if the OOB access pattern is self-consistent (same location written and read). Testing such mutations requires either configuration changes affecting thread counts, or static analysis to prove memory corruption propagates observably.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 454.96
+}

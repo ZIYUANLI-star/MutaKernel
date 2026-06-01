@@ -1,0 +1,156 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class Model(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        """
+        :param num_input_features: The number of input feature maps
+        :param num_output_features: The number of output feature maps
+        """
+        super(Model, self).__init__()
+        self.transition = nn.Sequential(
+            nn.BatchNorm2d(num_input_features),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(num_input_features, num_output_features, kernel_size=1, bias=False),
+            nn.AvgPool2d(kernel_size=2, stride=2)
+        )
+
+    def forward(self, x):
+        """
+        :param x: Input tensor of shape (batch_size, num_input_features, height, width)
+        :return: Downsampled tensor with reduced number of feature maps
+        """
+        return self.transition(x)
+
+batch_size = 128
+num_input_features = 32
+num_output_features = 64
+height, width = 256, 256
+
+def get_inputs():
+    return [torch.rand(batch_size, num_input_features, height, width)]
+
+def get_init_inputs():
+    return [num_input_features, num_output_features]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, num_input_features: int, num_output_features: int):
+        super(ModelNew, self).__init__()
+        # Initialize parameters to match the original model
+        self.transition = nn.Module()
+        self.transition._modules['0'] = nn.Module()
+        self.transition._modules['2'] = nn.Module()
+        
+        self.transition._modules['0'].weight = nn.Parameter(torch.randn(num_input_features))
+        self.transition._modules['0'].bias = nn.Parameter(torch.zeros(num_input_features))
+        self.transition._modules['0'].running_mean = nn.Parameter(torch.zeros(num_input_features), requires_grad=False)
+        self.transition._modules['0'].running_var = nn.Parameter(torch.ones(num_input_features), requires_grad=False)
+        self.transition._modules['2'].weight = nn.Parameter(torch.randn(num_output_features, num_input_features, 1, 1))
+        
+        # We don't need the num_batches_tracked parameter, but we can create it to avoid warnings
+        self.transition._modules['0'].num_batches_tracked = nn.Parameter(torch.tensor(0), requires_grad=False)
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def forward(self, x):
+        # Calculate batch norm parameters
+        eps = 1e-05
+        mean = self.transition._modules['0'].running_mean
+        var = self.transition._modules['0'].running_var
+        gamma = self.transition._modules['0'].weight
+        beta = self.transition._modules['0'].bias
+        
+        # Compute batch norm constants
+        inv_std = torch.rsqrt(var + eps)
+        scale = gamma * inv_std
+        shift = beta - mean * scale
+        
+        # Reshape for broadcasting
+        scale = scale.reshape(1, -1, 1, 1)
+        shift = shift.reshape(1, -1, 1, 1)
+        
+        # Fused batch norm + relu
+        x = x * scale + shift
+        x = x.clamp_min(0.0)
+        
+        # Reshape for matrix multiplication
+        batch_size, in_channels, height, width = x.shape
+        out_channels = self.transition._modules['2'].weight.shape[0]
+        
+        # Reshape input: (N, C, H, W) -> (N, C, H/2, 2, W/2, 2) -> (N, H/2, W/2, C, 2, 2)
+        x = x.reshape(batch_size, in_channels, 128, 2, 128, 2).permute(0, 2, 4, 1, 3, 5)
+        
+        # Average over the last two dimensions and reshape
+        x = x.mean(dim=(-1, -2)).reshape(batch_size * 128 * 128, in_channels)
+        
+        # Get weight and reshape
+        weight = self.transition._modules['2'].weight.reshape(out_channels, in_channels)
+        
+        # Matrix multiplication
+        x = x.matmul(weight.t()).reshape(batch_size, 128, 128, out_channels)
+        
+        # Permute back
+        x = x.permute(0, 3, 1, 2)
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 57
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (23 failures)
+  - [large_magnitude seed=50000] max_diff=4.911346e-01, mean_diff=5.918011e-02, ref_range=[-1.5227e+03,1.3556e+03], orig_range=[-1.5228e+03,1.3556e+03]
+  - [large_magnitude seed=50001] max_diff=5.484009e-01, mean_diff=5.766562e-02, ref_range=[-1.6021e+03,1.4188e+03], orig_range=[-1.6020e+03,1.4187e+03]
+  - [near_overflow seed=50002] max_diff=5.344208e+26, mean_diff=6.282635e+25, ref_range=[-1.2241e+30,1.3513e+30], orig_range=[-1.2241e+30,1.3514e+30]
+  - [near_overflow seed=50003] max_diff=5.091467e+26, mean_diff=6.112082e+25, ref_range=[-1.4534e+30,1.4839e+30], orig_range=[-1.4531e+30,1.4840e+30]
+  - [all_positive seed=50010] max_diff=9.420776e-02, mean_diff=1.027759e-02, ref_range=[-2.5965e+02,2.7108e+02], orig_range=[-2.5960e+02,2.7110e+02]
+  - [all_positive seed=50011] max_diff=6.838226e-02, mean_diff=9.373432e-03, ref_range=[-1.8565e+02,1.7817e+02], orig_range=[-1.8566e+02,1.7814e+02]
+  - [mixed_extremes seed=50012] max_diff=3.896240e+00, mean_diff=3.987322e-01, ref_range=[-1.0416e+04,1.1852e+04], orig_range=[-1.0416e+04,1.1851e+04]
+  - [mixed_extremes seed=50013] max_diff=3.648621e+00, mean_diff=3.760638e-01, ref_range=[-1.0412e+04,1.0496e+04], orig_range=[-1.0412e+04,1.0496e+04]
+  ... and 15 more failures
+
+### training_stress (34 failures)
+  - [large_magnitude seed=70000] max_diff=3.221071e+00, mean_diff=4.685917e-01, ref_range=[-1.4896e+00,1.4662e+00], orig_range=[-4.7106e+00,4.6366e+00]
+  - [large_magnitude seed=70001] max_diff=3.794400e+00, mean_diff=4.972490e-01, ref_range=[-1.5301e+00,1.7549e+00], orig_range=[-4.8387e+00,5.5493e+00]
+  - [all_negative seed=70008] max_diff=1.410379e+00, mean_diff=1.717993e-01, ref_range=[-1.4530e+00,1.0183e+00], orig_range=[-1.5131e-01,1.2958e-01]
+  - [all_negative seed=70009] max_diff=1.226245e+00, mean_diff=2.126756e-01, ref_range=[-1.2621e+00,1.2658e+00], orig_range=[-1.4463e-01,1.3767e-01]
+  - [all_positive seed=70010] max_diff=7.929651e+00, mean_diff=1.584612e+00, ref_range=[-1.5548e+00,1.9136e+00], orig_range=[-8.6830e+00,9.7466e+00]
+  - [all_positive seed=70011] max_diff=8.138777e+00, mean_diff=1.465963e+00, ref_range=[-1.7021e+00,1.7134e+00], orig_range=[-9.7121e+00,9.4134e+00]
+  - [mixed_extremes seed=70012] max_diff=3.516659e+00, mean_diff=4.194151e-01, ref_range=[-1.6262e+00,1.5533e+00], orig_range=[-5.1429e+00,4.9117e+00]
+  - [mixed_extremes seed=70013] max_diff=3.680429e+00, mean_diff=4.239121e-01, ref_range=[-1.7023e+00,1.6620e+00], orig_range=[-5.3827e+00,5.2561e+00]
+  ... and 26 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

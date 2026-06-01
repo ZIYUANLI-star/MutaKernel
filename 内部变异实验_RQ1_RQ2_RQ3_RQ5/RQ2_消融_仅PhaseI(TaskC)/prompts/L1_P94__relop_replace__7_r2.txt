@@ -1,0 +1,397 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fused MSE computation
+mse_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<int BLOCK_SIZE>
+__global__ void fused_mse_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ output,
+    int batch_size,
+    int element_count
+) {
+    // Shared memory for block-level reduction
+    __shared__ float shared_sum[BLOCK_SIZE];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const float* pred_batch = predictions + batch_idx * element_count;
+    const float* target_batch = targets + batch_idx * element_count;
+    
+    // Thread-local sum
+    float thread_sum = 0.0f;
+    
+    // Process multiple elements per thread for better memory coalescing
+    for (int i = tid; i < element_count; i += BLOCK_SIZE) {
+        float diff = pred_batch[i] - target_batch[i];
+        thread_sum += diff * diff;
+    }
+    
+    // Block-level reduction using shared memory
+    shared_sum[tid] = thread_sum;
+    __syncthreads();
+    
+    // Parallel reduction in shared memory
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // First thread writes the batch result
+    if (tid == 0) {
+        output[batch_idx] = shared_sum[0] / element_count;
+    }
+}
+
+__global__ void final_mean_kernel(
+    const float* __restrict__ batch_means,
+    float* __restrict__ final_output,
+    int batch_size
+) {
+    // Single block reduction for final mean
+    __shared__ float shared_sum[256];
+    
+    int tid = threadIdx.x;
+    shared_sum[tid] = 0.0f;
+    
+    // Accumulate batch means
+    for (int i = tid; i < batch_size; i += 256) {
+        shared_sum[tid] += batch_means[i];
+    }
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Write scalar output
+    if (tid == 0) {
+        *final_output = shared_sum[0] / batch_size;
+    }
+}
+
+torch::Tensor fused_mse_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto batch_size = predictions.size(0);
+    auto element_count = predictions.numel() / batch_size;
+    
+    // Allocate intermediate tensor for batch means
+    auto batch_means = torch::empty({batch_size}, predictions.options());
+    auto final_output = torch::zeros({}, predictions.options());  // Scalar tensor
+    
+    // Configure kernel launch parameters
+    const int BLOCK_SIZE = 256;
+    dim3 grid_dims(batch_size);
+    dim3 block_dims(BLOCK_SIZE);
+    
+    // Launch fused MSE kernel
+    fused_mse_kernel<BLOCK_SIZE><<<grid_dims, block_dims>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        batch_means.data_ptr<float>(),
+        batch_size,
+        element_count
+    );
+    
+    // Launch final reduction kernel (single block)
+    final_mean_kernel<<<1, 256>>>(
+        batch_means.data_ptr<float>(),
+        final_output.data_ptr<float>(),
+        batch_size
+    );
+    
+    return final_output;
+}
+"""
+
+mse_cpp_source = "torch::Tensor fused_mse_cuda(torch::Tensor predictions, torch::Tensor targets);"
+
+# Compile the inline CUDA code
+fused_mse = load_inline(
+    name="fused_mse",
+    cpp_sources=mse_cpp_source,
+    cuda_sources=mse_kernel_source,
+    functions=["fused_mse_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused CUDA kernel for Mean Squared Error computation.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fused_mse = fused_mse
+
+    def forward(self, predictions, targets):
+        # Use fused CUDA kernel for MSE computation
+        return self.fused_mse.fused_mse_cuda(predictions, targets)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for fused MSE computation
+mse_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+
+template<int BLOCK_SIZE>
+__global__ void fused_mse_kernel(
+    const float* __restrict__ predictions,
+    const float* __restrict__ targets,
+    float* __restrict__ output,
+    int batch_size,
+    int element_count
+) {
+    // Shared memory for block-level reduction
+    __shared__ float shared_sum[BLOCK_SIZE];
+    
+    int batch_idx = blockIdx.x;
+    int tid = threadIdx.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const float* pred_batch = predictions + batch_idx * element_count;
+    const float* target_batch = targets + batch_idx * element_count;
+    
+    // Thread-local sum
+    float thread_sum = 0.0f;
+    
+    // Process multiple elements per thread for better memory coalescing
+    for (int i = tid; i < element_count; i += BLOCK_SIZE) {
+        float diff = pred_batch[i] - target_batch[i];
+        thread_sum += diff * diff;
+    }
+    
+    // Block-level reduction using shared memory
+    shared_sum[tid] = thread_sum;
+    __syncthreads();
+    
+    // Parallel reduction in shared memory
+    for (int stride = BLOCK_SIZE / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // First thread writes the batch result
+    if (tid == 0) {
+        output[batch_idx] = shared_sum[0] / element_count;
+    }
+}
+
+__global__ void final_mean_kernel(
+    const float* __restrict__ batch_means,
+    float* __restrict__ final_output,
+    int batch_size
+) {
+    // Single block reduction for final mean
+    __shared__ float shared_sum[256];
+    
+    int tid = threadIdx.x;
+    shared_sum[tid] = 0.0f;
+    
+    // Accumulate batch means
+    for (int i = tid; i <= batch_size; i += 256) {
+        shared_sum[tid] += batch_means[i];
+    }
+    __syncthreads();
+    
+    // Parallel reduction
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    
+    // Write scalar output
+    if (tid == 0) {
+        *final_output = shared_sum[0] / batch_size;
+    }
+}
+
+torch::Tensor fused_mse_cuda(torch::Tensor predictions, torch::Tensor targets) {
+    auto batch_size = predictions.size(0);
+    auto element_count = predictions.numel() / batch_size;
+    
+    // Allocate intermediate tensor for batch means
+    auto batch_means = torch::empty({batch_size}, predictions.options());
+    auto final_output = torch::zeros({}, predictions.options());  // Scalar tensor
+    
+    // Configure kernel launch parameters
+    const int BLOCK_SIZE = 256;
+    dim3 grid_dims(batch_size);
+    dim3 block_dims(BLOCK_SIZE);
+    
+    // Launch fused MSE kernel
+    fused_mse_kernel<BLOCK_SIZE><<<grid_dims, block_dims>>>(
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        batch_means.data_ptr<float>(),
+        batch_size,
+        element_count
+    );
+    
+    // Launch final reduction kernel (single block)
+    final_mean_kernel<<<1, 256>>>(
+        batch_means.data_ptr<float>(),
+        final_output.data_ptr<float>(),
+        batch_size
+    );
+    
+    return final_output;
+}
+"""
+
+mse_cpp_source = "torch::Tensor fused_mse_cuda(torch::Tensor predictions, torch::Tensor targets);"
+
+# Compile the inline CUDA code
+fused_mse = load_inline(
+    name="fused_mse",
+    cpp_sources=mse_cpp_source,
+    cuda_sources=mse_kernel_source,
+    functions=["fused_mse_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=["-lcudart"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model with fused CUDA kernel for Mean Squared Error computation.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.fused_mse = fused_mse
+
+    def forward(self, predictions, targets):
+        # Use fused CUDA kernel for MSE computation
+        return self.fused_mse.fused_mse_cuda(predictions, targets)
+```
+
+## Mutation Details
+- Operator: relop_replace — Replace relational operator (<→<=, >→>=, etc.)
+- Location: line 68
+- Original fragment: `<`
+- node_type: cuda_Lt
+
+## Input Specification (FIXED)
+forward() expects 2 argument(s):
+  arg[0]: Tensor shape=[128, 4096], dtype=torch.float32
+  arg[1]: Tensor shape=[128, 4096], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: not_equivalent
+- Mutation site line: 68
+- Original fragment: `<`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): False
+- Tested seeds: [10000]
+- Divergence found: round_type=random, seed=10000, policy=None
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Use predictions equal to targets so expected MSE is exactly 0. Any garbage value from the out-of-bounds read will produce a non-zero result, detectable with atol/rtol=1e-2.
+- Suggested code:
+```python
+def generate_inputs(device):
+    # Identical predictions and targets yield MSE = 0
+    # Mutant adds garbage from out-of-bounds batch_means[128] to the sum
+    predictions = torch.ones(128, 4096, dtype=torch.float32, device=device)
+    targets = torch.ones(128, 4096, dtype=torch.float32, device=device)
+    return [predictions, targets]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null

@@ -1,0 +1,206 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch as th
+
+
+class Model(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(Model, self).__init__()
+
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+
+        init_sc = (1 / math.sqrt(feature_size))
+        clusters = cluster_size + ghost_clusters
+
+        # The `clusters` weights are the `(w,b)` in the paper
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        # The `clusters2` weights are the visual words `c_k` in the paper
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+        
+        # Initialize with fixed values for reproducibility
+        torch.manual_seed(42)
+        self.clusters.data = init_sc * th.randn(feature_size, clusters)
+        self.clusters2.data = init_sc * th.randn(1, feature_size, cluster_size)
+        self.batch_norm.running_mean.zero_()
+        self.batch_norm.running_var.fill_(1.0)
+        self.batch_norm.weight.data.fill_(1.0)
+        self.batch_norm.bias.data.fill_(0.0)
+
+    def forward(self, x, mask=None):
+        """Fixed forward pass for reproducibility"""
+        max_sample = x.size()[1]
+        x = x.view(-1, self.feature_size)
+
+        assignment = th.matmul(x, self.clusters)
+        
+        # Use batch norm in evaluation mode
+        assignment = (assignment - self.batch_norm.running_mean) * \
+                   torch.rsqrt(self.batch_norm.running_var + self.batch_norm.eps) * \
+                   self.batch_norm.weight + self.batch_norm.bias
+
+        assignment = assignment.softmax(dim=1)
+        assignment = assignment[:, :self.cluster_size]
+        assignment = assignment.view(-1, max_sample, self.cluster_size)
+
+        a_sum = th.sum(assignment, dim=1, keepdim=True)
+        a = a_sum * self.clusters2
+
+        assignment = assignment.transpose(1, 2)
+        x = x.view(-1, max_sample, self.feature_size)
+
+        vlad = th.matmul(assignment, x)
+        vlad = vlad.transpose(1, 2)
+        vlad = vlad - a
+
+        # L2 intra norm
+        vlad = vlad / vlad.norm(dim=-1, keepdim=True)
+
+        # flattening + L2 norm
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)
+        vlad = vlad / vlad.norm(dim=-1, keepdim=True)
+
+        return vlad
+
+batch_size = 2048
+num_features = 100
+num_clusters = 32
+feature_size = 512
+ghost_clusters = 0
+
+def get_inputs():
+  # Fixed input
+  torch.manual_seed(42)
+  return [torch.rand(batch_size, num_features, feature_size)]
+
+def get_init_inputs():
+  return [num_clusters, feature_size, ghost_clusters]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+import torch as th
+
+
+class ModelNew(nn.Module):
+    def __init__(self, cluster_size, feature_size, ghost_clusters):
+        super(ModelNew, self).__init__()
+        
+        self.feature_size = feature_size
+        self.cluster_size = cluster_size
+        self.ghost_clusters = ghost_clusters
+        
+        # Initialize dummy parameters to match state_dict
+        init_sc = (1 / torch.sqrt(torch.tensor(feature_size, dtype=torch.float32)))
+        clusters = cluster_size + ghost_clusters
+        self.clusters = nn.Parameter(init_sc * th.randn(feature_size, clusters))
+        self.batch_norm = nn.BatchNorm1d(clusters)
+        self.clusters2 = nn.Parameter(init_sc * th.randn(1, feature_size, cluster_size))
+        self.out_dim = self.cluster_size * feature_size
+        
+        # Load the correct state dict will overwrite these
+        self.batch_norm.running_mean.zero_()
+        self.batch_norm.running_var.fill_(1.0)
+        self.batch_norm.weight.data.fill_(1.0)
+        self.batch_norm.bias.data.fill_(0.0)
+
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    @torch.autocast(device_type='cuda', dtype=torch.float16)
+    def forward(self, x, mask=None):
+        """Optimized forward pass with autocast to FP16"""
+        
+        max_sample = x.size()[1]
+        x_flat = x.view(-1, self.feature_size)
+
+        assignment = x_flat @ self.clusters
+        
+        # Exact batch norm calculation
+        running_mean = self.batch_norm.running_mean
+        running_var = self.batch_norm.running_var
+        weight = self.batch_norm.weight
+        bias = self.batch_norm.bias
+        eps = self.batch_norm.eps
+        
+        inv_std = torch.rsqrt(running_var + eps)
+        assignment = weight * inv_std * (assignment - running_mean) + bias
+
+        assignment = assignment.softmax(dim=1)
+        assignment = assignment[:, :self.cluster_size].reshape(-1, max_sample, self.cluster_size)
+
+        a_sum = assignment.sum(dim=1, keepdim=True)
+        a = a_sum * self.clusters2
+
+        assignment_transposed = assignment.transpose(1, 2)
+        x_reshaped = x_flat.reshape(-1, max_sample, self.feature_size)
+
+        vlad = assignment_transposed @ x_reshaped
+        vlad = vlad.transpose(1, 2) - a
+
+        # L2 norm calculations - use float32 for stability
+        vlad = vlad.to(torch.float32)
+        vlad = vlad / vlad.norm(dim=-1, keepdim=True)
+        vlad = vlad.reshape(-1, self.cluster_size * self.feature_size)
+        vlad = vlad / vlad.norm(dim=-1, keepdim=True)
+
+        return vlad
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 24
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (12 failures)
+  - [mixed_extremes seed=50012] max_diff=nan, mean_diff=nan, ref_range=[-4.0290e-02,4.0864e-02], orig_range=[nan,nan]
+  - [mixed_extremes seed=50013] max_diff=nan, mean_diff=nan, ref_range=[-4.1917e-02,4.1314e-02], orig_range=[nan,nan]
+  - [head_heavy seed=50024] max_diff=nan, mean_diff=nan, ref_range=[-3.8314e-02,3.8393e-02], orig_range=[nan,nan]
+  - [head_heavy seed=50025] max_diff=nan, mean_diff=nan, ref_range=[-3.9083e-02,3.8007e-02], orig_range=[nan,nan]
+  - [tail_heavy seed=50026] max_diff=nan, mean_diff=nan, ref_range=[-3.7524e-02,3.9037e-02], orig_range=[nan,nan]
+  - [tail_heavy seed=50027] max_diff=nan, mean_diff=nan, ref_range=[-3.8508e-02,3.9178e-02], orig_range=[nan,nan]
+  - [extreme_magnitude seed=50030] max_diff=nan, mean_diff=nan, ref_range=[-3.8547e-02,3.8797e-02], orig_range=[nan,nan]
+  - [extreme_magnitude seed=50031] max_diff=nan, mean_diff=nan, ref_range=[-3.8538e-02,3.8160e-02], orig_range=[nan,nan]
+  ... and 4 more failures
+
+### training_stress (12 failures)
+  - [mixed_extremes seed=70012] max_diff=nan, mean_diff=nan, ref_range=[-4.0548e-02,4.0991e-02], orig_range=[nan,nan]
+  - [mixed_extremes seed=70013] max_diff=nan, mean_diff=nan, ref_range=[-4.0438e-02,4.1360e-02], orig_range=[nan,nan]
+  - [head_heavy seed=70024] max_diff=nan, mean_diff=nan, ref_range=[-3.7795e-02,3.9390e-02], orig_range=[nan,nan]
+  - [head_heavy seed=70025] max_diff=nan, mean_diff=nan, ref_range=[-3.8260e-02,3.9275e-02], orig_range=[nan,nan]
+  - [tail_heavy seed=70026] max_diff=nan, mean_diff=nan, ref_range=[-3.7444e-02,3.9079e-02], orig_range=[nan,nan]
+  - [tail_heavy seed=70027] max_diff=nan, mean_diff=nan, ref_range=[-3.9093e-02,3.8650e-02], orig_range=[nan,nan]
+  - [extreme_magnitude seed=70030] max_diff=nan, mean_diff=nan, ref_range=[-3.8670e-02,4.0032e-02], orig_range=[nan,nan]
+  - [extreme_magnitude seed=70031] max_diff=nan, mean_diff=nan, ref_range=[-4.0873e-02,4.0328e-02], orig_range=[nan,nan]
+  ... and 4 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

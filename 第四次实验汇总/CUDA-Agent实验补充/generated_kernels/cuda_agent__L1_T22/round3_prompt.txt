@@ -1,0 +1,334 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a 2D transposed convolution operation with asymmetric input and kernel, with optional padding.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (tuple): Size of the convolution kernel (height, width).
+        stride (tuple, optional): Stride of the convolution (height, width). Defaults to (1, 1).
+        padding (tuple, optional): Padding applied to the input (height, width). Defaults to (0, 0).
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), bias: bool = False):
+        super(Model, self).__init__()
+        self.conv_transpose2d = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 2D transposed convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, height, width).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, height_out, width_out).
+        """
+        return self.conv_transpose2d(x)
+
+# Test code
+batch_size = 8
+in_channels = 32
+out_channels = 32
+kernel_size = (3, 7)
+height = 512
+width = 1024
+stride = (1, 1)
+padding = (1, 3)
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, height, width)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), bias: bool = False):
+        super().__init__()
+        # Use the actual nn.ConvTranspose2d to preserve correct behavior and state_dict structure
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels, 
+            out_channels, 
+            kernel_size, 
+            stride=stride, 
+            padding=padding, 
+            bias=bias
+        )
+        self.stride = stride
+        self.padding = padding
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Save original settings
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        old_cudnn_enabled = torch.backends.cudnn.enabled
+        old_cudnn_deterministic = torch.backends.cudnn.deterministic
+        
+        # Disable TF32 and cuDNN non-determinism for numerical precision
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        
+        try:
+            # Convert to float64 for maximum precision with extreme values
+            original_dtype = x.dtype
+            
+            # Use double precision for computation to handle extreme values
+            x_double = x.double()
+            weight_double = self.conv_transpose2d.weight.double()
+            
+            if self.conv_transpose2d.bias is not None:
+                bias_double = self.conv_transpose2d.bias.double()
+            else:
+                bias_double = None
+            
+            # Perform the transposed convolution in double precision
+            output = F.conv_transpose2d(
+                x_double,
+                weight_double,
+                bias_double,
+                stride=self.conv_transpose2d.stride,
+                padding=self.conv_transpose2d.padding,
+                output_padding=self.conv_transpose2d.output_padding,
+                groups=self.conv_transpose2d.groups,
+                dilation=self.conv_transpose2d.dilation
+            )
+            
+            # Convert back to original dtype
+            output = output.to(original_dtype)
+            
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+            torch.backends.cudnn.deterministic = old_cudnn_deterministic
+        
+        return output
+```
+
+## Test Failures (Round 3 input)
+Total discrepancies: 56
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.005157e+00, mean_diff=1.377121e-01, ref_range=[-3.3352e+03,3.3972e+03], orig_range=[-3.3351e+03,3.3972e+03]
+  - [large_magnitude seed=50001] max_diff=1.043335e+00, mean_diff=1.379745e-01, ref_range=[-3.2014e+03,3.4104e+03], orig_range=[-3.2016e+03,3.4105e+03]
+  - [near_overflow seed=50002] max_diff=1.028229e+27, mean_diff=1.386239e+26, ref_range=[-3.7217e+30,3.6419e+30], orig_range=[-3.7217e+30,3.6419e+30]
+  - [near_overflow seed=50003] max_diff=1.078777e+27, mean_diff=1.382985e+26, ref_range=[-3.1641e+30,3.1653e+30], orig_range=[-3.1641e+30,3.1652e+30]
+  - [all_negative seed=50008] max_diff=9.853172e-02, mean_diff=1.396679e-02, ref_range=[-2.6683e+02,2.5268e+02], orig_range=[-2.6684e+02,2.5269e+02]
+  - [all_negative seed=50009] max_diff=9.553909e-02, mean_diff=1.365917e-02, ref_range=[-2.5899e+02,2.4415e+02], orig_range=[-2.5902e+02,2.4416e+02]
+  - [all_positive seed=50010] max_diff=1.000633e-01, mean_diff=1.366443e-02, ref_range=[-2.9755e+02,2.9584e+02], orig_range=[-2.9756e+02,2.9584e+02]
+  - [all_positive seed=50011] max_diff=1.032333e-01, mean_diff=1.460541e-02, ref_range=[-2.8604e+02,2.7591e+02], orig_range=[-2.8607e+02,2.7594e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.088814e+00, mean_diff=1.391777e-01, ref_range=[-3.2871e+03,3.2540e+03], orig_range=[-3.2871e+03,3.2541e+03]
+  - [large_magnitude seed=70001] max_diff=1.040955e+00, mean_diff=1.391974e-01, ref_range=[-3.2390e+03,3.4230e+03], orig_range=[-3.2390e+03,3.4232e+03]
+  - [near_overflow seed=70002] max_diff=1.018189e+27, mean_diff=1.384718e+26, ref_range=[-3.3029e+30,3.2523e+30], orig_range=[-3.3032e+30,3.2524e+30]
+  - [near_overflow seed=70003] max_diff=1.062797e+27, mean_diff=1.381835e+26, ref_range=[-3.2738e+30,3.3857e+30], orig_range=[-3.2740e+30,3.3858e+30]
+  - [all_negative seed=70008] max_diff=9.719849e-02, mean_diff=1.377639e-02, ref_range=[-3.0624e+02,2.9444e+02], orig_range=[-3.0623e+02,2.9441e+02]
+  - [all_negative seed=70009] max_diff=9.818649e-02, mean_diff=1.368058e-02, ref_range=[-2.5526e+02,2.7775e+02], orig_range=[-2.5526e+02,2.7774e+02]
+  - [all_positive seed=70010] max_diff=9.862137e-02, mean_diff=1.418409e-02, ref_range=[-2.7599e+02,2.7081e+02], orig_range=[-2.7598e+02,2.7080e+02]
+  - [all_positive seed=70011] max_diff=1.023102e-01, mean_diff=1.398614e-02, ref_range=[-2.9096e+02,3.1834e+02], orig_range=[-2.9095e+02,3.1834e+02]
+  ... and 20 more failures
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 56 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), bias: bool = False):
+        super().__init__()
+        # Use the actual nn.ConvTranspose2d to preserve correct behavior and state_dict structure
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels, 
+            out_channels, 
+            kernel_size, 
+            stride=stride, 
+            padding=padding, 
+            bias=bias
+        )
+        self.stride = stride
+        self.padding = padding
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Disable TF32 to ensure numerical precision
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # Use the standard ConvTranspose2d forward pass in fp32
+            # This ensures numerical stability with extreme values
+            output = self.conv_transpose2d(x)
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+        
+        return output
+```
+
+### What still failed after Round 1
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.005127e+00, mean_diff=1.377122e-01, ref_range=[-3.3352e+03,3.3972e+03], orig_range=[-3.3351e+03,3.3972e+03]
+  - [large_magnitude seed=50001] max_diff=1.043762e+00, mean_diff=1.379747e-01, ref_range=[-3.2014e+03,3.4104e+03], orig_range=[-3.2016e+03,3.4105e+03]
+  - [near_overflow seed=50002] max_diff=1.028116e+27, mean_diff=1.386241e+26, ref_range=[-3.7217e+30,3.6419e+30], orig_range=[-3.7217e+30,3.6419e+30]
+  - [near_overflow seed=50003] max_diff=1.078324e+27, mean_diff=1.382987e+26, ref_range=[-3.1641e+30,3.1653e+30], orig_range=[-3.1641e+30,3.1652e+30]
+  - [all_negative seed=50008] max_diff=9.852028e-02, mean_diff=1.396680e-02, ref_range=[-2.6683e+02,2.5268e+02], orig_range=[-2.6684e+02,2.5269e+02]
+  - [all_negative seed=50009] max_diff=9.552765e-02, mean_diff=1.365918e-02, ref_range=[-2.5899e+02,2.4415e+02], orig_range=[-2.5902e+02,2.4416e+02]
+  - [all_positive seed=50010] max_diff=1.000633e-01, mean_diff=1.366445e-02, ref_range=[-2.9755e+02,2.9584e+02], orig_range=[-2.9756e+02,2.9584e+02]
+  - [all_positive seed=50011] max_diff=1.032457e-01, mean_diff=1.460542e-02, ref_range=[-2.8604e+02,2.7591e+02], orig_range=[-2.8607e+02,2.7594e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.088974e+00, mean_diff=1.391778e-01, ref_range=[-3.2871e+03,3.2540e+03], orig_range=[-3.2871e+03,3.2541e+03]
+  - [large_magnitude seed=70001] max_diff=1.040695e+00, mean_diff=1.391976e-01, ref_range=[-3.2390e+03,3.4230e+03], orig_range=[-3.2390e+03,3.4232e+03]
+  - [near_overflow seed=70002] max_diff=1.018161e+27, mean_diff=1.384720e+26, ref_range=[-3.3029e+30,3.2523e+30], orig_range=[-3.3032e+30,3.2524e+30]
+  - [near_overflow seed=70003] max_diff=1.063288e+27, mean_diff=1.381837e+26, ref_range=[-3.2738e+30,3.3857e+30], orig_range=[-3.2740e+30,3.3858e+30]
+  - [all_negative seed=70008] max_diff=9.719849e-02, mean_diff=1.377641e-02, ref_range=[-3.0624e+02,2.9444e+02], orig_range=[-3.0623e+02,2.9441e+02]
+  - [all_negative seed=70009] max_diff=9.816742e-02, mean_diff=1.368060e-02, ref_range=[-2.5526e+02,2.7775e+02], orig_range=[-2.5526e+02,2.7774e+02]
+  - [all_positive seed=70010] max_diff=9.864330e-02, mean_diff=1.418411e-02, ref_range=[-2.7599e+02,2.7081e+02], orig_range=[-2.7598e+02,2.7080e+02]
+  - [all_positive seed=70011] max_diff=1.022186e-01, mean_diff=1.398616e-02, ref_range=[-2.9096e+02,3.1834e+02], orig_range=[-2.9095e+02,3.1834e+02]
+  ... and 20 more failures
+
+## Previous Repair Attempt (Round 2)
+After round 2, still 56 discrepancies in: value_stress, training_stress
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class ModelNew(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: tuple, stride: tuple = (1, 1), padding: tuple = (0, 0), bias: bool = False):
+        super().__init__()
+        # Use the actual nn.ConvTranspose2d to preserve correct behavior and state_dict structure
+        self.conv_transpose2d = nn.ConvTranspose2d(
+            in_channels, 
+            out_channels, 
+            kernel_size, 
+            stride=stride, 
+            padding=padding, 
+            bias=bias
+        )
+        self.stride = stride
+        self.padding = padding
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Save original settings
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        old_cudnn_enabled = torch.backends.cudnn.enabled
+        old_cudnn_deterministic = torch.backends.cudnn.deterministic
+        
+        # Disable TF32 and cuDNN non-determinism for numerical precision
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cudnn.deterministic = True
+        
+        try:
+            # Convert to float64 for maximum precision with extreme values
+            original_dtype = x.dtype
+            
+            # Use double precision for computation to handle extreme values
+            x_double = x.double()
+            weight_double = self.conv_transpose2d.weight.double()
+            
+            if self.conv_transpose2d.bias is not None:
+                bias_double = self.conv_transpose2d.bias.double()
+            else:
+                bias_double = None
+            
+            # Perform the transposed convolution in double precision
+            output = F.conv_transpose2d(
+                x_double,
+                weight_double,
+                bias_double,
+                stride=self.conv_transpose2d.stride,
+                padding=self.conv_transpose2d.padding,
+                output_padding=self.conv_transpose2d.output_padding,
+                groups=self.conv_transpose2d.groups,
+                dilation=self.conv_transpose2d.dilation
+            )
+            
+            # Convert back to original dtype
+            output = output.to(original_dtype)
+            
+        finally:
+            # Restore original settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+            torch.backends.cudnn.deterministic = old_cudnn_deterministic
+        
+        return output
+```
+
+### What still failed after Round 2
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=1.005157e+00, mean_diff=1.377121e-01, ref_range=[-3.3352e+03,3.3972e+03], orig_range=[-3.3351e+03,3.3972e+03]
+  - [large_magnitude seed=50001] max_diff=1.043335e+00, mean_diff=1.379745e-01, ref_range=[-3.2014e+03,3.4104e+03], orig_range=[-3.2016e+03,3.4105e+03]
+  - [near_overflow seed=50002] max_diff=1.028229e+27, mean_diff=1.386239e+26, ref_range=[-3.7217e+30,3.6419e+30], orig_range=[-3.7217e+30,3.6419e+30]
+  - [near_overflow seed=50003] max_diff=1.078777e+27, mean_diff=1.382985e+26, ref_range=[-3.1641e+30,3.1653e+30], orig_range=[-3.1641e+30,3.1652e+30]
+  - [all_negative seed=50008] max_diff=9.853172e-02, mean_diff=1.396679e-02, ref_range=[-2.6683e+02,2.5268e+02], orig_range=[-2.6684e+02,2.5269e+02]
+  - [all_negative seed=50009] max_diff=9.553909e-02, mean_diff=1.365917e-02, ref_range=[-2.5899e+02,2.4415e+02], orig_range=[-2.5902e+02,2.4416e+02]
+  - [all_positive seed=50010] max_diff=1.000633e-01, mean_diff=1.366443e-02, ref_range=[-2.9755e+02,2.9584e+02], orig_range=[-2.9756e+02,2.9584e+02]
+  - [all_positive seed=50011] max_diff=1.032333e-01, mean_diff=1.460541e-02, ref_range=[-2.8604e+02,2.7591e+02], orig_range=[-2.8607e+02,2.7594e+02]
+  ... and 20 more failures
+
+### training_stress (28 failures)
+  - [large_magnitude seed=70000] max_diff=1.088814e+00, mean_diff=1.391777e-01, ref_range=[-3.2871e+03,3.2540e+03], orig_range=[-3.2871e+03,3.2541e+03]
+  - [large_magnitude seed=70001] max_diff=1.040955e+00, mean_diff=1.391974e-01, ref_range=[-3.2390e+03,3.4230e+03], orig_range=[-3.2390e+03,3.4232e+03]
+  - [near_overflow seed=70002] max_diff=1.018189e+27, mean_diff=1.384718e+26, ref_range=[-3.3029e+30,3.2523e+30], orig_range=[-3.3032e+30,3.2524e+30]
+  - [near_overflow seed=70003] max_diff=1.062797e+27, mean_diff=1.381835e+26, ref_range=[-3.2738e+30,3.3857e+30], orig_range=[-3.2740e+30,3.3858e+30]
+  - [all_negative seed=70008] max_diff=9.719849e-02, mean_diff=1.377639e-02, ref_range=[-3.0624e+02,2.9444e+02], orig_range=[-3.0623e+02,2.9441e+02]
+  - [all_negative seed=70009] max_diff=9.818649e-02, mean_diff=1.368058e-02, ref_range=[-2.5526e+02,2.7775e+02], orig_range=[-2.5526e+02,2.7774e+02]
+  - [all_positive seed=70010] max_diff=9.862137e-02, mean_diff=1.418409e-02, ref_range=[-2.7599e+02,2.7081e+02], orig_range=[-2.7598e+02,2.7080e+02]
+  - [all_positive seed=70011] max_diff=1.023102e-01, mean_diff=1.398614e-02, ref_range=[-2.9096e+02,3.1834e+02], orig_range=[-2.9095e+02,3.1834e+02]
+  ... and 20 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

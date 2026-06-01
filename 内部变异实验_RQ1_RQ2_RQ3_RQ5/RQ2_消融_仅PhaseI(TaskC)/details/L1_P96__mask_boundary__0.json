@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P96__mask_boundary__0",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P96",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5514,
+        "completion_tokens": 4471,
+        "total_tokens": 9985,
+        "reasoning_tokens": 1748
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "total_elements=524288. Original processes idx in [0,524287]; mutant processes [0,524286]. Index 524287 (element [127,4095]) is not written in mutant but IS read in reduction. Setting only last element to have large loss (≈50000) gives original_mean≈0.0954 vs mutant_mean≈0 (assuming uninitialized=0). Difference 0.0954 >> tolerance 0.011.",
+      "survival_reason": "Layer 2 tests used random distributions where the loss contribution from the single last element was negligible compared to the aggregate loss from 524287 other elements. With tolerance atol=rtol=0.01, the missing contribution of one element among 524288 elements was masked by numerical noise. The 'boundary_last_element' stress tests likely didn't isolate the last element's contribution.",
+      "killable": true,
+      "kill_strategy": "Create inputs where ONLY the last element (index 524287, position [127,4095]) has a non-zero loss contribution. Set all other elements to have zero loss (predictions=targets). Make the last element's difference large enough that its loss/total_elements exceeds the tolerance threshold.",
+      "recommendations": "Boundary mutation tests should include scenarios where ONLY boundary elements contribute to the output, isolating their effect rather than diluting it among many other elements. For reduction operations, test with sparse inputs concentrated at boundary positions.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Only the last element (index 524287 = [127, 4095]) has non-zero loss\n    # This is the exact element not processed by the mutant\n    targets[127, 4095] = -50000.0  # diff=50000, loss=49999.5\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5411,
+        "completion_tokens": 3773,
+        "total_tokens": 9184,
+        "reasoning_tokens": 1916
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutant skips writing to element_losses[524287]. With torch::empty(), this position is uninitialized. If the garbage happens to be close to the expected loss value (possibly due to CUDA memory pool caching/zeroing), the outputs match. Using NaN forces the original to produce NaN (which propagates through summation), while the mutant's garbage is almost certainly not NaN, creating a distinguishable difference.",
+      "survival_reason": "Round 1 failed because torch::empty() in CUDA often returns memory from a pool that may contain predictable values (zeros or cached data from previous allocations). The uninitialized element_losses[524287] likely contained a value close to zero or near the expected loss value. The new strategy exploits NaN propagation: if the original computes NaN for the last element (from NaN input), the entire sum becomes NaN. The mutant's uninitialized garbage is statistically almost never NaN, so it produces a finite result. NaN vs finite is always distinguishable by torch.allclose (NaN != anything, including NaN itself).",
+      "killable": true,
+      "kill_strategy": "Force the last element (index 524287) to produce NaN in the original by using NaN input values. The original will propagate NaN through summation to the final output. The mutant skips this element, using uninitialized memory (almost certainly not NaN), producing a finite result. NaN vs finite guarantees torch.allclose returns False.",
+      "recommendations": "When testing boundary condition mutations on kernels using uninitialized buffers (torch::empty), use NaN/Inf sentinel values at boundary positions to create infection patterns that cannot be masked by arbitrary garbage values. Memory pool reuse can make uninitialized memory appear 'reasonable', but NaN propagation provides a deterministic distinguishing signal.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    targets = torch.zeros(128, 4096, dtype=torch.float32, device=device)\n    # Set the last element to NaN - this is the exact element the mutant skips\n    predictions[127, 4095] = float('nan')\n    # Original: computes NaN loss for last element -> sum is NaN -> mean is NaN\n    # Mutant: skips last element, uses uninitialized garbage (not NaN) -> finite result\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5710,
+        "completion_tokens": 5552,
+        "total_tokens": 11262,
+        "reasoning_tokens": 2751
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation skips processing element 524287, leaving element_losses[524287] uninitialized. However, CUDA memory allocation via torch::empty() often reuses memory from previous kernel executions. When the test harness runs original->mutant sequentially on same inputs, the mutant's element_losses buffer may reuse the exact memory location where the original stored its computed value for position 524287, causing identical outputs.",
+      "survival_reason": "Round 1 failed because CUDA memory reuse likely caused the uninitialized position 524287 to contain the same value the original kernel computed there from a previous execution. Round 2 failed because NaN inputs made the reference implementation invalid. The key insight is that sequential execution with memory reuse masks the mutation. A new strategy is needed: create inputs where element 524286 (processed by both) has a DIFFERENT loss than element 524287 (only processed by original). If memory reuse copies from adjacent allocations or previous values, the garbage at 524287 would be wrong.",
+      "killable": true,
+      "kill_strategy": "Create a pattern where element 524287 has zero loss but element 524286 has a very large loss. If memory contains garbage from nearby computations or previous iterations with different values, position 524287's garbage won't match zero. Additionally, use extreme values to maximize the detectable difference.",
+      "recommendations": "Test kernels with explicit memory zeroing or randomization between runs to detect mutations that rely on uninitialized memory. Consider using torch::zeros() instead of torch::empty() for intermediate buffers to make kernel behavior deterministic and easier to test.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.full((128, 4096), 7.7777, dtype=torch.float32, device=device)\n    targets = torch.full((128, 4096), 7.7777, dtype=torch.float32, device=device)\n    # Element 524286 (second-to-last): large loss\n    predictions[127, 4094] = 1e7\n    targets[127, 4094] = 0.0\n    # Element 524287 (last): zero loss - both same\n    predictions[127, 4095] = 7.7777\n    targets[127, 4095] = 7.7777\n    # Original: loss[524286]=1e7-0.5, loss[524287]=0, mean=(1e7-0.5)/524288 ~ 19.07\n    # Mutant: loss[524286]=1e7-0.5, loss[524287]=garbage\n    # If garbage != 0, outputs differ significantly\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6077,
+        "completion_tokens": 6016,
+        "total_tokens": 12093,
+        "reasoning_tokens": 2854
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation skips last element (idx 524287). For uninitialized memory, if garbage=G, mean_diff = G/524288. Need G/524288 > 0.01 (atol). Requires G > 5243. Memory pollution with 12345.0 should exceed this threshold.",
+      "survival_reason": "Previous attempts failed because PyTorch's CUDA caching allocator returned memory that either (1) was zeroed for fresh allocations, or (2) contained values coincidentally close to expected. By polluting memory with distinctive values (12345) then making the expected loss zero at position 524287, any non-zero garbage will cause a detectable difference. Round 1 failed because the 'correct' value was large and garbage may have been similar; this test makes the correct value 0, maximizing the chance garbage differs.",
+      "killable": true,
+      "kill_strategy": "Pollute GPU memory with distinctive non-zero values, then create inputs where the last element should compute zero loss. If garbage memory contains the pollution pattern, mutant output differs from zero by garbage/total_elements.",
+      "recommendations": "Kernels using torch::empty should explicitly initialize all elements or use torch::zeros for output buffers to prevent subtle bugs from uninitialized memory. Testing should include memory-stress scenarios with pre-allocated pollution patterns.",
+      "suggested_code": "def generate_inputs(device):\n    # Pollute GPU memory with distinctive pattern\n    pollution = torch.full((128, 4096), 12345.0, dtype=torch.float32, device=device)\n    del pollution\n    torch.cuda.synchronize()\n    \n    # Inputs where ALL elements have zero loss (predictions == targets)\n    # Original: mean = 0 (all losses are 0)\n    # Mutant: mean = garbage/524288 (last element uninitialized)\n    predictions = torch.full((128, 4096), 5.5, dtype=torch.float32, device=device)\n    targets = torch.full((128, 4096), 5.5, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6361,
+        "completion_tokens": 5080,
+        "total_tokens": 11441,
+        "reasoning_tokens": 2464
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation skips processing element 524287, leaving garbage in element_losses[524287]. With total_elements=524288, a single element's contribution to mean is loss/524288. For torch.allclose(atol=0.01, rtol=0.01), we need |ref-mut| > 0.01 + 0.01*|ref|. If ref≈0 and loss[524287]/524288 > 0.01, then loss[524287] > 5242.88. Previous attempts may have failed because CUDA memory pools often return recently-freed memory containing similar values, or garbage happened to be near expected.",
+      "survival_reason": "Round 1 set only last element with diff=50000 (loss=49999.5, mean≈0.095), which should exceed tolerance but didn't kill - suggesting garbage memory contained a value close to expected. Round 2 used NaN which broke the reference. Round 3/4 targeted wrong elements or relied on unpredictable garbage. The key insight is that CUDA memory allocation via torch::empty often reuses memory from previous operations. Previous tests used zeros as the base tensor, which may have primed memory. A fundamentally different approach uses non-zero base values throughout to ensure garbage memory (likely containing zeros or previous computation results) differs maximally from the computed loss value.",
+      "killable": true,
+      "kill_strategy": "Use a uniform NON-ZERO base pattern (e.g., 50.0) for all elements so any garbage memory (likely zeros from allocator patterns or different values from unrelated prior ops) will contrast sharply. Set the last element to produce an extremely large loss (diff=100000) so that even if garbage is some small non-zero value, the difference in means still exceeds tolerance. The large magnitude (0.19 mean vs ~0 garbage contribution) provides margin against allocator-dependent garbage values.",
+      "recommendations": "When testing boundary mutations that skip single elements, ensure test inputs use non-zero base values to avoid memory reuse artifacts, and make the affected element's contribution large enough (>500x the per-element tolerance threshold) to reliably exceed allclose tolerances even if garbage memory contains unexpected values.",
+      "suggested_code": "def generate_inputs(device):\n    # Non-zero base ensures memory pattern differs from likely garbage\n    predictions = torch.full((128, 4096), 50.0, dtype=torch.float32, device=device)\n    targets = torch.full((128, 4096), 50.0, dtype=torch.float32, device=device)\n    # Last element: massive difference to produce large loss\n    predictions[127, 4095] = 100050.0  # diff = 100050 - 50 = 100000\n    # targets stays at 50.0\n    # loss[524287] = |100000| - 0.5 = 99999.5\n    # Original mean = 99999.5 / 524288 ≈ 0.1907\n    # Mutant mean (garbage likely 0 or small) ≈ 0 or small\n    # Difference ≈ 0.1907 >> tolerance (0.01 + 0.01*0.1907 ≈ 0.012)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 442.36
+}

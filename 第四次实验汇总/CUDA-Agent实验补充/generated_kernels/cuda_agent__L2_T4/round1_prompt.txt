@@ -1,0 +1,262 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a matrix multiplication, applies GELU, and then applies Softmax.
+    """
+    def __init__(self, in_features, out_features):
+        super(Model, self).__init__()
+        self.linear = nn.Linear(in_features, out_features)
+
+    def forward(self, x):
+        x = self.linear(x)
+        x = torch.nn.functional.gelu(x)
+        x = torch.nn.functional.softmax(x, dim=1)
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_bias_gelu_softmax.cu ===
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float gelu_activation(float x) {
+    const float cdf = 0.5f * (1.0f + erf(x / 1.41421356237309504880f));
+    return x * cdf;
+}
+
+__global__ void fused_bias_gelu_softmax_kernel(float* output, const float* matmul_out, const float* bias, int batch_size, int features) {
+    __shared__ float shared_max[128];
+    __shared__ float shared_sum[128];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    if (tid < 128 && row < batch_size) {
+        // Step 1: Initialize shared memory
+        shared_max[tid] = -INFINITY;
+        shared_sum[tid] = 0.0f;
+        __syncthreads();
+
+        // Step 2: Compute initial max_val for this thread's portion of the row
+        float local_max = -INFINITY;
+        for (int col = tid; col < features; col += 128) {
+            float val = matmul_out[row * features + col] + bias[col];
+            local_max = max(local_max, gelu_activation(val));
+        }
+
+        // Step 3: Block-wise reduction for max_val
+        shared_max[tid] = local_max;
+        __syncthreads();
+
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) {
+                shared_max[tid] = max(shared_max[tid], shared_max[tid + s]);
+            }
+            __syncthreads();
+        }
+
+        float row_max = shared_max[0];
+        __syncthreads();
+
+        // Step 4: Compute initial sum_exp for this thread's portion of the row
+        float local_sum = 0.0f;
+        for (int col = tid; col < features; col += 128) {
+            float val = matmul_out[row * features + col] + bias[col];
+            float gelu_val = gelu_activation(val);
+            local_sum += exp(gelu_val - row_max);
+        }
+
+        // Step 5: Block-wise reduction for sum_exp
+        shared_sum[tid] = local_sum;
+        __syncthreads();
+
+        for (int s = 64; s > 0; s >>= 1) {
+            if (tid < s) {
+                shared_sum[tid] = shared_sum[tid] + shared_sum[tid + s];
+            }
+            __syncthreads();
+        }
+
+        float row_sum = shared_sum[0];
+        float inv_row_sum = 1.0f / row_sum;
+
+        // Step 6: Compute output for this thread's portion of the row
+        for (int col = tid; col < features; col += 128) {
+            float val = matmul_out[row * features + col] + bias[col];
+            float gelu_val = gelu_activation(val);
+            float exp_val = exp(gelu_val - row_max);
+            output[row * features + col] = exp_val * inv_row_sum;
+        }
+    }
+}
+
+extern "C" void fused_bias_gelu_softmax_launcher(float* output, const float* matmul_out, const float* bias, int batch_size, int features, cudaStream_t stream) {
+    fused_bias_gelu_softmax_kernel<<<batch_size, 128, 0, stream>>>(output, matmul_out, bias, batch_size, features);
+}
+"""
+
+_cpp_sources = """
+// === fused_bias_gelu_softmax_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_bias_gelu_softmax_launcher(float* output, const float* matmul_out, const float* bias, int batch_size, int features, cudaStream_t stream);
+
+torch::Tensor fused_bias_gelu_softmax_forward(torch::Tensor matmul_out, torch::Tensor bias) {
+    // Input validation
+    TORCH_CHECK(matmul_out.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(matmul_out.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(matmul_out.dtype() == torch::kFloat32, "Input must be float32");
+    
+    TORCH_CHECK(bias.is_cuda(), "Bias must be a CUDA tensor");
+    TORCH_CHECK(bias.is_contiguous(), "Bias must be contiguous");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Bias must be float32");
+    TORCH_CHECK(bias.ndimension() == 1, "Bias must be 1D");
+    TORCH_CHECK(matmul_out.size(1) == bias.size(0), "Bias size mismatch");
+
+    auto output = torch::empty_like(matmul_out);
+    
+    // Get current CUDA stream
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    // Call CUDA launcher
+    fused_bias_gelu_softmax_launcher(
+        output.data_ptr<float>(),
+        matmul_out.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        matmul_out.size(0),
+        matmul_out.size(1),
+        stream
+    );
+    
+    return output;
+}
+
+void register_fused_bias_gelu_softmax(pybind11::module& m) {
+    m.def("fused_bias_gelu_softmax_forward", &fused_bias_gelu_softmax_forward, 
+          "Fused bias + GELU + Softmax forward",
+          py::arg("matmul_out"),
+          py::arg("bias"));
+}
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_bias_gelu_softmax_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model using custom fused kernel for bias + GELU + Softmax after Linear layer.
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        # Initialize parameters with the same names as in the original model
+        self.linear = nn.Module()
+        self.linear.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.linear.bias = nn.Parameter(torch.zeros(out_features))
+
+    def forward(self, x):
+        # Enable TensorFloat32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Step 1: Compute matrix multiplication using PyTorch's optimized implementation
+        # This should use cuBLAS under the hood with TF32
+        matmul_out = x @ self.linear.weight.transpose(0, 1)
+        
+        # Step 2: Apply fused bias + GELU + Softmax using custom CUDA kernel
+        x = cuda_extension.fused_bias_gelu_softmax_forward(matmul_out, self.linear.bias)
+        
+        # Disable TensorFloat32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        return x
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 33
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (19 failures)
+  - [large_magnitude seed=50000] max_diff=1.266300e-01, mean_diff=1.324094e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [large_magnitude seed=50001] max_diff=7.680327e-02, mean_diff=1.358564e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [near_overflow seed=50002] max_diff=1.000000e+00, mean_diff=2.384186e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [near_overflow seed=50003] max_diff=1.000000e+00, mean_diff=2.384186e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_negative seed=50008] max_diff=1.918632e-02, mean_diff=1.280539e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_positive seed=50010] max_diff=1.798385e-02, mean_diff=1.867124e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_positive seed=50011] max_diff=1.451141e-02, mean_diff=1.444284e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [mixed_extremes seed=50012] max_diff=3.329546e-01, mean_diff=1.994713e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  ... and 11 more failures
+
+### training_stress (14 failures)
+  - [large_magnitude seed=70000] max_diff=9.819102e-02, mean_diff=1.694390e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [large_magnitude seed=70001] max_diff=8.575478e-02, mean_diff=1.697101e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [all_negative seed=70008] max_diff=1.632020e-02, mean_diff=1.868313e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [mixed_extremes seed=70012] max_diff=3.749974e-01, mean_diff=1.607348e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [mixed_extremes seed=70013] max_diff=2.121248e-01, mean_diff=1.103760e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [alternating_sign seed=70014] max_diff=1.566356e-02, mean_diff=1.410734e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [alternating_sign seed=70015] max_diff=1.753891e-02, mean_diff=1.677339e-07, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  - [head_heavy seed=70025] max_diff=1.717558e-01, mean_diff=5.708463e-08, ref_range=[0.0000e+00,1.0000e+00], orig_range=[0.0000e+00,1.0000e+00]
+  ... and 6 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

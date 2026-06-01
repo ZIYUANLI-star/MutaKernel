@@ -1,0 +1,476 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# From https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+
+class NewGELU(nn.Module):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    def __init__(self):
+        super(NewGELU, self).__init__()
+    
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+class CausalSelfAttention(nn.Module):
+    """
+    A vanilla multi-head masked self-attention layer with a projection at the end.
+    It is possible to use torch.nn.MultiheadAttention here but I am including an
+    explicit implementation here to show that there is nothing too scary here.
+    """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # regularization
+        self.attn_dropout = nn.Dropout(attn_pdrop)
+        self.resid_dropout = nn.Dropout(resid_pdrop)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+    
+class Model(nn.Module):
+    """ an unassuming Transformer block """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        self.ln_1 = nn.LayerNorm(n_embd)
+        self.attn = CausalSelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen)
+        self.ln_2 = nn.LayerNorm(n_embd)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc    = nn.Linear(n_embd, 4 * n_embd),
+            c_proj  = nn.Linear(4 * n_embd, n_embd),
+            act     = NewGELU(),
+            dropout = nn.Dropout(resid_pdrop),
+        ))
+        m = self.mlp
+        self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlpf(self.ln_2(x))
+        return x
+
+batch_size = 128
+max_seqlen = 1024
+seq_len = 512
+n_embd = 768
+n_head = 8
+attn_pdrop = 0.0
+resid_pdrop = 0.0
+
+def get_inputs():
+    return [torch.rand(batch_size, seq_len, n_embd)]
+
+def get_init_inputs():
+    return [n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === attention_fused_cuda.cu ===
+#include <cuda_runtime.h>
+
+__global__ void attention_mask_and_softmax_kernel(float* output, const float* input, const float* mask,
+                                                   int batch_size, int n_head, int seq_len) {
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    int total_elems = batch_size * n_head * seq_len * seq_len;
+    
+    while (idx < total_elems) {
+        float val = input[idx];
+        int batch = idx / (n_head * seq_len * seq_len);
+        int head = (idx % (n_head * seq_len * seq_len)) / (seq_len * seq_len);
+        int i = ((idx % (n_head * seq_len * seq_len)) % (seq_len * seq_len)) / seq_len;
+        int j = ((idx % (n_head * seq_len * seq_len)) % (seq_len * seq_len)) % seq_len;
+        
+        if (j > i) {
+            val = float('-inf');
+        }
+        
+        output[idx] = val;
+        
+        idx += gridDim.x * 256;
+    }
+}
+
+extern "C" void attention_mask_and_softmax_launcher(float* output, const float* input, int batch_size, int n_head, int seq_len, cudaStream_t stream) {
+    int blocks = (batch_size * n_head * seq_len * seq_len + 256 - 1) / 256;
+    
+    // First, apply the mask
+    attention_mask_and_softmax_kernel<<<blocks, 256, 0, stream>>>(output, input, nullptr, batch_size, n_head, seq_len);
+    
+    // Then apply softmax - but this is complex, let's use the existing implementation for now
+}
+
+
+// === gelu_fused_cuda.cu ===
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void gelu_fused_after_fc_kernel(float* output, const float* input, const float* weight, const float* bias,
+                                          int batch_size_seq_len, int in_dim, int out_dim) {
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    int total_elems = batch_size_seq_len * out_dim;
+    
+    while (idx < total_elems) {
+        float val = 0.0f;
+        int row = idx / out_dim;
+        int col = idx % out_dim;
+        
+        // This is still naive - need to use cuBLAS for the matrix multiply
+        // and only fuse the bias and gelu
+        for (int k = 0; k < in_dim; k++) {
+            val += input[row * in_dim + k] * weight[col * in_dim + k];
+        }
+        
+        val += bias[col];
+        
+        float cdf = 0.5f * (1.0f + tanhf(0.7978845608028654f * (val + 0.044715f * val * val * val)));
+        output[idx] = val * cdf;
+        
+        idx += gridDim.x * 256;
+    }
+}
+
+__global__ void gelu_fused_after_cublas_kernel(float* output, const float* fc_out, int batch_size, int seq_len, int dim) {
+    int idx = blockIdx.x * 256 + threadIdx.x;
+    int total_elems = batch_size * seq_len * dim;
+    
+    while (idx < total_elems) {
+        float val = fc_out[idx];
+        
+        float cdf = 0.5f * (1.0f + tanhf(0.7978845608028654f * (val + 0.044715f * val * val * val)));
+        output[idx] = val * cdf;
+        
+        idx += gridDim.x * 256;
+    }
+}
+
+extern "C" void gelu_fused_after_cublas_launcher(float* output, const float* fc_out, int batch_size, int seq_len, int dim, cudaStream_t stream) {
+    int blocks = (batch_size * seq_len * dim + 256 - 1) / 256;
+    gelu_fused_after_cublas_kernel<<<blocks, 256, 0, stream>>>(output, fc_out, batch_size, seq_len, dim);
+}
+
+
+// === layernorm_cuda.cu ===
+#include <cuda_runtime.h>
+#include <cmath>
+
+__global__ void layernorm_kernel(float* output, const float* input, const float* weight, const float* bias, 
+                                  int batch_size, int seq_len, int dim, float eps) {
+    int idx = blockIdx.x * 128 + threadIdx.x;
+    int total_blocks = batch_size * seq_len;
+    
+    while (idx < total_blocks) {
+        float sum = 0.0f;
+        float sum_sq = 0.0f;
+        
+        int start = idx * dim;
+        
+        // Calculate mean and variance
+        for (int i = 0; i < dim; i++) {
+            float val = input[start + i];
+            sum += val;
+            sum_sq += val * val;
+        }
+        
+        float mean = sum / dim;
+        float var = (sum_sq / dim - mean * mean);
+        float inv_std = rsqrt(var + eps);
+        
+        // Normalize, scale, and shift
+        for (int i = 0; i < dim; i++) {
+            float val = input[start + i];
+            float gamma = weight[i];
+            float beta = bias[i];
+            output[start + i] = gamma * (val - mean) * inv_std + beta;
+        }
+        
+        idx += gridDim.x * 128;
+    }
+}
+
+extern "C" void layernorm_launcher(float* output, const float* input, const float* weight, const float* bias,
+                                    int batch_size, int seq_len, int dim, float eps, cudaStream_t stream) {
+    int blocks = (batch_size * seq_len + 128 - 1) / 128;
+    layernorm_kernel<<<blocks, 128, 0, stream>>>(output, input, weight, bias, batch_size, seq_len, dim, eps);
+}
+
+"""
+
+_cpp_sources = """
+// === gelu_fused_cuda_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void gelu_fused_after_cublas_launcher(float* output, const float* fc_out, int batch_size, int seq_len, int dim, cudaStream_t stream);
+
+torch::Tensor gelu_fused_after_cublas_forward(torch::Tensor fc_out, int batch_size, int seq_len, int dim) {
+    TORCH_CHECK(fc_out.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(fc_out.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(fc_out.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(fc_out.numel() == batch_size * seq_len * dim, "Input size mismatch");
+    
+    auto output = torch::empty_like(fc_out);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    gelu_fused_after_cublas_launcher(output.data_ptr<float>(), fc_out.data_ptr<float>(), batch_size, seq_len, dim, stream);
+    
+    return output;
+}
+
+void register_gelu_fused_cuda(pybind11::module& m) {
+    m.def("gelu_fused_after_cublas_forward", &gelu_fused_after_cublas_forward, "Fused Gelu after cublas forward",
+          py::arg("fc_out"), py::arg("batch_size"), py::arg("seq_len"), py::arg("dim"));
+}
+
+
+
+
+// === layernorm_cuda_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void layernorm_launcher(float* output, const float* input, const float* weight, const float* bias,
+                                    int batch_size, int seq_len, int dim, float eps, cudaStream_t stream);
+
+torch::Tensor layernorm_forward(torch::Tensor input, torch::Tensor weight, torch::Tensor bias,
+                                int batch_size, int seq_len, int dim, float eps = 1e-05) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    TORCH_CHECK(input.size(0) == batch_size, "Batch size mismatch");
+    TORCH_CHECK(input.size(1) == seq_len, "Sequence length mismatch");
+    TORCH_CHECK(input.size(2) == dim, "Dimension mismatch");
+    TORCH_CHECK(weight.is_cuda() && weight.size(0) == dim, "Weight mismatch");
+    TORCH_CHECK(bias.is_cuda() && bias.size(0) == dim, "Bias mismatch");
+    
+    auto output = torch::empty_like(input);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    layernorm_launcher(output.data_ptr<float>(), input.data_ptr<float>(), 
+                       weight.data_ptr<float>(), bias.data_ptr<float>(),
+                       batch_size, seq_len, dim, eps, stream);
+    
+    return output;
+}
+
+void register_layernorm_cuda(pybind11::module& m) {
+    m.def("layernorm_forward", &layernorm_forward, "LayerNorm forward",
+          py::arg("input"), py::arg("weight"), py::arg("bias"),
+          py::arg("batch_size"), py::arg("seq_len"), py::arg("dim"),
+          py::arg("eps") = 1e-05);
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["gelu_fused_after_cublas_forward", "layernorm_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+import math
+
+class ModelNew(nn.Module):
+    """ an optimized Transformer block using custom CUDA ops """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.ln_1 = nn.LayerNorm(n_embd)  # Keep for state_dict
+        self.ln_2 = nn.LayerNorm(n_embd)  # Keep for state_dict
+        self.attn = CausalSelfAttention(n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen)
+        self.mlp = nn.ModuleDict(dict(
+            c_fc    = nn.Linear(n_embd, 4 * n_embd),
+            c_proj  = nn.Linear(4 * n_embd, n_embd),
+            dropout = nn.Dropout(resid_pdrop),  # Keep for state_dict
+        ))
+        
+        self.n_embd = n_embd
+        self.batch_size = 128
+        self.seq_len = 512
+
+    def forward(self, x):
+        # Enable TensorFloat32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Custom layer norm
+        x_norm1 = cuda_extension.layernorm_forward(x, self.ln_1.weight, self.ln_1.bias,
+                                                 self.batch_size, self.seq_len, self.n_embd)
+        x = x + self.attn(x_norm1)
+        
+        # Custom layer norm
+        x_norm2 = cuda_extension.layernorm_forward(x, self.ln_2.weight, self.ln_2.bias,
+                                                 self.batch_size, self.seq_len, self.n_embd)
+        
+        # MLP forward with fused fc + gelu
+        mlp_out = self._mlpf(x_norm2)
+        x = x + mlp_out
+        
+        # Disable TensorFloat32
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return x
+        
+    def _mlpf(self, x):
+        # FC1 using cuBLAS with TF32
+        x_fc1 = x.reshape(-1, self.n_embd) @ self.mlp.c_fc.weight.t() + self.mlp.c_fc.bias
+        
+        # Fused Gelu
+        x_gelu = cuda_extension.gelu_fused_after_cublas_forward(x_fc1, self.batch_size, self.seq_len, 4 * self.n_embd)
+        
+        # FC2 using cuBLAS with TF32
+        x_fc2 = x_gelu.reshape(-1, 4 * self.n_embd) @ self.mlp.c_proj.weight.t() + self.mlp.c_proj.bias
+        
+        x_fc2 = x_fc2.reshape(self.batch_size, self.seq_len, self.n_embd)
+        return x_fc2
+
+
+class CausalSelfAttention(nn.Module):
+    """ optimized causal self-attention """
+
+    def __init__(self, n_embd, n_head, attn_pdrop, resid_pdrop, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+        
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        qkv = x.reshape(-1, C) @ self.c_attn.weight.t() + self.c_attn.bias
+        qkv = qkv.reshape(B, T, 3 * C)
+        q, k ,v  = qkv.split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = att.softmax(dim=-1)
+        # Skip attention dropout since attn_pdrop=0.0
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = y.reshape(-1, C) @ self.c_proj.weight.t() + self.c_proj.bias
+        y = y.reshape(B, T, C)
+        # Skip residual dropout since resid_pdrop=0.0
+        return y
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 86
+Failing dimensions: value_stress, training_stress, repeated_run
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (42 failures)
+  - [large_magnitude seed=50000] 
+  - [large_magnitude seed=50001] 
+  - [near_overflow seed=50002] 
+  - [near_overflow seed=50003] 
+  - [near_zero seed=50004] 
+  - [near_zero seed=50005] 
+  - [denormals seed=50006] 
+  - [denormals seed=50007] 
+  ... and 34 more failures
+
+### training_stress (42 failures)
+  - [large_magnitude seed=70000] 
+  - [large_magnitude seed=70001] 
+  - [near_overflow seed=70002] 
+  - [near_overflow seed=70003] 
+  - [near_zero seed=70004] 
+  - [near_zero seed=70005] 
+  - [denormals seed=70006] 
+  - [denormals seed=70007] 
+  ... and 34 more failures
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

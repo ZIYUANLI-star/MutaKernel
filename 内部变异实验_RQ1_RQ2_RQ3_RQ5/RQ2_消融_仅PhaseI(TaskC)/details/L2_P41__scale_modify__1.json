@@ -1,0 +1,75 @@
+{
+  "mutant_id": "L2_P41__scale_modify__1",
+  "operator_name": "scale_modify",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8443,
+        "completion_tokens": 3562,
+        "total_tokens": 12005,
+        "reasoning_tokens": 1381
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Mutation changes inv_std from 1/sqrt(var+eps) to (var+eps). For var=0.5: original≈1.414, mutant≈0.5. For var≈0: original≈316, mutant≈1e-5. The normalized values (val-mean)*inv_std differ by factors of 2-10^7 depending on variance.",
+      "survival_reason": "The mutant survived EMD Layer 2 likely due to insufficient test rounds (only 0 total rounds shown). The mutation fundamentally changes GroupNorm's normalization: instead of dividing by standard deviation (rsqrtf computes 1/sqrt), it multiplies by variance. This produces completely different scaling for any variance not exactly equal to 1. With default initialization (running_var=1 for BatchNorm, but GroupNorm computes its own statistics), the intermediate activations will have group variances that vary widely from 1.",
+      "killable": true,
+      "kill_strategy": "Use any input that produces non-trivial variance in the GroupNorm computation. Random input scaled to ensure spread works well. The GELU outputs will have variance spread across groups, and rsqrt(var) vs var produces dramatically different scaling factors.",
+      "recommendations": "Critical mathematical functions like rsqrtf should have dedicated unit tests that verify the normalization scale. Testing with inputs producing known variance values (e.g., constant=0 variance, or uniform in [0,1] for ~0.083 variance) can catch such mutations.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    # Scaled random input ensures variance in GroupNorm differs from 1\n    # rsqrtf(var+eps) vs (var+eps) produces huge differences\n    x = torch.randn(128, 512, device=device) * 2.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8280,
+        "completion_tokens": 3886,
+        "total_tokens": 12166,
+        "reasoning_tokens": 1652
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "When group variance → 0: Original uses rsqrt(1e-5) ≈ 316.2, Mutant uses 1e-5. Factor difference ~31.6M. Even with subsequent averaging/ReLU, |ref - mut| >> atol + rtol*|ref|.",
+      "survival_reason": "Previous attempt used randn*2.0 which, after GEMM+BatchNorm+GELU pipeline with default params (running_var=1, weight_bn=1), produced group variances near 1.0 where rsqrt(1)≈1≈(1+eps). Zero input forces GEMM output = bias only, making all batch rows identical. The small bias initialization (-bound, bound with bound~0.044 for fan_in=512) means channels within same group have very similar bias values, yielding near-zero group variance. This pushes rsqrt(var+eps) to ~316 while mutant uses ~1e-5.",
+      "killable": true,
+      "kill_strategy": "Use zero input to minimize group variance. When var→0, rsqrt(eps)≈316 vs eps≈1e-5, creating massive numerical divergence that propagates through the mean and survives ReLU.",
+      "recommendations": "Scale-modifying mutations in normalization layers require testing with inputs that produce extreme variance values (near-zero or very large), not just typical random inputs where variance tends toward moderate values.",
+      "suggested_code": "def generate_inputs(device):\n    # Zero input: GEMM output = bias for all rows\n    # This creates identical values per column, minimizing within-group variance\n    # When variance ≈ 0, rsqrt(eps) ≈ 316 vs eps ≈ 1e-5 → huge difference\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "error": "Bedrock invoke_model failed in 230541 ms after 5 attempts: Failed to connect to proxy URL: \"http://127.0.0.1:7897\"",
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 488.43
+}

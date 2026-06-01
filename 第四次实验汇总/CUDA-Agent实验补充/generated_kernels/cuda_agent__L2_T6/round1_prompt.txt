@@ -1,0 +1,127 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a convolution, multiplies by a learnable scalar, applies LeakyReLU, and then GELU.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
+        super(Model, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape)) 
+        self.leaky_relu = nn.LeakyReLU()
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = x * self.multiplier
+        x = self.leaky_relu(x)
+        x = torch.nn.functional.gelu(x)
+        return x
+
+batch_size = 64
+in_channels = 64
+out_channels = 64
+height, width = 256, 256
+kernel_size = 3
+multiplier_shape = (out_channels, 1, 1)
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, multiplier_shape]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Model that performs a convolution, multiplies by a learnable scalar, applies LeakyReLU, and then GELU.
+    Optimized with TF32 and fused operations.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, multiplier_shape):
+        super(ModelNew, self).__init__()
+        # Initialize parameters - preserve original structure for state_dict compatibility
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size)
+        self.multiplier = nn.Parameter(torch.randn(multiplier_shape))
+
+    def forward(self, x):
+        # Use TF32 for faster convolution
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Convolution
+        x = torch.conv2d(x, self.conv.weight, self.conv.bias, stride=1, padding=0, dilation=1)
+        
+        # Fused operations
+        x = x * self.multiplier
+        x = torch.max(x, 0.01 * x)  # LeakyReLU
+        
+        # GELU approximation
+        cdf = 0.5 * (1.0 + torch.tanh(0.7978845608028654 * (x + 0.044715 * torch.pow(x, 3))))
+        x = x * cdf
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return x
+
+# Apply torch.compile with optimization flags
+ModelNew = torch.compile(ModelNew, mode='max-autotune')
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 54
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (27 failures)
+  - [large_magnitude seed=50000] max_diff=7.144043e+00, mean_diff=1.510429e-01, ref_range=[-1.6997e-01,8.0800e+03], orig_range=[-1.7004e-01,8.0740e+03]
+  - [large_magnitude seed=50001] max_diff=6.199219e+00, mean_diff=1.668861e-01, ref_range=[-1.6997e-01,6.9700e+03], orig_range=[-1.7004e-01,6.9638e+03]
+  - [near_overflow seed=50002] max_diff=7.284987e+27, mean_diff=1.572990e+26, ref_range=[-0.0000e+00,7.7347e+30], orig_range=[-0.0000e+00,7.7296e+30]
+  - [near_overflow seed=50003] max_diff=5.780479e+27, mean_diff=1.421216e+26, ref_range=[-0.0000e+00,6.1689e+30], orig_range=[-4.2740e-05,6.1638e+30]
+  - [all_negative seed=50008] max_diff=4.563599e-01, mean_diff=2.028628e-02, ref_range=[-1.6997e-01,3.8171e+02], orig_range=[-1.7004e-01,3.8145e+02]
+  - [all_negative seed=50009] max_diff=3.801727e-01, mean_diff=9.138765e-03, ref_range=[-1.6997e-01,3.6700e+02], orig_range=[-1.7004e-01,3.6678e+02]
+  - [all_positive seed=50010] max_diff=5.544434e-01, mean_diff=2.123388e-02, ref_range=[-1.6997e-01,6.1958e+02], orig_range=[-1.7004e-01,6.1907e+02]
+  - [all_positive seed=50011] max_diff=7.496338e-01, mean_diff=2.073906e-02, ref_range=[-1.6997e-01,8.0438e+02], orig_range=[-1.7004e-01,8.0379e+02]
+  ... and 19 more failures
+
+### training_stress (27 failures)
+  - [large_magnitude seed=70000] max_diff=1.022559e+01, mean_diff=1.713313e-01, ref_range=[-1.6997e-01,1.0022e+04], orig_range=[-1.7004e-01,1.0017e+04]
+  - [large_magnitude seed=70001] max_diff=7.808105e+00, mean_diff=1.722206e-01, ref_range=[-1.6997e-01,8.5370e+03], orig_range=[-1.7004e-01,8.5296e+03]
+  - [near_overflow seed=70002] max_diff=1.031274e+28, mean_diff=1.493453e+26, ref_range=[-0.0000e+00,1.0560e+31], orig_range=[-1.6170e-05,1.0552e+31]
+  - [near_overflow seed=70003] max_diff=7.997649e+27, mean_diff=1.857235e+26, ref_range=[-0.0000e+00,9.7033e+30], orig_range=[-0.0000e+00,9.6958e+30]
+  - [all_negative seed=70008] max_diff=6.816406e-01, mean_diff=1.869582e-02, ref_range=[-1.6997e-01,6.0498e+02], orig_range=[-1.7004e-01,6.0458e+02]
+  - [all_negative seed=70009] max_diff=6.723022e-01, mean_diff=2.016284e-02, ref_range=[-1.6997e-01,7.8059e+02], orig_range=[-1.7004e-01,7.8011e+02]
+  - [all_positive seed=70010] max_diff=6.943970e-01, mean_diff=1.651773e-02, ref_range=[-1.6997e-01,6.9397e+02], orig_range=[-1.7004e-01,6.9335e+02]
+  - [all_positive seed=70011] max_diff=3.867188e-01, mean_diff=1.530850e-02, ref_range=[-1.6997e-01,3.8294e+02], orig_range=[-1.7004e-01,3.8259e+02]
+  ... and 19 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

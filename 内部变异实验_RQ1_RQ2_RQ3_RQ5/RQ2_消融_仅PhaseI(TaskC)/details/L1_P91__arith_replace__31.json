@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P91__arith_replace__31",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P91",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4980,
+        "completion_tokens": 3407,
+        "total_tokens": 8387,
+        "reasoning_tokens": 1193
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original grid_x = (1+256-1)/256 = 1; Mutated grid_x = (1+256-1)*256 = 65536. This launches 65536×128 = 8.4M blocks instead of 128, causing timeout/crash as evidenced by Layer 2. Output tensor remains uninitialized.",
+      "survival_reason": "The mutation changes division to multiplication in the grid launch configuration, transforming a standard ceiling-division calculation into an enormous grid size. While the kernel logic itself is protected by bounds checking (extra threads return early), launching 8.4 million blocks creates such massive overhead that the kernel times out or crashes. The output tensor allocated by torch::empty_like remains uninitialized and won't match the reference output.",
+      "killable": true,
+      "kill_strategy": "Any input values will expose the difference because the mutation causes an execution failure (timeout or crash) regardless of input values. The test framework will detect either a crash or that the uninitialized output differs from the correctly computed reference.",
+      "recommendations": "Kernel launch configurations should be tested with sanity checks on grid dimensions. Consider adding CUDA error checking after kernel launches (cudaGetLastError/cudaDeviceSynchronize) to catch configuration errors early rather than producing silent failures with garbage output.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.randn(128, 4000, device=device, dtype=torch.float32)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4766,
+        "completion_tokens": 3391,
+        "total_tokens": 8157,
+        "reasoning_tokens": 1557
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "Mutation changes grid_x = (inner_size + block_size - 1) / block_size to grid_x = (inner_size + block_size - 1) * block_size. With shape [128, 4000] and dim=1: inner_size=1, original grid_x=1, mutant grid_x=65536. Both versions still launch at least 1 block that covers inner_idx=0 (the only valid index). Extra threads simply early-exit via bounds check. Output is identical regardless of tensor values.",
+      "survival_reason": "The previous attempt with random values failed because this mutation is semantically equivalent for the fixed shape [128, 4000]. The mutation affects the grid dimension calculation (line 110), changing division to multiplication. This causes the mutant to launch far more thread blocks than necessary. However, with inner_size=1 (when dim=1), only inner_idx=0 is valid, and both kernels compute this correctly. The extra threads in the mutant simply fail the bounds check (inner_idx >= inner_size) and return without modifying output. Since the kernel correctly initializes all output elements via the valid threads, both versions produce bitwise-identical results. No value-level input can change this because grid_x depends only on tensor dimensions, not tensor values.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable by value changes. The grid_x calculation depends solely on inner_size, which is derived from tensor shape (not values). With the fixed shape [128, 4000] and dim=1, inner_size=1 always. Both original (grid_x=1) and mutant (grid_x=65536) launch threads that cover inner_idx=0, producing identical output. Killing would require changing dim parameter or tensor shape, neither allowed by the testing contract.",
+      "recommendations": "Mutation testing for GPU kernels should include configuration-level mutations (like changing the dimension parameter) as part of the test suite, not just value-level testing. Grid/block dimension calculations are particularly sensitive to the relationship between tensor shape and the target dimension, which cannot be varied through input values alone.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 189.29
+}

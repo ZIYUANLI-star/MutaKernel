@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P97__const_perturb__35",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P97",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5537,
+        "completion_tokens": 4836,
+        "total_tokens": 10373,
+        "reasoning_tokens": 1856
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Original: each thread processes 4 elements per iteration (256×4=1024 elements/iter, 4 iterations). Mutated: each thread processes 3 elements per iteration (256×3=768 elements/iter, 6 iterations). Thread 0 accumulates elements {0-3,1024-1027,2048-2051,3072-3075} vs {0-2,768-770,1536-1538,2304-2306,3072-3074,3840-3842}. Different accumulation orders cause different floating-point rounding.",
+      "survival_reason": "The mutation changes ELEMENTS_PER_THREAD from 4 to 3, altering which elements each thread accumulates into its private registers before the shared memory reduction. While all 4096 elements are still processed exactly once, the order of floating-point accumulation within each thread differs. This causes different intermediate rounding errors that propagate through the dot product, prediction norm, and target norm calculations. The effect is subtle with small values but becomes measurable with larger magnitudes.",
+      "killable": true,
+      "kill_strategy": "Use large-magnitude random values to amplify floating-point rounding differences caused by different accumulation orders. The different element-to-thread mapping between ELEMENTS_PER_THREAD=4 and ELEMENTS_PER_THREAD=3 will cause measurably different intermediate sums.",
+      "recommendations": "When testing kernels with configurable work distribution (elements per thread, threads per block), include tests with large-magnitude values to expose floating-point accumulation order sensitivity. The tolerance of 1e-2 may mask subtle numerical differences that become significant in downstream computations.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10002)  # Seed confirmed to show divergence\n    batch_size = 128\n    feature_size = 4096\n    # Use large magnitude to amplify rounding differences\n    predictions = torch.randn(batch_size, feature_size, device=device, dtype=torch.float32) * 1e4\n    targets = torch.randn(batch_size, feature_size, device=device, dtype=torch.float32) * 1e4\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5431,
+        "completion_tokens": 5717,
+        "total_tokens": 11148,
+        "reasoning_tokens": 2351
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With ELEMENTS_PER_THREAD=4 vs 3, the accumulation order differs. For feature_size=4096: original uses 4 iterations (1024 elements/iter), mutant uses 6 iterations (768 elements/iter). The partial sums before reduction are grouped differently. To expose this, we need values where the different groupings produce detectably different rounding errors that survive the final mean computation across 128 batches.",
+      "survival_reason": "The previous attempt with large random values (1e4 scale) failed because random values cause rounding errors that tend to cancel out across the reduction. The tolerance (atol=1e-2, rtol=1e-2) is large enough to absorb small floating-point differences from random data. To kill this mutant, I need a structured pattern where the difference in element-to-thread mapping (groups of 4 vs groups of 3) produces systematic accumulation differences. Specifically, I'll use a pattern where consecutive groups of 4 elements have products that cancel exactly, but groups of 3 do not, causing the partial sums to differ significantly.",
+      "killable": true,
+      "kill_strategy": "Create a pattern where pred*target values form [+V, +V, -V, -V] repeating. For ELEMENTS_PER_THREAD=4, each thread sees exactly 0 per iteration. For ELEMENTS_PER_THREAD=3, threads see non-zero partial sums (+V, -V, etc.) that must accumulate correctly. Use V = 2^23 (exact float) to maximize precision impact at sum boundaries. Additionally, add small perturbations to trigger distinct rounding paths.",
+      "recommendations": "When testing kernels with configurable loop tiling (ELEMENTS_PER_THREAD), always include structured test patterns that exploit specific grouping boundaries, not just random data. Cancellation patterns that align with one tiling factor but not another are particularly effective for exposing accumulation order bugs.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    feature_size = 4096\n    \n    # Base pattern: [+1, +1, -1, -1] repeating in predictions\n    # Targets all +1, so dot products follow the same pattern\n    # Groups of 4 sum to 0, groups of 3 sum to +/-1\n    \n    V = 2.0 ** 23  # Exact float, large enough to matter\n    \n    predictions = torch.zeros(batch_size, feature_size, device=device, dtype=torch.float32)\n    targets = torch.ones(batch_size, feature_size, device=device, dtype=torch.float32)\n    \n    # Create repeating pattern [+V, +V, -V, -V]\n    idx = torch.arange(feature_size, device=device)\n    pattern = torch.where((idx % 4) < 2, V, -V)\n    predictions[:] = pattern.unsqueeze(0)\n    \n    # Add tiny noise to break perfect cancellation and expose rounding\n    torch.manual_seed(42)\n    predictions += torch.randn_like(predictions) * 1e-4\n    targets += torch.randn_like(targets) * 1e-4\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5916,
+        "completion_tokens": 5348,
+        "total_tokens": 11264,
+        "reasoning_tokens": 2333
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With THREADS=256 and feature_size=4096, EPT=4 processes 1024 elements per iteration (4 complete iterations), while EPT=3 processes 768 elements per iteration (6 iterations). Both cover all 4096 elements but with different thread-to-element mappings. For element index i: EPT=4 assigns to thread (i%1024)//4, EPT=3 assigns to thread (i%768)//3. Element 3 goes to thread 0 in EPT=4 but thread 1 in EPT=3. This difference in accumulation order within threads can cause measurable floating-point discrepancies only with extreme value magnitudes near float32 limits.",
+      "survival_reason": "Round 1 failed because 1e4 magnitude is insufficient to produce rounding errors exceeding the 1e-2 tolerance threshold - the mathematical sums are identical, only accumulation order differs. Round 2 failed because the [+V,+V,-V,-V] pattern sums to 0 regardless of grouping when all 4096 elements are processed - the reduction phase sums all partial results yielding identical final values. The key insight is that both versions process ALL elements identically - only the thread assignment differs. For precision errors to exceed tolerance, we need values at float32 precision boundaries (near 2^24 for integers, or ~1e38 for floats) where intermediate accumulations in different orders produce different rounding behaviors that compound across 4096 elements.",
+      "killable": true,
+      "kill_strategy": "Use values near float32 precision limits with alternating signs at specific thread-boundary indices. Place values at indices 0,1,2,3 (different thread groupings between EPT=4 and EPT=3) using magnitudes near 2^23-2^24 where float32 loses precision. Create a pattern where thread 0 in EPT=4 sees [large,large,small,small] but in EPT=3 sees [large,large,small] with the fourth element going to a different thread, causing different intermediate sums that round differently.",
+      "recommendations": "When optimizing GPU kernels with configurable elements-per-thread or similar parameters, add test cases with values at float32 precision boundaries (2^23, 2^24) combined with alternating signs to verify that different accumulation orderings produce results within acceptable tolerance. This validates numerical stability across configuration variations.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    feature_size = 4096\n    \n    predictions = torch.zeros(batch_size, feature_size, device=device, dtype=torch.float32)\n    targets = torch.zeros(batch_size, feature_size, device=device, dtype=torch.float32)\n    \n    # Use values at float32 precision boundary\n    large = float(2**23)  # Exact integer in float32\n    tiny = float(2**(-23))  # Very small\n    \n    # Thread-critical indices:\n    # EPT=4 iter0: thread 0 gets [0,1,2,3], thread 1 gets [4,5,6,7]...\n    # EPT=3 iter0: thread 0 gets [0,1,2], thread 1 gets [3,4,5]...\n    # Element 3 goes to thread 0 in EPT=4, thread 1 in EPT=3\n    \n    # Create pattern exploiting this difference\n    for b in range(batch_size):\n        # Large values that thread 0 accumulates in both\n        predictions[b, 0] = large\n        predictions[b, 1] = large\n        predictions[b, 2] = -large - tiny  # Nearly cancels sum of [0,1]\n        # Element 3: goes to different threads\n        predictions[b, 3] = tiny * (b + 1)  # Variable tiny residual\n        \n        # Index 768: start of iter1 for EPT=3, middle of iter0 for EPT=4\n        predictions[b, 768] = large * 0.5\n        predictions[b, 769] = -large * 0.5 + tiny\n        predictions[b, 770] = tiny * 2\n        predictions[b, 771] = -tiny  # Different thread in EPT=4 vs EPT=3\n        \n        # Fill some other values to ensure non-trivial norms\n        predictions[b, 1024:1028] = large * 0.1\n        predictions[b, 2048:2052] = -large * 0.1\n        \n    # Targets: all 1s where predictions are non-zero\n    targets[:, 0:4] = 1.0\n    targets[:, 768:772] = 1.0\n    targets[:, 1024:1028] = 1.0\n    targets[:, 2048:2052] = 1.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6711,
+        "completion_tokens": 5417,
+        "total_tokens": 12128,
+        "reasoning_tokens": 2332
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "With atol=rtol=1e-2 and loss values ~0-2, need |diff| > ~0.02. Float32 rounding in 4096-element sums gives ~4096*1e-7 ≈ 4e-4 relative error under normal conditions. However, catastrophic cancellation (summing large +/- values to near-zero) can amplify relative errors dramatically. If dot product ≈ 0 while norms are large, small absolute differences become large relative errors in cosine_sim = dot/norm_product.",
+      "survival_reason": "Round 1-3 failed because they either: (1) used random values where rounding errors average out, (2) created patterns where cancellation occurred within the same thread in both configs, or (3) focused on specific indices but didn't exploit catastrophic cancellation. The key insight is that when the final result is near zero (dot product ≈ 0), any absolute error becomes a large relative error. By making predictions orthogonal to targets (dot≈0, norms large), small differences in accumulation order for the near-zero dot product will produce measurably different cosine similarities. Different thread-to-element mappings (EPT=4 vs EPT=3) will accumulate the canceling terms in different orders, leading to different residual values.",
+      "killable": true,
+      "kill_strategy": "Create near-orthogonal vectors where dot product approaches zero through cancellation of large terms. Place large positive products at indices processed by same thread in EPT=4 but different threads in EPT=3, and corresponding negative products similarly. The different accumulation orders will yield different near-zero residuals, which translate to significant differences in cosine similarity.",
+      "recommendations": "When testing kernels with configurable loop strides or elements-per-thread parameters, always include tests with near-orthogonal vectors (dot product ≈ 0) where catastrophic cancellation can amplify floating-point accumulation order differences into measurable result differences.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    feature_size = 4096\n    \n    predictions = torch.zeros(batch_size, feature_size, device=device, dtype=torch.float32)\n    targets = torch.zeros(batch_size, feature_size, device=device, dtype=torch.float32)\n    \n    # Large value for cancellation\n    V = float(2**22)\n    \n    # Create pattern where adjacent groups of 12 elements sum to ~0 in dot product\n    # but accumulate differently in EPT=4 (3 iterations) vs EPT=3 (4 iterations)\n    for i in range(feature_size // 12):\n        base = i * 12\n        # Elements 0-5: positive contributions\n        predictions[:, base:base+6] = V\n        targets[:, base:base+6] = 1.0\n        # Elements 6-11: negative contributions\n        predictions[:, base+6:base+12] = V\n        targets[:, base+6:base+12] = -1.0\n    \n    # Handle remaining elements (4096 % 12 = 4)\n    predictions[:, 4092:4096] = V * 0.001\n    targets[:, 4092:4096] = 1.0\n    \n    # Add asymmetric tiny perturbations at thread-boundary sensitive indices\n    # Index 3: thread 0 in EPT=4, thread 1 in EPT=3\n    predictions[:, 3] += 1e-4\n    # Index 768: thread 192 (iter0) in EPT=4, thread 0 (iter1) in EPT=3  \n    predictions[:, 768] += 1e-4\n    # Index 1024: thread 0 (iter1) in EPT=4, thread 85 (iter1) in EPT=3\n    predictions[:, 1024] += 1e-4\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7319,
+        "completion_tokens": 6992,
+        "total_tokens": 14311,
+        "reasoning_tokens": 3298
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "EPT=4 processes 1024 elements/iter (4 iters total), EPT=3 processes 768 elements/iter (6 iters). At iteration boundaries, partial sums differ. If each iteration's boundary aligns with sign changes in dot-products, intermediate partial sums accumulate differently. With values ~1e4, thread-local sums can reach ~1e8, where float32 precision (~7 decimal digits) causes different rounding during the tree reduction depending on which partial sums get combined first.",
+      "survival_reason": "Previous attempts failed because: (1) Random large values don't create systematic differences across threads - errors average out. (2) Cancellation patterns [+V,+V,-V,-V] sum to zero regardless of grouping. (3) Thread-boundary focused attempts only affected a few elements, insufficient to exceed tolerance. (4) Near-orthogonal vectors also averaged out. The key insight is that we need ITERATION-BOUNDARY aligned patterns where EPT=4 sees balanced sums per iteration but EPT=3 sees highly imbalanced sums that overflow intermediate precision differently during the tree reduction.",
+      "killable": true,
+      "kill_strategy": "Create values where the 768-element iteration boundary (EPT=3) vs 1024-element boundary (EPT=4) causes radically different intermediate sums. Alternate large positive/negative blocks at these specific boundaries so EPT=4 iterations see near-zero sums while EPT=3 iterations see large one-sided sums that accumulate differently in the reduction tree.",
+      "recommendations": "When testing loop-unrolling or elements-per-thread mutations, construct inputs specifically aligned to iteration boundaries of BOTH original and mutated versions to create maximally different intermediate accumulation patterns.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    feature_size = 4096\n    \n    predictions = torch.zeros(batch_size, feature_size, device=device, dtype=torch.float32)\n    targets = torch.ones(batch_size, feature_size, device=device, dtype=torch.float32)\n    \n    V = 1e4\n    \n    # Pattern designed for iter boundary differences:\n    # EPT=3 iter boundaries: 768, 1536, 2304, 3072, 3840\n    # EPT=4 iter boundaries: 1024, 2048, 3072\n    \n    # Block 0-767: +V (full iter0 for EPT=3, partial iter0 for EPT=4)\n    predictions[:, 0:768] = V\n    # Block 768-1023: -V (iter1 start for EPT=3, still iter0 for EPT=4)\n    predictions[:, 768:1024] = -V\n    # Block 1024-1535: +V (still iter1 for EPT=3, iter1 start for EPT=4)\n    predictions[:, 1024:1536] = V\n    # Block 1536-2047: -V\n    predictions[:, 1536:2048] = -V\n    # Block 2048-2303: +V\n    predictions[:, 2048:2304] = V\n    # Block 2304-2815: -V\n    predictions[:, 2304:2816] = -V\n    # Block 2816-3071: +V\n    predictions[:, 2816:3072] = V\n    # Block 3072-3839: -V\n    predictions[:, 3072:3840] = -V\n    # Block 3840-4095: +V\n    predictions[:, 3840:4096] = V\n    \n    # Add small perturbation for rounding sensitivity\n    torch.manual_seed(42)\n    predictions += torch.randn_like(predictions) * 1e-2\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 542.74
+}

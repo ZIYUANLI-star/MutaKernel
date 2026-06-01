@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P16__arith_replace__23",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P16",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3930,
+        "completion_tokens": 3204,
+        "total_tokens": 7134,
+        "reasoning_tokens": 1281
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "Original grid.y = (1024+31)/32 = 32 blocks. Mutated grid.y = (1024+31)*32 = 33,760 blocks. This launches 2.16M blocks instead of 2K blocks (1055x increase), causing timeout/crash.",
+      "survival_reason": "The mutation changes division to multiplication in the grid.y calculation, causing the kernel to launch 1,055 times more thread blocks than necessary. While the extra blocks would not corrupt the output (bounds checks prevent invalid writes), the massive resource consumption causes the kernel to crash or timeout before completion. This is a classic mutation that creates equivalent computation logic but catastrophically different resource usage.",
+      "killable": true,
+      "kill_strategy": "Any valid input will trigger the crash/timeout because the behavioral difference stems from grid dimension calculation, not input values. Use simple random inputs to demonstrate the kernel failure.",
+      "recommendations": "Grid dimension calculations should be covered by unit tests that verify expected block counts. Mutations that change division to multiplication in launch configurations can cause resource exhaustion without changing computational correctness, making them detectable only through performance/stability testing.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    A = torch.randn(4096, 1024, dtype=torch.float32, device=device)\n    B = torch.randn(4096, 2048, dtype=torch.float32, device=device)\n    return [A, B]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3742,
+        "completion_tokens": 3980,
+        "total_tokens": 7722,
+        "reasoning_tokens": 1723
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Original grid.y = (1024+32-1)/32 = 32 blocks. Mutant grid.y = (1024+32-1)*32 = 33760 blocks. For blocks with by >= 32, row = by*32+ty >= 1024 = M, causing guard condition 'row < M' to fail. These extra blocks load zeros into As (since A_col >= M), compute unused sums, and write nothing to C. The first 32 y-blocks in both kernels execute identically. Output C is initialized to zeros and only valid blocks (by<32) write to it.",
+      "survival_reason": "The previous random input attempt failed because the mutation does not change the computed output - it only changes the number of CUDA blocks launched. The extra 33,728 blocks (33760-32) in the mutant all have row >= 1024 = M, so the write guard 'if (row < M && col < N)' prevents them from modifying output C. The valid 32 y-blocks compute exactly the same values in both kernels since they access the same input elements and perform identical arithmetic. No value pattern can distinguish the kernels because the mutation only affects wasted computation that never reaches the output buffer.",
+      "killable": false,
+      "kill_strategy": "Unkillable by value changes. The mutation is semantically equivalent for fixed shapes M=1024, N=2048, K=4096. The guard condition 'row < M' perfectly isolates the extra blocks from affecting output. The only behavioral difference is performance (33760 vs 32 y-blocks launched), which doesn't affect correctness. Would require different shapes where the grid calculation produces functional differences or exceeds CUDA limits.",
+      "recommendations": "Mutation testing should include dimension-dependent tests where the relationship between problem size and tile size varies. This mutation would be killable with M values that cause (M+TILE_SIZE-1)*TILE_SIZE to exceed CUDA's 65535 y-grid limit (M >= 2017), causing kernel launch failure and zero output. Consider adding shape-parameterized test suites for tiled kernels.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 172.23
+}

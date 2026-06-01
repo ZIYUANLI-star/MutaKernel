@@ -1,0 +1,116 @@
+{
+  "mutant_id": "L1_P96__arith_replace__12",
+  "operator_name": "arith_replace",
+  "kernel_name": "L1_P96",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5657,
+        "completion_tokens": 4240,
+        "total_tokens": 9897,
+        "reasoning_tokens": 1282
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Original num_blocks=(524288+256-1)/256=2048, Mutant num_blocks=(524288-256-1)/256=2046. Mutant launches 2046*256=523776 threads, leaving elements 523776-524287 (512 elements) unprocessed. These uninitialized values in element_losses are still read by the reduction kernel.",
+      "survival_reason": "The 112 test rounds passed because random inputs likely had minimal loss contributions from the last 512 elements, and GPU memory happened to be zeroed. The mutation causes a real difference: the smooth_l1_loss_kernel doesn't process the final 512 elements, leaving uninitialized memory that gets summed. When losses in the last 512 elements are explicitly made large, the original correctly computes them while the mutant uses garbage/zero values.",
+      "killable": true,
+      "kill_strategy": "Set predictions and targets such that the last 512 elements (flat indices 523776-524287) have large differences (e.g., predictions=1000, targets=0), while all other elements are identical. The original computes ~0.976 mean loss from these elements; the mutant misses them entirely.",
+      "recommendations": "When testing GPU kernels with launch configuration mutations, always include tests where the edge elements (last block's worth) contain significant values distinct from the bulk of the data. Ceiling division mutations are especially dangerous as they silently drop trailing work.",
+      "suggested_code": "def generate_inputs(device):\n    # Create zero tensors - most elements will have zero loss\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    # Set the last 512 elements to have large differences\n    # These are exactly the elements the mutant fails to process\n    # (flat indices 523776 to 524287)\n    predictions.view(-1)[-512:] = 1000.0\n    targets.view(-1)[-512:] = 0.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5587,
+        "completion_tokens": 5121,
+        "total_tokens": 10708,
+        "reasoning_tokens": 2250
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutation changes num_blocks from (524288+255)/256=2048 to (524288-257)/256=2046. This leaves 512 elements (indices 523776-524287) unprocessed in element_losses. However, torch::empty() on CUDA often returns zero-initialized memory from the caching allocator. With only 512/524288≈0.098% elements affected, and uninitialized values being 0, the relative difference is ~0.1%, well below rtol=1%.",
+      "survival_reason": "The previous attempt correctly identified the 512 unprocessed elements and set them to have large differences. However, the mutant doesn't COMPUTE those elements - they remain uninitialized in element_losses. PyTorch's CUDA caching allocator frequently returns zeroed memory, so the uninitialized elements read as 0.0. With 512 elements missing out of 524288 (~0.1%), even with perfect loss isolation, the relative error is below the 1% rtol threshold. The test requires either non-zero garbage values OR a scenario where the absolute difference exceeds tolerance despite the small fraction of affected elements.",
+      "killable": true,
+      "kill_strategy": "Pre-contaminate GPU memory pool with large non-zero values before model execution, hoping element_losses reuses that memory. Allocate a tensor with large values matching the expected element_losses size, delete it, then run the test with zero-difference inputs so the original produces all zeros while the mutant reads garbage.",
+      "recommendations": "CUDA kernels using torch::empty() should be tested with memory contamination to expose reliance on uninitialized memory. Consider using torch::zeros() or explicit initialization when correctness depends on all elements being processed, or add assertions to validate grid coverage.",
+      "suggested_code": "def generate_inputs(device):\n    # Contaminate GPU memory with large positive values\n    # This memory might be reused for element_losses tensor\n    contaminant = torch.full((524288,), 1e6, device=device, dtype=torch.float32)\n    # Force synchronization and deallocation\n    del contaminant\n    torch.cuda.synchronize()\n    \n    # Second contamination attempt with different size to hit different pool buckets\n    contaminant2 = torch.full((524288,), 5e5, device=device, dtype=torch.float32)\n    del contaminant2\n    torch.cuda.synchronize()\n    \n    # Create identical tensors - zero loss for all elements\n    # Original: element_losses will be all zeros, mean = 0\n    # Mutant: first 523776 elements = 0, last 512 = garbage (hopefully contaminated large values)\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5982,
+        "completion_tokens": 5404,
+        "total_tokens": 11386,
+        "reasoning_tokens": 2514
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Mutant computes num_blocks = (524288-256-1)/256 = 2046 vs original's 2048. Missing blocks leave elements 523776-524287 uninitialized in element_losses (torch::empty). However, CUDA caching allocator may reuse memory from original's prior execution, making mutant read the correct computed values. With massive values (1e30), loss ≈ 1e30 per element → original mean ≈ 9.77e26, while mutant (if garbage ≈ 0 or stale small values) would produce near-zero mean. Difference >> tolerance.",
+      "survival_reason": "Previous attempts failed because: (1) Round 1 used large values (1000) but the CUDA memory allocator likely reused the original kernel's element_losses buffer, so the mutant inherited correct loss values for the last 512 elements. (2) Round 2's memory contamination was ineffective because CUDA's caching allocator manages memory pools independently and may not reuse the exact contaminated block. The key insight is that if memory reuse occurs between original and mutant runs in the same test session, the mutant accidentally reads correct values. Using EXTREME magnitude (1e30) ensures that even if partial garbage is present, the mean difference will be astronomical (original ≈ 9.77e26 vs mutant ≈ 0 or small garbage), far exceeding any tolerance threshold and any possible memory contamination noise.",
+      "killable": true,
+      "kill_strategy": "Use extremely large values (1e30) in the last 512 elements (flat indices 523776-524287) which the mutant fails to compute. The original produces mean loss ≈ 9.77e26 while the mutant (reading uninitialized memory with typical small/zero garbage) produces near-zero mean. This astronomical difference cannot be masked by memory reuse artifacts or tolerance thresholds.",
+      "recommendations": "When testing GPU kernels with uninitialized memory (torch::empty), test with extreme magnitude values that cannot possibly match garbage memory contents. Values like 1e30 produce losses so large that no memory artifact can mask the difference.",
+      "suggested_code": "def generate_inputs(device):\n    # Create zero tensors - most elements will have zero loss\n    predictions = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    targets = torch.zeros(128, 4096, device=device, dtype=torch.float32)\n    \n    # Put EXTREMELY large values in the last 512 elements\n    # These are exactly the elements the mutant fails to process\n    # (flat indices 523776 to 524287)\n    # Loss per element = 1e30 - 0.5 ≈ 1e30\n    # Original mean contribution = 512 * 1e30 / 524288 ≈ 9.77e26\n    predictions.view(-1)[-512:] = 1e30\n    targets.view(-1)[-512:] = 0.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6343,
+        "completion_tokens": 4521,
+        "total_tokens": 10864,
+        "reasoning_tokens": 2033
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original: num_blocks = (524288 + 256 - 1)/256 = 2048. Mutant: num_blocks = (524288 - 256 - 1)/256 = 2047. Mutant launches 1 fewer block, leaving elements 523776-524287 unwritten in element_losses (allocated with torch::empty). However, PyTorch CUDA memory allocator caches and reuses freed memory. When test framework runs original before mutant, the mutant's element_losses allocation reuses the exact same memory that original just freed, which already contains the correctly computed values.",
+      "survival_reason": "All previous attempts failed because PyTorch's CUDA memory caching causes the mutant's torch::empty allocation to reuse memory from the original kernel's element_losses tensor (which was just computed and freed). Since both allocations are identical size (524288 floats = 2MB), the same memory block is reused. The mutant's uninitialized elements (indices 523776-524287) contain exactly the values the original computed, making outputs match. Round 1-3 focused on putting distinguishing values in the last 512 elements, but those values were already correctly computed by the original and left in reused memory. Memory contamination in Round 2 failed because the original's execution overwrites any pre-contamination before the mutant runs.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable with value-level testing. The mutation causes the last 512 elements of element_losses to remain uninitialized, but PyTorch's CUDA memory allocator consistently reuses memory from the original kernel's execution. Since the test framework runs original before mutant, and both allocate identically-sized element_losses tensors, the mutant reads the original's correctly-computed values from cached memory. Killing this mutant would require: (1) running mutant before original, (2) disabling CUDA memory caching, or (3) forcing different memory allocation between runs - none achievable via input values alone.",
+      "recommendations": "To detect such memory-reuse-masked bugs: (1) Run mutant tests in a fresh CUDA context before original, (2) Disable PyTorch's CUDA memory caching (PYTORCH_NO_CUDA_MEMORY_CACHING=1), (3) Add explicit memset/zero-fill of output buffers before kernel launch, or (4) Compare intermediate tensors (element_losses) not just final outputs. The kernel should use torch::zeros instead of torch::empty for element_losses to make behavior deterministic.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 337.51
+}

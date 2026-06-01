@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P49__init_modify__6",
+  "operator_name": "init_modify",
+  "kernel_name": "L1_P49",
+  "tier": 2,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7923,
+        "completion_tokens": 4330,
+        "total_tokens": 12253,
+        "reasoning_tokens": 1433
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "For dim2 kernel with block_size=256: (256+31)/32=8 warps. Threads 8-31 in warp 0 use identity element (-FLT_MAX vs -1e10f). If all 256 values in a dim2 slice are < -1e10, original returns true max (e.g., -1e15), mutant incorrectly returns -1e10.",
+      "survival_reason": "The 'all_negative' test policy used values that were negative but still greater than -1e10 (typical random negative values are in range [-10, 0] or at most [-1e6, 0]). The mutation only manifests when ALL input values along the reduction dimension are less than -1e10f, causing the corrupted identity element (-1e10f instead of -FLT_MAX) to incorrectly become the maximum. No test pattern in the 112+ rounds generated values sufficiently negative to expose this bug.",
+      "killable": true,
+      "kill_strategy": "Fill tensor with values uniformly less than -1e10 (e.g., -1e15). Ensure model uses dim=2 for reduction. The mutant will return -1e10 as max instead of the true maximum (around -1e15), causing a difference of ~1e15 >> atol threshold.",
+      "recommendations": "Test harnesses for reduction kernels should include 'extreme_negative' policy with values below common sentinel values like -1e10, -1e20, and -FLT_MAX/2 to catch identity element mutations. The 'all_negative' policy should have a variant specifically targeting values below -1e10.",
+      "suggested_code": "def generate_inputs(device):\n    # Create tensor with all values far below -1e10\n    # True max should be around -1e14, mutant will return -1e10\n    x = torch.full((16, 256, 256), -1e15, dtype=torch.float32, device=device)\n    # Add slight variation so max is distinguishable but still << -1e10\n    x[:, :, 0] = -1e14  # This is the actual max, still much less than -1e10\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7500,
+        "completion_tokens": 4682,
+        "total_tokens": 12182,
+        "reasoning_tokens": 2216
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "The mutation is in max_reduction_dim2_kernel (line 118), but the model must be instantiated with dim=2 for this kernel to execute. With blockDim.x=256, there are 8 warps, so (blockDim.x+31)/32=8. In the cross-warp reduction, lanes 0-7 read actual warp_maxs, lanes 8-31 get the default value. For mutation to manifest: all warp_maxs[0..7] must be < -1e10. However, 112 EMD rounds and all previous tests returned bitwise identical results, strongly suggesting dim=1 is being used (mutation in dim2_kernel never reached).",
+      "survival_reason": "The mutation changes the identity element for unused lanes (8-31) in warp 0 during the final cross-warp reduction in max_reduction_dim2_kernel. With 256 threads (8 warps), only lanes 0-7 read actual warp_maxs values; lanes 8-31 receive the default (-FLT_MAX vs -1e10f). The previous test with values at -1e15 should have killed the mutant IF dim=2 were used. The fact that ALL 112+ test rounds produced bitwise identical results strongly indicates the model is instantiated with dim=1, making the mutation in dim2_kernel completely unreachable. The input specification only fixes tensor shapes, not the model's reduction dimension parameter.",
+      "killable": false,
+      "kill_strategy": "The mutation is in max_reduction_dim2_kernel but the model appears to be using dim=1 for reduction, making the mutated code path unreachable. Killing requires changing the model's dim parameter from 1 to 2, which violates the testing contract that prohibits configuration changes. No value-level input can trigger a code path that isn't called.",
+      "recommendations": "Mutation testing frameworks should verify path reachability before declaring mutants as 'survived'. For parameterized kernels (like this one with dim=1 vs dim=2), mutations should be tested against all valid configurations, or the testing contract should specify which configuration is being tested. Additionally, recording code coverage during tests would immediately reveal that max_reduction_dim2_kernel is never executed.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 3
+  },
+  "elapsed_sec": 224.46
+}

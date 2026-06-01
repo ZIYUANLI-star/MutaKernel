@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L1_P96__launch_config_mutate__0",
+  "operator_name": "launch_config_mutate",
+  "kernel_name": "L1_P96",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5584,
+        "completion_tokens": 4100,
+        "total_tokens": 9684,
+        "reasoning_tokens": 1681
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "With 524,288 elements and block_size=256, original launches 2048 blocks covering all elements. Mutant launches 2047 blocks, missing indices 524,032-524,287. These 256 uninitialized values get summed in reduction, producing incorrect mean when these positions should have non-zero losses.",
+      "survival_reason": "Layer 2 testing used random/structured distributions where losses were spread across all elements. If the last 256 elements had small expected losses similar to uninitialized garbage (often near-zero), the difference wouldn't exceed tolerance. The mutation specifically affects only the LAST 256 elements out of 524,288, making it hard to detect without targeted input focusing losses there.",
+      "killable": true,
+      "kill_strategy": "Concentrate all non-zero loss in the last 256 elements (row 127, columns 3840-4095). Set predictions=1000.0 and targets=0.0 for these positions only, with all other positions having identical predictions/targets (zero loss). This produces expected mean ≈ 0.488 vs mutant mean ≈ 0, far exceeding tolerance.",
+      "recommendations": "When testing grid launch mutations, always include stress tests that isolate specific block boundaries by concentrating meaningful computation in the exact elements that would be affected by off-by-one block count errors.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    dim = 4096\n    \n    # Initialize with identical values (zero loss everywhere)\n    predictions = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    targets = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    \n    # The mutant doesn't compute losses for indices 524032-524287\n    # These correspond to row 127, columns 3840-4095\n    # Set large differences to produce large expected losses only here\n    predictions[127, 3840:4096] = 1000.0\n    targets[127, 3840:4096] = 0.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5556,
+        "completion_tokens": 4625,
+        "total_tokens": 10181,
+        "reasoning_tokens": 1855
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Original computes 2048 blocks covering all 524,288 elements. Mutant computes 2047 blocks covering only 524,032 elements. Last 256 elements (indices 524,032-524,287 = row 127, cols 3840-4095) are uninitialized in mutant. Previous attempt used large finite values (1000.0), but uninitialized CUDA memory from torch::empty may have coincidentally contained similar values due to memory caching/reuse. Using NaN inputs forces NaN propagation in original's mean while mutant's uninitialized memory is virtually never NaN, guaranteeing detection.",
+      "survival_reason": "The previous attempt failed because it relied on uninitialized memory differing from computed loss values of 999.5. CUDA's caching allocator often reuses recently freed memory, which may have retained values close to zero or small positive numbers. When summing 524,032 zeros plus 256 uninitialized values, the result could still fall within the rtol/atol tolerance of ~0.02 around the expected 0.488 mean if garbage averaged to ~256. By using NaN inputs instead, the original kernel computes NaN losses that propagate through summation to produce NaN mean, while the mutant's uninitialized memory is extremely unlikely to contain NaN bit patterns (0x7FC00000), producing a finite result instead.",
+      "killable": true,
+      "kill_strategy": "Use NaN values in predictions for the last 256 elements (row 127, columns 3840-4095). The original correctly computes NaN losses which propagate to NaN mean. The mutant leaves those elements uninitialized with arbitrary finite garbage, producing a finite mean. NaN vs finite always fails torch.allclose.",
+      "recommendations": "For launch configuration mutations, test with special floating-point values (NaN, inf) concentrated in boundary regions that correspond to the last block's coverage. Uninitialized memory rarely contains these special bit patterns, making detection reliable regardless of memory allocator caching behavior.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros((128, 4096), dtype=torch.float32, device=device)\n    targets = torch.zeros((128, 4096), dtype=torch.float32, device=device)\n    \n    # Last 256 elements correspond to row 127, columns 3840-4095\n    # These are indices 524032-524287, which the mutant doesn't compute\n    # Using NaN ensures original produces NaN mean while mutant produces finite\n    predictions[127, 3840:4096] = float('nan')\n    targets[127, 3840:4096] = 0.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5863,
+        "completion_tokens": 5850,
+        "total_tokens": 11713,
+        "reasoning_tokens": 2583
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutant launches 2047 blocks instead of 2048, leaving indices 524032-524287 uncomputed. With total_elements=524288 and block_size=256: original num_blocks=(524288+255)/256=2048, mutant=2047. The last 256 elements (row 127, cols 3840-4095) use uninitialized memory. Round 1 used predictions=1000, producing expected mean≈0.488, but uninitialized memory likely contained residual values close to expected. Round 2 failed because NaN propagated to both ref and original. To kill: use extreme magnitude difference (predictions=1e6, targets=-1e6) producing loss≈2e6 per element, mean contribution≈976.56, far exceeding any plausible garbage sum.",
+      "survival_reason": "Round 1 failed likely because CUDA memory allocator cached/reused memory from prior operations that coincidentally contained values near the expected losses (≈999.5). The test framework may run warmup iterations or the allocator primes memory regions. Round 2 failed because NaN corrupted reference output as well. The key insight is that previous attempts used values where garbage COULD plausibly approximate expected losses. Using extreme oppositely-signed values (1e6 vs -1e6) produces losses ≈2e6 that no reasonable garbage pattern could match, and the total mean contribution of ≈976.56 vastly exceeds tolerance bounds (≈9.78).",
+      "killable": true,
+      "kill_strategy": "Use extreme oppositely-signed values for the last 256 elements: predictions[127,3840:4096]=1e6 and targets[127,3840:4096]=-1e6. This creates |diff|=2e6, loss=2e6-0.5≈2e6 per element. Expected mean contribution=256*2e6/524288≈976.56. Uninitialized garbage cannot plausibly sum to 256*2e6=512e6, so mutant mean will differ by ~976.56 >> tolerance(0.01+0.01*976.56≈9.78).",
+      "recommendations": "Kernel launch configuration mutations affecting boundary elements require testing with extreme-magnitude sentinel values that cannot plausibly match uninitialized memory patterns. Memory allocator caching can cause uninitialized regions to contain semi-predictable residual values, making moderate test values insufficient.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    dim = 4096\n    \n    # Initialize with identical values (zero loss everywhere)\n    predictions = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    targets = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    \n    # The mutant doesn't compute losses for indices 524032-524287\n    # These correspond to row 127, columns 3840-4095\n    # Use extreme opposite-sign values for maximum differentiation\n    predictions[127, 3840:4096] = 1e6\n    targets[127, 3840:4096] = -1e6\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6243,
+        "completion_tokens": 5081,
+        "total_tokens": 11324,
+        "reasoning_tokens": 2629
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With 524,288 elements and block_size=256, original launches 2048 blocks, mutant launches 2047. The last 256 elements (indices 524,032-524,287) are uninitialized in mutant. Previous attempts failed because torch::empty on CUDA often returns zeroed or previously-used memory that may coincidentally match computed values. Using +inf in predictions for last 256 elements guarantees original computes inf losses (inf - 0.5 = inf), producing inf mean, while mutant reads finite garbage, producing finite mean. inf vs finite always fails torch.allclose.",
+      "survival_reason": "Round 1 failed because uninitialized CUDA memory from torch::empty likely contained zeros or values close to expected losses (possibly from memory reuse). Round 2 failed because NaN propagates through the entire computation chain including the reference implementation, making all three outputs NaN (which torch.allclose treats as equal). Round 3 failed for the same reason as Round 1 - the CUDA memory allocator may be returning consistent values. Using +inf is fundamentally different: it produces deterministic inf values in the original that cannot be matched by any finite garbage values, and inf in the mean won't cause the reference/original to fail since smooth_l1(inf, 0) = inf is a valid computable value.",
+      "killable": true,
+      "kill_strategy": "Use +inf values in predictions for the last 256 elements (row 127, cols 3840-4095) with targets=0. The original kernel computes loss = inf - 0.5 = inf for these elements, causing mean = inf. The mutant reads uninitialized finite garbage for those elements, producing a finite mean. torch.allclose(inf, finite) always returns False.",
+      "recommendations": "When testing CUDA kernels with uninitialized memory patterns, use special floating-point values (inf) rather than large finite magnitudes, as CUDA memory allocators may return consistent finite values that coincidentally match expected computations. This ensures detectability regardless of memory state.",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    dim = 4096\n    \n    # Initialize with identical values (zero loss everywhere)\n    predictions = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    targets = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    \n    # Last 256 elements: indices 524032-524287 = row 127, cols 3840-4095\n    # Mutant doesn't compute these. Using +inf ensures original gets inf mean\n    # while mutant reads finite garbage, guaranteeing mismatch.\n    predictions[127, 3840:4096] = float('inf')\n    targets[127, 3840:4096] = 0.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6601,
+        "completion_tokens": 5681,
+        "total_tokens": 12282,
+        "reasoning_tokens": 2296
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutant launches 2047 blocks (523,776 threads) instead of 2048 (524,288 threads). Missing indices are 523,776-524,287, which maps to row 127, columns 3584-4095 (512 elements). Previous tests only targeted columns 3840-4095 (256 elements). Targeting all 512 missing elements: expected_mean = 512 * 999.5 / 524288 ≈ 0.976, mutant_mean ≈ 0. Error = 0.976 > 0.02 tolerance.",
+      "survival_reason": "Previous attempts targeted only half the missing region (columns 3840-4095 = 256 columns) while the actual missing region spans columns 3584-4095 (512 columns). With only partial coverage, the loss difference was approximately halved, and memory reuse patterns may have resulted in near-zero garbage values for the targeted subset. By targeting the COMPLETE missing region of 512 elements with large loss values, the relative error becomes approximately 0.1% of total elements but 100% of the summed loss, creating an absolute difference of ~0.976 which exceeds the tolerance threshold of ~0.02.",
+      "killable": true,
+      "kill_strategy": "Concentrate ALL loss in the complete missing region: row 127, columns 3584-4095 (512 elements). Set predictions=1000, targets=0 for these positions only. Original computes loss≈0.976 mean, mutant reads uninitialized zeros producing mean≈0.",
+      "recommendations": "When analyzing CUDA kernel launch mutations, always precisely calculate the exact indices affected by computing (mutated_blocks × block_size) and compare against total_elements. Off-by-one errors in block count can affect more elements than initially apparent (512 vs 256 in this case).",
+      "suggested_code": "def generate_inputs(device):\n    batch_size = 128\n    dim = 4096\n    \n    # Initialize with identical values (zero loss everywhere)\n    predictions = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    targets = torch.zeros((batch_size, dim), dtype=torch.float32, device=device)\n    \n    # The mutant skips indices 523776-524287 (512 elements)\n    # These correspond to row 127, columns 3584-4095\n    # Target the COMPLETE missing region (not just 3840-4095)\n    predictions[127, 3584:4096] = 1000.0\n    targets[127, 3584:4096] = 0.0\n    \n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 433.63
+}

@@ -1,0 +1,116 @@
+{
+  "mutant_id": "L2_P41__const_perturb__1",
+  "operator_name": "const_perturb",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8438,
+        "completion_tokens": 6151,
+        "total_tokens": 14589,
+        "reasoning_tokens": 2591
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "sqrt_2_over_pi changed from 0.7979 to 0.8059 (1.01x). For GELU input x≈1: inner changes by ~1%, causing tanh output difference ~0.005, leading to GELU difference ~0.25%. Since GELU is nonlinear, relative differences vary across values and survive GroupNorm. Layer 2 confirmed divergence with seed 10000.",
+      "survival_reason": "The mutation changes a fundamental constant in the GELU approximation formula by 1%. While the absolute difference is small for individual elements (~0.25%), the nonlinear nature of GELU means different input values experience different relative changes. GroupNorm preserves these relative differences within groups. The accumulated effect through the network produces detectable differences in the final output, as confirmed by Layer 2 differential testing.",
+      "killable": true,
+      "kill_strategy": "Use random inputs that produce GELU inputs in the sensitive range (-2 to 2) where the tanh function is not saturated. The seed 10000 already showed divergence in Layer 2 testing.",
+      "recommendations": "When implementing mathematical approximations (like GELU), test with multiple precision levels for key constants. A 1% perturbation in sqrt(2/π) should be easily detectable - if differential testing passes, it suggests insufficient numerical coverage in the test suite.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(10000)\n    x = torch.randn(128, 512, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8227,
+        "completion_tokens": 4929,
+        "total_tokens": 13156,
+        "reasoning_tokens": 2116
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes sqrt(2/π) from 0.7978845608028654 to 0.805863406411 (~1% increase). For GELU input x≈1, the inner term changes by ~1%, causing tanh difference of ~0.5%, giving GELU difference ~0.2%. However, after GroupNorm (normalizes within groups) and mean across channels, the systematic bias partially cancels. For tolerance atol=1e-2,rtol=1e-2, need |diff|>0.01+0.01*|ref|≈0.02, but observed diff≈0.002.",
+      "survival_reason": "The previous random input attempt failed because: (1) Random values produce varied GELU inputs, some in saturated regions where tanh≈±1 (low sensitivity), (2) GroupNorm subtracts group mean and divides by std, normalizing away uniform shifts, (3) The mean operation further averages residual differences. To kill the mutant, we need inputs that produce GELU inputs consistently in the sensitive region (|x|≈0.5-1.5) where tanh derivative is high, and where the non-uniform nature of the GELU error (varying with x) isn't normalized away. Using constant input values creates highly correlated GEMM outputs across channels, which after BN produce similar GELU inputs. This creates systematic error that may survive GroupNorm better.",
+      "killable": true,
+      "kill_strategy": "Use constant-valued input tensor (all elements equal) to create correlated channel values after GEMM. This produces GELU inputs in similar ranges, creating consistent bias that may not be fully normalized away by GroupNorm. Try multiple constant values to find the sweet spot.",
+      "recommendations": "For mutation testing kernels with multiple normalization stages, test with both random and structured inputs (constant, linearly varying, alternating patterns) to ensure numerical differences propagate through normalization layers rather than being averaged away.",
+      "suggested_code": "def generate_inputs(device):\n    # Use constant input value to create correlated outputs\n    # Value 0.7 chosen to produce moderate GELU inputs after GEMM+BN\n    x = torch.full((128, 512), 0.7, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8414,
+        "completion_tokens": 4969,
+        "total_tokens": 13383,
+        "reasoning_tokens": 2160
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation changes sqrt_2_over_pi from 0.7978845608 to 0.8058634 (~1% increase). For GELU input x=1, this creates difference of ~0.002 in output. After GroupNorm (which centers each group), Mean (averages 256 channels), the difference propagates to ~0.002 at output. Tolerance threshold is 0.01 + 0.01*|ref|. For typical output magnitudes (0.1-1.0), threshold is 0.011-0.02, exceeding the propagated difference.",
+      "survival_reason": "Round 1 failed because random inputs produce GELU inputs across all sensitivity ranges, and GroupNorm's centering operation removes consistent shifts. Round 2's constant input (0.7) creates highly correlated GEMM outputs that after GroupNorm become nearly identical, completely masking the ~0.2% GELU difference. The key insight is that the 1% GELU constant change produces only ~0.2% output difference, and GroupNorm's per-group mean subtraction eliminates any consistent bias. To kill, we need inputs creating GELU values with dramatically different sensitivities across channels within same group, so GroupNorm cannot fully normalize away the varying errors.",
+      "killable": true,
+      "kill_strategy": "Use high-variance inputs with extreme positive and negative values. This creates GEMM outputs spanning from saturated (|x|>3) to sensitive (|x|~1) regions across channels within the same group. The GELU mutation error varies by channel (0% in saturated, 0.3% in sensitive), creating non-uniform shifts that GroupNorm's mean subtraction cannot fully eliminate. The variance of errors across channels may propagate through to final output.",
+      "recommendations": "For GELU approximation mutations, test with inputs that create GELU arguments spanning multiple sensitivity regions (-2 to 2 for sensitive, |x|>3 for saturated) within the same normalization group. The non-uniform error pattern is key to surviving downstream normalization operations.",
+      "suggested_code": "def generate_inputs(device):\n    # Create structured high-variance input\n    # Alternating extreme positive/negative values\n    x = torch.zeros(128, 512, dtype=torch.float32, device=device)\n    # Create a pattern that produces varying GEMM outputs\n    for i in range(512):\n        if i % 4 == 0:\n            x[:, i] = 5.0  # Large positive\n        elif i % 4 == 1:\n            x[:, i] = -5.0  # Large negative  \n        elif i % 4 == 2:\n            x[:, i] = 0.5  # Small positive\n        else:\n            x[:, i] = -0.5  # Small negative\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8751,
+        "completion_tokens": 4581,
+        "total_tokens": 13332,
+        "reasoning_tokens": 2032
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The GELU mutation (sqrt_2_over_pi: 0.7978... → 0.8058..., +1%) causes ~0.3% maximum relative error at x≈1. After GroupNorm (mean-subtraction normalizes constant biases) and Mean-across-channels (averages remaining variance), the final error is <<1%. With tolerance atol=1e-2, rtol=1e-2 (~2% at moderate values), the diluted error cannot exceed threshold.",
+      "survival_reason": "Round 1 (random) failed because the ~0.3% GELU error gets normalized by GroupNorm's mean subtraction (removes constant shift) and diluted by channel averaging. Round 2 (constant 0.7) failed because all channels receive identical GELU inputs, creating uniform error that GroupNorm completely removes via mean subtraction. Round 3 (extreme ±5 values) failed because GELU saturates for |x|>3 where tanh→±1, making the coefficient change irrelevant. The fundamental issue is the pipeline structure: GroupNorm+Mean reduce any GELU error signal below detection threshold. A new strategy uses sparse inputs to create GEMM outputs dominated by bias terms (near-zero), keeping more outputs in the GELU sensitive region while creating group-level variance that might partially survive normalization.",
+      "killable": false,
+      "kill_strategy": "The mutant appears unkillable within given tolerances. The GELU mutation causes ~0.3% error, but GroupNorm (subtracts mean, divides by std) and Mean (averages channels) operations mathematically guarantee the propagated error is below the 2% tolerance threshold. The only way to kill would be with tighter tolerances (atol=1e-4, rtol=1e-4) or bypassing the normalization layers.",
+      "recommendations": "For mutation testing of fused kernels with normalization layers, consider testing intermediate outputs (before normalization) separately, or use much tighter tolerances (1e-4 or less) to catch small coefficient changes that get diluted by downstream averaging operations.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 504.55
+}

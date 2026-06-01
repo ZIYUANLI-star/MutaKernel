@@ -1,0 +1,143 @@
+{
+  "mutant_id": "L1_P44__relop_replace__0",
+  "operator_name": "relop_replace",
+  "kernel_name": "L1_P44",
+  "phase1_status": "candidate_equivalent",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5925,
+        "completion_tokens": 5612,
+        "total_tokens": 11537,
+        "reasoning_tokens": 2611
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "With input_length=128, typical pooling gives output_length≈125. threads_per_block=256 means output_pos∈[0,255]. Thread with output_pos=125=output_length executes in mutant but not original. It writes to index output_length which corrupts output[b,c+1,0].",
+      "survival_reason": "The EMD testing likely saw races resolve in favor of the correct value, or the specific model parameters used happened to avoid triggering the corruption consistently. The OOB write from channel c corrupts channel c+1's first element, but this is a race between thread blocks. With random values, the difference might be small, or the correct thread might win the race.",
+      "killable": true,
+      "kill_strategy": "Create input where channel 0's last elements (near position output_length-1) are very large (e.g., 10000), and channel 1's first elements are very different (e.g., -10000). This maximizes the observable difference when the OOB write corrupts output[b,1,0].",
+      "recommendations": "Always test boundary conditions where thread index equals dimension bounds. Race conditions between thread blocks make such bugs non-deterministic - use extreme value patterns to maximize detection probability.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 32, 128, device=device, dtype=torch.float32)\n    # Set channel 0's last elements to large positive values\n    x[:, 0, 120:128] = 10000.0\n    # Set channel 1's first elements to large negative values\n    x[:, 1, 0:8] = -10000.0\n    # Similarly for other adjacent channel pairs to increase chance of detection\n    for c in range(0, 31, 2):\n        x[:, c, 120:128] = 10000.0\n        x[:, c+1, 0:8] = -10000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5869,
+        "completion_tokens": 5630,
+        "total_tokens": 11499,
+        "reasoning_tokens": 2288
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With input_length=128, kernel_size=4, stride=1, padding=0: output_length=125. Thread 125 (OOB) reads input[b,c,125:128] and writes to output[b,c+1,0]. If input[:,:,125:128]=1.0 and rest=0, OOB writes ~0.75-1.0 while correct value is 0.0. |0.75 - 0| = 0.75 > atol(0.01).",
+      "survival_reason": "Previous attempt used ±10000 values which created large reference values, making the rtol component (1e-2 * 10000 = 100) dominate the tolerance. With sparse inputs where correct output is exactly 0.0, the absolute tolerance (1e-2) is the only threshold, and any non-zero corrupted value >0.01 will be detected. This tests the OOB write path with values that produce a clearer difference.",
+      "killable": true,
+      "kill_strategy": "Use sparse input where only positions 125-127 of each channel are non-zero (set to 1.0), making correct output at position 0 equal to 0.0 while the OOB corruption writes a non-zero average (~0.75-1.0), exceeding the 0.01 absolute tolerance.",
+      "recommendations": "When testing boundary conditions in GPU kernels, prefer sparse inputs that create clear zero/non-zero distinctions rather than large magnitude values, as large values increase relative tolerance thresholds and can mask small absolute corruptions.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 32, 128, device=device, dtype=torch.float32)\n    # Set only the last 3 valid positions to 1.0\n    # These are the positions read by the OOB thread (output_pos=125 reads input[125:128])\n    x[:, :, 125:128] = 1.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6096,
+        "completion_tokens": 5655,
+        "total_tokens": 11751,
+        "reasoning_tokens": 2246
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "OOB thread at output_pos=output_length writes to next channel's position 0. For output_length=125, thread 125 computes avg of input[0,0,125:128]. Race with legitimate thread writing to same location. Race resolution determines observability.",
+      "survival_reason": "Previous attempts used large finite values (±10000) or sparse patterns (1.0), but these don't guarantee distinguishability when the race resolves in favor of the legitimate write. The mutation causes an OOB write, but if the legitimate thread consistently writes last (common GPU block scheduling), the corruption is masked. Using Inf/NaN creates a categorical difference: Inf vs finite is always distinguishable regardless of tolerance, potentially triggering different behavior if race resolution varies.",
+      "killable": true,
+      "kill_strategy": "Use Inf values in channel 1's first positions (read by legitimate thread for output[*,1,0]) and finite values in channel 0's last positions (read by OOB thread). If OOB write wins, output will be finite instead of Inf.",
+      "recommendations": "When testing GPU kernels with potential race conditions, use special floating-point values (Inf, NaN, denormals) that create categorical differences rather than relying on magnitude differences that could be masked by tolerance thresholds.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 32, 128, device=device, dtype=torch.float32)\n    # Legitimate computation for output[*,1,0] should produce Inf\n    x[:, 1, 0:4] = float('inf')\n    # OOB computation from channel 0 uses positions 125:128\n    # Set to large finite values that average to non-Inf\n    x[:, 0, 125:128] = 1e30\n    # Do the same for all adjacent channel pairs to maximize detection chance\n    for c in range(0, 31):\n        x[:, c+1, 0:4] = float('inf')  # Legitimate writes produce Inf\n        x[:, c, 125:128] = 1e30  # OOB writes produce finite\n    # Also handle batch boundary: channel 31's OOB goes to next batch's channel 0\n    x[:, 0, 0:4] = float('inf')  # Catch corruption from previous batch's channel 31\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6486,
+        "completion_tokens": 5666,
+        "total_tokens": 12152,
+        "reasoning_tokens": 2327
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "OOB thread for channel c, output_pos=125 writes to output[c+1,0]. With NaN at input[:,:,125:128], OOB writes NaN. Legitimate thread writes finite value (1.0) from input[:,:,0:4]. Race determines final value. If OOB wins even once among 496 positions, NaN≠1.0 fails allclose.",
+      "survival_reason": "Previous attempts used finite values where OOB and legitimate threads both produced finite results. Race timing consistently favored the legitimate thread, masking the mutation. Inf approach corrupted the reference. NaN sentinel approach ensures that IF OOB wins the race, the output is NaN which cannot equal any finite value (1.0), guaranteeing detection. This is fundamentally different because NaN propagation creates an unambiguous signal regardless of exact race timing.",
+      "killable": true,
+      "kill_strategy": "Use NaN at input positions 125:128 (read by OOB threads) and finite values at positions 0:4 (read by legitimate threads). If the OOB thread's write wins the race in even one location, output contains NaN instead of finite value, failing allclose.",
+      "recommendations": "Test GPU kernels with NaN/Inf sentinels at boundaries where race conditions could occur between legitimate and out-of-bounds thread writes, as these create unambiguous detection signals.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 32, 128, device=device, dtype=torch.float32)\n    # Positions 125:128 read by OOB thread - set to NaN\n    x[:, :, 125:128] = float('nan')\n    # Positions 0:4 read by legitimate thread for output position 0\n    x[:, :, 0:4] = 1.0\n    # Fill remaining positions with finite values to avoid other NaN propagation\n    x[:, :, 4:125] = 0.5\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": false,
+        "original_ok": false,
+        "mutant_ok": false,
+        "diff_summary": "",
+        "error": "ref NaN/Inf and original also invalid on LLM input"
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6768,
+        "completion_tokens": 4165,
+        "total_tokens": 10933,
+        "reasoning_tokens": 1827
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With input_length=128, kernel_size=4, stride=1, padding=0: output_length=125. The OOB thread at output_pos=125 writes to output_idx=(batch_idx*32+channel_idx)*125+125, which equals (batch_idx*32+channel_idx+1)*125+0 - the exact same index where the legitimate thread for (batch_idx, channel_idx+1, output_pos=0) writes. Due to deterministic CUDA block scheduling, the legitimate thread consistently writes AFTER the OOB thread, overwriting the corrupted value.",
+      "survival_reason": "All previous attempts failed because they focused on making the OOB write produce a different value than the legitimate write, but the fundamental problem is write ordering, not value difference. The CUDA scheduler consistently executes block (channel_idx+1) after block (channel_idx), so the OOB write from channel c to position [b,c+1,0] is always overwritten by the legitimate write from channel c+1. The 112 rounds of bitwise equivalence confirm this deterministic ordering. Round 1-2 tried extreme/sparse values, Round 3-4 tried special values (Inf/NaN) - none addressed the root cause that the corrupted write is immediately overwritten regardless of values. The mutation infects the output momentarily but the infection doesn't propagate because CUDA scheduling ensures deterministic overwrite order.",
+      "killable": false,
+      "kill_strategy": "This mutation appears unkillable through value changes. The OOB thread (output_pos=125) writes to the same memory location as the legitimate thread for (channel+1, output_pos=0). CUDA's block scheduling is deterministic enough that across 112 random seeds, the legitimate write consistently occurred after the OOB write, overwriting it. The mutation would only be detectable if: (1) we could change CUDA scheduling order (requires config/hardware change), or (2) there was a position where OOB writes don't collide with legitimate writes (not possible with this kernel structure). For channel 31 in each batch, the OOB write goes to the first position of channel 0 in the next batch (or out-of-bounds for the last batch), still overwritten by legitimate writes.",
+      "recommendations": "When testing CUDA kernels for boundary condition bugs involving write races, consider that GPU block scheduling may be highly deterministic within a given hardware/driver configuration. To improve mutation testing coverage, either: (1) instrument the kernel to detect OOB accesses separately from output comparison, (2) use memory sanitizers (compute-sanitizer), or (3) add explicit memory barriers to guarantee race conditions are observable.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 1006.84
+}

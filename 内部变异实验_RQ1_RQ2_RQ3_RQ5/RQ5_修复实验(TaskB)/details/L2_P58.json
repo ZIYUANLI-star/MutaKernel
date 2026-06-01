@@ -1,0 +1,275 @@
+{
+  "kernel_name": "L2_P58",
+  "level": "L2",
+  "problem_id": "58",
+  "executed": true,
+  "trigger": "task_b_regenerate_opus45",
+  "max_rounds": 3,
+  "n_failing_inputs": 15,
+  "round0_stats": {
+    "n_total": 15,
+    "n_confirmed_buggy": 5,
+    "n_ref_failed": 0,
+    "n_unexpected_pass": 10
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3876,
+        "completion_tokens": 7227,
+        "total_tokens": 11103,
+        "reasoning_tokens": 2524
+      },
+      "reasoning_chars": 10097,
+      "llm_elapsed_sec": 69.04,
+      "v_stress_elapsed_sec": 83.23,
+      "v_kb_elapsed_sec": 14.36,
+      "new_kernel_code": "import torch\nimport torch.nn as nn\nfrom torch.utils.cpp_extension import load_inline\n\nfused_ops_source = \"\"\"\n#include <torch/extension.h>\n#include <cuda_runtime.h>\n#include <math.h>\n#include <float.h>\n\n__global__ void fused_ops_kernel(\n    const float* __restrict__ input, \n    const float* __restrict__ bias, \n    float* __restrict__ output,\n    int batch_size,\n    int channels,\n    int spatial_size\n) {\n    int idx = blockIdx.x * blockDim.x + threadIdx.x;\n    int total_elements = batch_size * spatial_size;\n    if (idx >= total_elements) return;\n    \n    int batch_idx = idx / spatial_size;\n    int spatial_idx = idx % spatial_size;\n    \n    int base_input_idx = batch_idx * channels * spatial_size + spatial_idx;\n    \n    // Step 1: LogSumExp with numerical stability - find max\n    float max_val = -FLT_MAX;\n    for (int c = 0; c < channels; c++) {\n        float val = input[base_input_idx + c * spatial_size];\n        if (val > max_val) {\n            max_val = val;\n        }\n    }\n    \n    // Step 2: Sum of exponentials\n    float sum_exp = 0.0f;\n    for (int c = 0; c < channels; c++) {\n        float val = input[base_input_idx + c * spatial_size];\n        float diff = val - max_val;\n        // Clamp to avoid underflow in exp\n        if (diff > -88.0f) {\n            sum_exp += expf(diff);\n        }\n    }\n    \n    // Step 3: Complete LogSumExp\n    float logsumexp_result;\n    if (sum_exp > 0.0f) {\n        logsumexp_result = logf(sum_exp) + max_val;\n    } else {\n        logsumexp_result = max_val;\n    }\n    \n    // Handle potential inf/nan\n    if (isnan(logsumexp_result)) {\n        logsumexp_result = max_val;\n    }\n    \n    // Step 4: HardSwish: x * sigmoid(x + 3) / 6\n    float x_plus_3 = logsumexp_result + 3.0f;\n    float sigmoid_val;\n    if (x_plus_3 > 20.0f) {\n        sigmoid_val = 1.0f;\n    } else if (x_plus_3 < -20.0f) {\n        sigmoid_val = 0.0f;\n    } else {\n        sigmoid_val = 1.0f / (1.0f + expf(-x_plus_3));\n    }\n    float hardswish_result = logsumexp_result * sigmoid_val / 6.0f;\n    \n    // Handle nan in hardswish result\n    if (isnan(hardswish_result)) {\n        hardswish_result = 0.0f;\n    }\n    \n    // Step 5, 6, 7: Subtract each bias, clamp to [-1, 1], and find max\n    float max_final = -FLT_MAX;\n    for (int c = 0; c < channels; c++) {\n        float biased = hardswish_result - bias[c];\n        float clamped = fminf(fmaxf(biased, -1.0f), 1.0f);\n        if (clamped > max_final) {\n            max_final = clamped;\n        }\n    }\n    \n    output[idx] = max_final;\n}\n\ntorch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias) {\n    TORCH_CHECK(input.is_cuda(), \"Input must be a CUDA tensor\");\n    TORCH_CHECK(bias.is_cuda(), \"Bias must be a CUDA tensor\");\n    TORCH_CHECK(input.dim() == 5, \"Input must be 5D\");\n    TORCH_CHECK(input.is_contiguous(), \"Input must be contiguous\");\n    \n    auto sizes = input.sizes();\n    int batch_size = sizes[0];\n    int channels = sizes[1];\n    int depth = sizes[2];\n    int height = sizes[3];\n    int width = sizes[4];\n    int spatial_size = depth * height * width;\n    \n    auto output = torch::empty({batch_size, 1, depth, height, width}, \n                               input.options());\n    \n    int total_elements = batch_size * spatial_size;\n    int block_size = 256;\n    int grid_size = (total_elements + block_size - 1) / block_size;\n    \n    fused_ops_kernel<<<grid_size, block_size>>>(\n        input.data_ptr<float>(),\n        bias.data_ptr<float>(),\n        output.data_ptr<float>(),\n        batch_size,\n        channels,\n        spatial_size\n    );\n    \n    return output;\n}\n\"\"\"\n\nfused_ops_cpp_source = \"torch::Tensor fused_ops_cuda(torch::Tensor input, torch::Tensor bias);\"\n\nfused_ops = load_inline(\n    name=\"fused_ops_fixed\",\n    cpp_sources=fused_ops_cpp_source,\n    cuda_sources=fused_ops_source,\n    functions=[\"fused_ops_cuda\"],\n    verbose=False,\n    extra_cflags=[\"-O3\"],\n    extra_ldflags=[\"\"],\n)\n\nclass ModelNew(nn.Module):\n    \"\"\"\n    Optimized model with fused CUDA kernel for operations after conv transpose.\n    Operations: LogSumExp -> HardSwish -> bias subtraction -> clamp -> max\n    \"\"\"\n    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, bias_shape):\n        super(ModelNew, self).__init__()\n        self.conv_transpose = nn.ConvTranspose3d(in_channels, out_channels, kernel_size, stride=stride, padding=padding)\n        self.bias = nn.Parameter(torch.randn(bias_shape))\n        self.fused_ops = fused_ops\n\n    def forward(self, x):\n        x = self.conv_transpose(x)\n        x = x.contiguous()\n        bias_flat = self.bias.view(-1).contiguous()\n        x = self.fused_ops.fused_ops_cuda(x, bias_flat)\n        return x",
+      "extraction_ok": true,
+      "v_stress": {
+        "n_total": 15,
+        "n_pass": 15,
+        "n_fail": 0,
+        "n_ref_failed_skipped": 0,
+        "all_pass": true,
+        "per_input": [
+          {
+            "policy": "mixed_extremes",
+            "seed": 42,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 38688.14039230347,
+            "status": "pass"
+          },
+          {
+            "policy": "mixed_extremes",
+            "seed": 44,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1376.4188289642334,
+            "status": "pass"
+          },
+          {
+            "policy": "near_overflow",
+            "seed": 50,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1050.7636070251465,
+            "status": "pass"
+          },
+          {
+            "policy": "alternating_sign",
+            "seed": 57,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 902.3585319519043,
+            "status": "pass"
+          },
+          {
+            "policy": "mixed_extremes",
+            "seed": 46,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1495.8298206329346,
+            "status": "pass"
+          },
+          {
+            "policy": "dense_nonzero",
+            "seed": 49,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 913.3400917053223,
+            "status": "pass"
+          },
+          {
+            "policy": "denormals",
+            "seed": 57,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 898.667573928833,
+            "status": "pass"
+          },
+          {
+            "policy": "mixed_extremes",
+            "seed": 57,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1063.1558895111084,
+            "status": "pass"
+          },
+          {
+            "policy": "all_negative",
+            "seed": 42,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1160.660743713379,
+            "status": "pass"
+          },
+          {
+            "policy": "sparse_extreme",
+            "seed": 42,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1055.2318096160889,
+            "status": "pass"
+          },
+          {
+            "policy": "all_positive",
+            "seed": 49,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 958.066463470459,
+            "status": "pass"
+          },
+          {
+            "policy": "uniform_constant",
+            "seed": 57,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1006.5600872039795,
+            "status": "pass"
+          },
+          {
+            "policy": "tail_heavy",
+            "seed": 65,
+            "mode": "eval_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 1046.0469722747803,
+            "status": "pass"
+          },
+          {
+            "policy": "large_magnitude",
+            "seed": 342,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 966.9113159179688,
+            "status": "pass"
+          },
+          {
+            "policy": "all_negative",
+            "seed": 342,
+            "mode": "train_value",
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": "",
+            "time_ms": 891.8027877807617,
+            "status": "pass"
+          }
+        ],
+        "still_failing": []
+      },
+      "v_kb": {
+        "n_total": 5,
+        "n_pass": 5,
+        "all_pass": true,
+        "per_seed": [
+          {
+            "seed": 42,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 1337,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 7,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 100,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          },
+          {
+            "seed": 2024,
+            "passed": true,
+            "ref_ok": true,
+            "new_ok": true,
+            "diff_summary": "",
+            "error": ""
+          }
+        ],
+        "regressed_seeds": []
+      },
+      "round_pass": true
+    }
+  ],
+  "final_status": "fixed_at_round_1",
+  "final_round": 1,
+  "elapsed_sec": 205.51
+}

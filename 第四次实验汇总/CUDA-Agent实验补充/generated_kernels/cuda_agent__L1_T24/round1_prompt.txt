@@ -1,0 +1,163 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Performs a standard 1D convolution operation.
+
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super(Model, self).__init__()
+        self.conv1d = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the 1D convolution.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, length).
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, length_out).
+        """
+        return self.conv1d(x)
+
+# Test code
+batch_size = 32
+in_channels = 64
+out_channels = 128
+kernel_size = 3
+length = 131072
+
+def get_inputs():
+    x = torch.rand(batch_size, in_channels, length)
+    return [x]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size]  # Provide in_channels, out_channels, kernel_size for initialization
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Optimized 1D convolution using PyTorch's 2D convolution with TF32 and torch.compile.
+    
+    Args:
+        in_channels (int): Number of channels in the input tensor.
+        out_channels (int): Number of channels produced by the convolution.
+        kernel_size (int): Size of the convolution kernel.
+        stride (int, optional): Stride of the convolution. Defaults to 1.
+        padding (int, optional): Padding applied to the input. Defaults to 0.
+        dilation (int, optional): Spacing between kernel elements. Defaults to 1.
+        groups (int, optional): Number of blocked connections from input channels to output channels. Defaults to 1.
+        bias (bool, optional): If `True`, adds a learnable bias to the output. Defaults to `False`.\n
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int, stride: int = 1, padding: int = 0, dilation: int = 1, groups: int = 1, bias: bool = False):
+        super().__init__()
+        # Create the same conv1d as in the original model
+        self.conv1d = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
+        
+    @torch.compile(backend='inductor', options={'max_autotune': True})
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Performs the optimized 1D convolution using PyTorch's 2D convolution with TF32.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_channels, length).
+        
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_channels, length_out).
+        """
+        # Enable TF32 for this compiled function
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+        # Use PyTorch's ATen to call the native 2D convolution
+        x_4d = x.unsqueeze(2)  # (N, C, 1, L)
+        weight_4d = self.conv1d.weight.unsqueeze(2)  # (O, I, 1, K)
+        
+        output_4d = torch.ops.aten.conv2d(
+            x_4d,
+            weight_4d,
+            self.conv1d.bias,
+            stride=(1, self.conv1d.stride[0]),
+            padding=(0, self.conv1d.padding[0]),
+            dilation=(1, self.conv1d.dilation[0]),
+            groups=self.conv1d.groups
+        )
+        
+        # Convert back to 3D
+        output = output_4d.squeeze(2)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        return output
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 54
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (27 failures)
+  - [large_magnitude seed=50000] max_diff=3.241943e+00, mean_diff=4.107090e-01, ref_range=[-3.3365e+03,3.5224e+03], orig_range=[-3.3343e+03,3.5197e+03]
+  - [large_magnitude seed=50001] max_diff=3.329834e+00, mean_diff=4.109927e-01, ref_range=[-3.4789e+03,3.8739e+03], orig_range=[-3.4765e+03,3.8711e+03]
+  - [near_overflow seed=50002] max_diff=3.269389e+27, mean_diff=4.073191e+26, ref_range=[-3.3972e+30,3.7073e+30], orig_range=[-3.3950e+30,3.7052e+30]
+  - [near_overflow seed=50003] max_diff=3.242339e+27, mean_diff=4.048237e+26, ref_range=[-3.5061e+30,3.7653e+30], orig_range=[-3.5038e+30,3.7629e+30]
+  - [all_negative seed=50008] max_diff=3.121948e-01, mean_diff=4.146674e-02, ref_range=[-3.3475e+02,3.0475e+02], orig_range=[-3.3449e+02,3.0460e+02]
+  - [all_negative seed=50009] max_diff=3.171387e-01, mean_diff=3.869233e-02, ref_range=[-2.7173e+02,3.0549e+02], orig_range=[-2.7155e+02,3.0520e+02]
+  - [all_positive seed=50010] max_diff=2.751465e-01, mean_diff=3.991975e-02, ref_range=[-2.9312e+02,2.9239e+02], orig_range=[-2.9295e+02,2.9219e+02]
+  - [all_positive seed=50011] max_diff=3.215485e-01, mean_diff=4.079699e-02, ref_range=[-2.8608e+02,3.1021e+02], orig_range=[-2.8590e+02,3.1005e+02]
+  ... and 19 more failures
+
+### training_stress (27 failures)
+  - [large_magnitude seed=70000] max_diff=3.312988e+00, mean_diff=4.094872e-01, ref_range=[-3.5370e+03,3.3810e+03], orig_range=[-3.5348e+03,3.3780e+03]
+  - [large_magnitude seed=70001] max_diff=3.312744e+00, mean_diff=4.098206e-01, ref_range=[-3.4345e+03,3.5833e+03], orig_range=[-3.4322e+03,3.5811e+03]
+  - [near_overflow seed=70002] max_diff=3.479440e+27, mean_diff=4.083659e+26, ref_range=[-3.4489e+30,3.5312e+30], orig_range=[-3.4462e+30,3.5284e+30]
+  - [near_overflow seed=70003] max_diff=3.176301e+27, mean_diff=4.060023e+26, ref_range=[-3.6923e+30,3.7869e+30], orig_range=[-3.6892e+30,3.7839e+30]
+  - [all_negative seed=70008] max_diff=3.533630e-01, mean_diff=4.095455e-02, ref_range=[-3.1619e+02,2.8777e+02], orig_range=[-3.1593e+02,2.8754e+02]
+  - [all_negative seed=70009] max_diff=3.101196e-01, mean_diff=3.970608e-02, ref_range=[-2.9872e+02,3.1546e+02], orig_range=[-2.9856e+02,3.1521e+02]
+  - [all_positive seed=70010] max_diff=3.323669e-01, mean_diff=4.256691e-02, ref_range=[-3.1192e+02,2.7903e+02], orig_range=[-3.1170e+02,2.7883e+02]
+  - [all_positive seed=70011] max_diff=2.760315e-01, mean_diff=3.945479e-02, ref_range=[-3.1527e+02,3.0315e+02], orig_range=[-3.1503e+02,3.0289e+02]
+  ... and 19 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

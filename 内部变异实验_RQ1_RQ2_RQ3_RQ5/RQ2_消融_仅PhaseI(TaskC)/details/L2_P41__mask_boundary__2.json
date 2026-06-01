@@ -1,0 +1,143 @@
+{
+  "mutant_id": "L2_P41__mask_boundary__2",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8436,
+        "completion_tokens": 2176,
+        "total_tokens": 10612,
+        "reasoning_tokens": 941
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "M=128 (batch size), row ranges from 0 to 127 across thread blocks (grid.y=4, each block covers 32 rows). Original condition `row < M` (row < 128) includes row=127. Mutated condition `row < M - 1` (row < 127) EXCLUDES row=127. The last row of the intermediate output tensor is never written by the mutant.",
+      "survival_reason": "The mutation changes the boundary condition from `row < M` to `row < M - 1` at line 73. With M=128 (the fixed batch size), this means row=127 is processed by the original kernel but skipped by the mutant. Since the output tensor is allocated with `torch::empty()`, row 127 contains uninitialized values. These garbage values are then read by the second kernel (`fused_group_norm_mean_relu_kernel`) for batch element 127, causing the final output[127] to contain incorrect/garbage values instead of the properly computed result.",
+      "killable": true,
+      "kill_strategy": "Any input tensor with shape [128, 512] will expose the bug because the mutant always fails to write row 127 of the intermediate GEMM+BN+GELU output. This causes batch element 127's final output to be computed from uninitialized memory. Using non-zero inputs ensures the correct output differs substantially from the garbage produced by the mutant.",
+      "recommendations": "Boundary mutations on loop guards that process the last element are particularly dangerous. Test with exact boundary batch sizes (M where M is exactly aligned or M-1 would exclude the last element) and verify that all output rows contain valid computed values, not just that the kernel runs without errors.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(42)\n    x = torch.randn(128, 512, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8265,
+        "completion_tokens": 4739,
+        "total_tokens": 13004,
+        "reasoning_tokens": 2530
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation skips row M-1=127 in GEMM output, leaving uninitialized values. However, the GroupNorm+Mean operation normalizes each group to mean≈0 and std≈1, then computes mean across channels which equals ~0. With default weight_gn=1, bias_gn=0, both reference and mutant outputs converge to ~0 after ReLU. To expose the bug, we need inputs that either: (1) cause uninitialized memory to contain NaN/Inf, or (2) exploit numerical differences between properly computed vs garbage values at extreme magnitudes.",
+      "survival_reason": "The previous random input attempt failed because GroupNorm mathematically forces each group's mean to 0, so the mean across all channels is always ~0 regardless of input. With ReLU(~0)=0 for both reference (proper row 127) and mutant (garbage row 127 that also normalizes to ~0), outputs matched within tolerance. The fix requires extreme input magnitudes that amplify numerical precision differences between proper GELU outputs versus uninitialized memory, or values that might trigger special floating-point behavior (inf/nan) in the uninitialized region's GroupNorm computation.",
+      "killable": true,
+      "kill_strategy": "Use extremely large positive input values (e.g., 1e4 to 1e6) specifically for row 127 to ensure the reference GEMM+BN+GELU produces very large positive values that, while GroupNorm-centered, maintain numerical precision artifacts. Meanwhile, uninitialized memory (likely zeros or random small values) will produce fundamentally different GroupNorm statistics and potentially underflow/overflow behaviors. The key is creating maximum divergence between correct extreme-value computation vs garbage-value computation.",
+      "recommendations": "When testing kernels with boundary mutations, focus on inputs that specifically affect the boundary rows/columns with extreme values, as normalization operations can mask differences when using typical random inputs. Also consider that uninitialized memory behavior varies by system and may need targeted extreme-value testing.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(12345)\n    x = torch.full((128, 512), 0.01, dtype=torch.float32, device=device)\n    # Make row 127 have extreme large values to maximize difference with garbage\n    x[127, :] = torch.full((512,), 1e4, dtype=torch.float32, device=device)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8531,
+        "completion_tokens": 4230,
+        "total_tokens": 12761,
+        "reasoning_tokens": 1835
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "GroupNorm normalizes to zero mean, causing both correct computation and garbage to produce ~0 output. However, if input causes GEMM overflow→NaN, reference produces NaN while uninitialized zeros produce 0. NaN != 0 per allclose.",
+      "survival_reason": "Previous attempts used values that, despite being different at the GEMM output stage, got normalized by GroupNorm to the same zero mean. The GroupNorm's per-group normalization with weight=1, bias=0 effectively maps any finite input distribution to zero mean, making both correctly computed and uninitialized values produce ReLU(0)=0. Using extreme values that cause arithmetic overflow produces NaN which cannot be normalized away.",
+      "killable": true,
+      "kill_strategy": "Use extremely large input values (1e30) specifically for row 127 to cause GEMM output overflow to Inf, which becomes NaN through BatchNorm division, propagating through GELU and GroupNorm. Uninitialized memory (zeros) produces finite output 0.",
+      "recommendations": "When testing kernels with boundary mutations, include test cases that produce NaN/Inf values in the affected rows, as normalization layers can mask value differences but cannot hide NaN propagation.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(999)\n    x = torch.randn(128, 512, dtype=torch.float32, device=device)\n    # Row 127 uses extreme values to cause overflow in GEMM computation\n    x[127, :] = 1e30\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8725,
+        "completion_tokens": 6081,
+        "total_tokens": 14806,
+        "reasoning_tokens": 3129
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "GroupNorm with affine=(1,0) normalizes any finite distribution to mean=0 across channels. ReLU(0)=0, so finite garbage and finite correct values both produce ~0. However, NaN propagates through all operations: NaN input → NaN GEMM → NaN BN → NaN GELU → NaN GroupNorm → NaN mean → NaN output. Mutant's uninitialized row produces finite 0. |NaN - 0| fails allclose since NaN != any finite value.",
+      "survival_reason": "Previous attempts used finite values (randn, extreme large, 1e30) which either produced finite outputs that were too similar after GroupNorm+Mean+ReLU normalization to 0, or the extreme values still resulted in finite computations. The architecture's GroupNorm with (weight=1, bias=0) guarantees channel-mean≈0 for ANY finite input distribution, and ReLU clips this to exactly 0. The garbage memory is also likely finite (zeros from allocator), producing the same 0. NaN injection breaks this equivalence because NaN propagates through all operations while garbage produces finite output.",
+      "killable": true,
+      "kill_strategy": "Inject NaN values specifically into row 127 of the input tensor. This causes reference to compute NaN through the entire pipeline for batch 127, while the mutant's uninitialized memory (finite garbage) produces a finite result. NaN vs finite fails allclose.",
+      "recommendations": "When testing GPU kernels with boundary mutations, always include NaN/Inf injection tests at boundary positions. These special floating-point values propagate differently than finite values and can expose write-skipping bugs that finite-value tests miss due to normalization layers collapsing differences.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.randn(128, 512, dtype=torch.float32, device=device)\n    x[127, :] = float('nan')\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8887,
+        "completion_tokens": 4262,
+        "total_tokens": 13149,
+        "reasoning_tokens": 1954
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation causes row 127 of intermediate GEMM+BN+GELU output to be uninitialized (likely zeros). However, the second kernel applies GroupNorm with bias_gn=0, which normalizes each group to mean=0. The mean across all channels is therefore ~0 regardless of input values. ReLU(0)=0 for both reference (correctly computed row 127 → GroupNorm → mean≈0 → 0) and mutant (garbage row 127 → GroupNorm → mean≈0 → 0). With atol=rtol=1e-2, any numerical precision difference is within tolerance.",
+      "survival_reason": "All previous attempts failed because they focused on making row 127's intermediate values different (large, NaN, extreme), but this infection cannot propagate to a detectable output difference. The model architecture applies GroupNorm with default bias_gn=0 after the GELU output, which centers each group's mean to exactly 0. When we compute the mean across all channels (sum of per-group means), we get 0 regardless of the actual intermediate tensor values. ReLU(0)=0 produces identical outputs for both reference and mutant within the 1% tolerance. The EMD detected bitwise divergence, but the difference magnitude is too small to exceed atol + rtol*|ref| = 0.01 + 0.01*0 = 0.01 when ref≈0.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable through input value manipulation alone. The GroupNorm→mean→ReLU pipeline with bias_gn=0 forces output to ~0 regardless of intermediate tensor values. Killing requires modifying model parameters (e.g., setting bias_gn to non-zero values), which is outside the testing contract.",
+      "recommendations": "When testing boundary mutations in fused kernels, ensure the output pipeline doesn't collapse infected values to a fixed point. Consider testing with non-default normalization parameters (non-zero bias) or adding test configurations that bypass value-collapsing operations like GroupNorm+mean+ReLU with zero bias.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 950.04
+}

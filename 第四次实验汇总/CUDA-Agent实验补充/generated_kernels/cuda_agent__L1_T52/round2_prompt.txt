@@ -1,0 +1,192 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a masked cumulative sum, only summing elements that satisfy a condition.
+
+    Parameters:
+        dim (int): The dimension along which to perform the masked cumulative sum.
+    """
+
+    def __init__(self, dim):
+        super(Model, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        """
+        return torch.cumsum(x * mask, dim=self.dim)
+
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    x = torch.rand(batch_size, *input_shape)
+    mask = torch.randint(0, 2, x.shape).bool()  # Random boolean mask
+    return [x, mask]
+
+def get_init_inputs():
+    return [dim]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs masked cumulative sum using PyTorch operations.
+    """
+
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        """
+        # Disable TF32 for better numerical precision
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # For better numerical stability, especially with float16/bfloat16,
+            # perform the computation in float32 and cast back
+            input_dtype = x.dtype
+            
+            if input_dtype in (torch.float16, torch.bfloat16):
+                # Upcast to float32 for accumulation
+                x_float = x.float()
+                mask_float = mask.float()
+                masked = x_float * mask_float
+                result = torch.cumsum(masked, dim=self.dim)
+                return result.to(input_dtype)
+            else:
+                # For float32 and float64, use standard computation
+                # Ensure mask is properly cast to the same dtype as x
+                masked = x * mask.to(x.dtype)
+                return torch.cumsum(masked, dim=self.dim)
+        finally:
+            # Restore TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+```
+
+## Test Failures (Round 2 input)
+Total discrepancies: 4
+Failing dimensions: dtype_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### dtype_stress (4 failures)
+  - [? seed=60000] 
+  - [? seed=60001] 
+  - [? seed=60000] 
+  - [? seed=60001] 
+
+## Previous Repair Attempt (Round 1)
+After round 1, still 4 discrepancies in: dtype_stress
+```python
+import torch
+import torch.nn as nn
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs masked cumulative sum using PyTorch operations.
+    """
+
+    def __init__(self, dim):
+        super(ModelNew, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, mask):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, *input_shape).
+            mask (torch.Tensor): Boolean mask of the same shape as x.
+
+        Returns:
+            torch.Tensor: Cumulative sum of elements where mask is True.
+        """
+        # Disable TF32 for better numerical precision
+        old_matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+        old_cudnn_tf32 = torch.backends.cudnn.allow_tf32
+        
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        
+        try:
+            # For better numerical stability, especially with float16/bfloat16,
+            # perform the computation in float32 and cast back
+            input_dtype = x.dtype
+            
+            if input_dtype in (torch.float16, torch.bfloat16):
+                # Upcast to float32 for accumulation
+                x_float = x.float()
+                mask_float = mask.float()
+                masked = x_float * mask_float
+                result = torch.cumsum(masked, dim=self.dim)
+                return result.to(input_dtype)
+            else:
+                # For float32 and float64, use standard computation
+                # Ensure mask is properly cast to the same dtype as x
+                masked = x * mask.to(x.dtype)
+                return torch.cumsum(masked, dim=self.dim)
+        finally:
+            # Restore TF32 settings
+            torch.backends.cuda.matmul.allow_tf32 = old_matmul_tf32
+            torch.backends.cudnn.allow_tf32 = old_cudnn_tf32
+```
+
+### What still failed after Round 1
+
+### dtype_stress (4 failures)
+  - [? seed=60000] 
+  - [? seed=60001] 
+  - [? seed=60000] 
+  - [? seed=60001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

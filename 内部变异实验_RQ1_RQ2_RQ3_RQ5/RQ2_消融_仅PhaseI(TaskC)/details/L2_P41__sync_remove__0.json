@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P41__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8427,
+        "completion_tokens": 2898,
+        "total_tokens": 11325,
+        "reasoning_tokens": 933
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "The removed __syncthreads() guards the transition from tile-loading phase to computation phase. Thread (ty,tx) reads tile_a[ty][k] written by thread (ty,k) and tile_b[k][tx] written by thread (k,tx). Without sync, reads may occur before writes complete. With 1024 threads and K=512 requiring 16 tile iterations, race conditions are virtually guaranteed.",
+      "survival_reason": "This mutant cannot survive proper testing. The removed synchronization barrier is essential for correctness in tiled matrix multiplication. Every thread in a 32x32 block cooperatively loads shared memory tiles, and without synchronization before the computation phase, threads will read values before other threads have written them. This creates non-deterministic incorrect results. The differential testing at Layer 2 already found divergence at seed 10000, confirming the race manifests.",
+      "killable": true,
+      "kill_strategy": "Use large-magnitude varied input values to maximize the numerical impact of race-condition-induced incorrect reads. The race condition is inherent and should trigger on virtually any non-trivial input, but large values amplify the observable difference.",
+      "recommendations": "Synchronization barriers in tiled GPU algorithms are critical for correctness. Mutation testing should flag any __syncthreads() removal in cooperative loading patterns as high-priority killable mutations. Test with varied seeds and large magnitudes to ensure race conditions manifest visibly.",
+      "suggested_code": "def generate_inputs(device):\n    torch.manual_seed(12345)\n    # Large varied values maximize divergence from incorrect shared memory reads\n    x = torch.randn(128, 512, device=device, dtype=torch.float32) * 100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8243,
+        "completion_tokens": 4511,
+        "total_tokens": 12754,
+        "reasoning_tokens": 1900
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "Race occurs when slow threads in tile t read shared memory while fast threads write tile t+1 data. With adjacent tiles having values +10000 vs -10000, any misread causes error ≈ 20000*|weight|. With Kaiming init, |weight| ~ 0.06, so per-element error ~ 1200. Even small fraction of affected elements exceeds atol=0.01 + rtol=0.01*|ref| threshold.",
+      "survival_reason": "Previous random inputs had similar statistical distributions across tiles (mean≈0, std≈100 for all tiles). When race occurred, incorrectly read values were within similar range as correct values, producing small errors that normalized away. The new alternating +/-10000 pattern ensures adjacent tiles have maximally different values (20000 gap), so ANY race-induced cross-tile read produces catastrophic numerical divergence that cannot be normalized away.",
+      "killable": true,
+      "kill_strategy": "Use tile-boundary-contrasting values: alternate large positive (+10000) and large negative (-10000) values at each 32-column tile boundary to maximize the impact of any race condition from the missing __syncthreads().",
+      "recommendations": "When testing tiled GEMM kernels with removed synchronization barriers, use structured inputs with dramatically different values at tile boundaries (every TILE_SIZE columns) rather than random inputs, as random distributions may mask race conditions due to statistical similarity.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    # K=512, TILE_SIZE=32 gives 16 tiles\n    # Alternate tiles between extreme positive and negative values\n    for tile_idx in range(16):\n        start_col = tile_idx * 32\n        end_col = start_col + 32\n        # Alternating sign ensures race reads cause maximum error\n        value = 10000.0 if tile_idx % 2 == 0 else -10000.0\n        x[:, start_col:end_col] = value\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8503,
+        "completion_tokens": 3939,
+        "total_tokens": 12442,
+        "reasoning_tokens": 1658
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The race occurs when thread (ty,tx) reads tile_a[ty][k] for k!=tx before other threads write. With intra-tile values varying by ~32000 (from -16*1000 to +15*1000), reading wrong position gives error ~32000 per element. Summed over tiles, this exceeds tolerance even after normalization.",
+      "survival_reason": "Previous attempts used tile-boundary patterns that didn't maximize the impact of intra-tile race conditions. Round 1 used random values which average out. Round 2 alternated across tiles but not within them. The actual race reads wrong positions within shared memory arrays during a single tile iteration. By making values vary drastically based on threadIdx position (which maps to column position mod 32), any incorrect read produces maximum divergence in the accumulated dot products.",
+      "killable": true,
+      "kill_strategy": "Create input where column values depend strongly on (col % 32), giving each threadIdx.x position a unique extreme value. This maximizes error when race conditions cause threads to read shared memory positions written by other threads.",
+      "recommendations": "When testing tiled matrix multiplication kernels with shared memory, design inputs that maximize variance at different threadIdx positions within a tile, as race conditions affect intra-tile synchronization between threads loading different elements.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    for col in range(512):\n        tx = col % 32  # threadIdx.x equivalent\n        # Value varies drastically within each tile based on position\n        x[:, col] = (tx - 15.5) * 2000.0  # Range: -31000 to +31000\n    # Add row-dependent variation to prevent cancellation\n    for row in range(128):\n        ty = row % 32\n        x[row, :] *= (1.0 + 0.1 * (ty - 15.5))\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8766,
+        "completion_tokens": 6025,
+        "total_tokens": 14791,
+        "reasoning_tokens": 2688
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With sparse inputs concentrated in tile 0, any race condition reading 0 instead of 10000 at specific positions causes GEMM output difference of O(10000*weight). With K=32 active elements and typical weight magnitude ~0.06, the difference per output element is ~600. After BatchNorm normalization and GroupNorm averaging, differences should still exceed atol=0.01.",
+      "survival_reason": "Previous attempts used dense patterns where all tiles had similar statistical properties. The averaging in GroupNorm + Mean masked small per-element differences. The sparse diagonal pattern ensures that race-induced errors (reading 0 instead of 10000) cannot be averaged away, as only specific positions contribute to the output. Additionally, the diagonal structure ensures different threads handle different sparse elements, maximizing inter-warp race exposure.",
+      "killable": true,
+      "kill_strategy": "Use sparse diagonal input pattern where only positions matching (row, col) = (i, i%512) have non-zero values. This makes GEMM highly sensitive to any single element being misread due to the race condition.",
+      "recommendations": "When testing GPU synchronization mutations, use sparse input patterns that make computation sensitive to individual element values rather than dense patterns where averaging can mask race-induced errors.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    # Only first tile (columns 0-31) has values, one per row diagonal\n    # This creates maximum sensitivity to race conditions\n    for row in range(128):\n        col = row % 32  # Only first tile\n        x[row, col] = 50000.0 * (1.0 if row % 2 == 0 else -1.0)\n    # Add a second sparse pattern in a non-adjacent tile to stress tile transitions\n    for row in range(128):\n        col = 256 + (row % 32)  # Tile 8\n        x[row, col] = -50000.0 * (1.0 if row % 2 == 0 else -1.0)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9076,
+        "completion_tokens": 4382,
+        "total_tokens": 13458,
+        "reasoning_tokens": 2020
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Race causes reading tile_b[k][tx] from previous iteration. With carefully constructed cancellation patterns, correct sum ≈ 0 but stale-read sum ≈ ±large. After BatchNorm (running_var=1), this directly passes through. GELU at x≈0 vs x=large gives outputs 0 vs ≈x, difference exceeds atol + rtol*|ref| threshold.",
+      "survival_reason": "Previous attempts used uniform or symmetric patterns where even if races occurred, the resulting errors were either (1) within tolerance due to mean-averaging across 256+ channels, or (2) not triggered because warp scheduling happened to complete writes before reads. The key insight is that races between different warps accessing tile_b[k][tx] can cause reading the PREVIOUS tile's values. By creating anti-correlated patterns between consecutive tiles where correct computation produces near-zero but wrong-tile computation produces extreme values, we maximize the observable difference.",
+      "killable": true,
+      "kill_strategy": "Create input where each tile's dot-product contributions should sum to near-zero through cancellation, but reading the PREVIOUS tile's values would give large non-zero results. Use alternating sign patterns within tiles that anti-correlate with adjacent tiles.",
+      "recommendations": "When testing synchronization-related mutations, consider that race conditions are probabilistic and may require repeated runs with different random seeds, or inputs that create deterministic worst-case scenarios by exploiting the specific memory access patterns and warp scheduling of the kernel.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    A = 5000.0\n    for tile_idx in range(16):\n        start_col = tile_idx * 32\n        for j in range(32):\n            col = start_col + j\n            if tile_idx % 2 == 0:\n                # Even tiles: alternating pattern\n                x[:, col] = A if j % 2 == 0 else -A\n            else:\n                # Odd tiles: all same sign but row-dependent\n                for row in range(128):\n                    row_sign = 1.0 if (row // 32) % 2 == 0 else -1.0\n                    x[row, col] = A * row_sign * (1.0 + 0.01 * j)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 963.71
+}

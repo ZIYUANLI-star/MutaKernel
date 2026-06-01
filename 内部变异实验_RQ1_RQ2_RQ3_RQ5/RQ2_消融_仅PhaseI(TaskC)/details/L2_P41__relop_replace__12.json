@@ -1,0 +1,150 @@
+{
+  "mutant_id": "L2_P41__relop_replace__12",
+  "operator_name": "relop_replace",
+  "kernel_name": "L2_P41",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8424,
+        "completion_tokens": 3703,
+        "total_tokens": 12127,
+        "reasoning_tokens": 1376
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Mutation changes loop bound from `< num_groups` to `<= num_groups`. Thread num_groups executes extra iteration, computing start_idx = (batch+1)*channels (out-of-bounds read). Writes to group_means[num_groups] which aliases group_vars[0] in shared memory. Corrupted group_vars[0] affects inv_std calculation for all group-0 channels.",
+      "survival_reason": "The mutant survived initial testing likely because the corruption effect was masked by ReLU clamping negative values and the tolerance of 1e-2. However, the corruption is real: the out-of-bounds read gets garbage/next-batch data, and writing to group_means[num_groups] overwrites group_vars[0] due to shared memory layout. This corrupts the inverse standard deviation calculation for group 0, propagating errors through the normalization path.",
+      "killable": true,
+      "kill_strategy": "Use large-magnitude inputs that produce diverse values across batches. The out-of-bounds read will get dramatically different data, and the corrupted variance for group 0 will cause large deviations in the normalized output. For the last batch, reading beyond array bounds produces garbage that will corrupt group_vars[0] significantly.",
+      "recommendations": "Loop bounds involving shared memory allocation sizes should be tested with explicit boundary checks. Consider adding runtime assertions that validate loop indices never exceed shared memory dimensions, especially in kernels with complex shared memory aliasing patterns like `group_vars = &shared_mem[num_groups]`.",
+      "suggested_code": "def generate_inputs(device):\n    # Create input where batches have very different patterns\n    # This maximizes divergence when wrong batch data is read\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    for i in range(128):\n        # Alternate between large positive and large negative values\n        sign = 1.0 if i % 2 == 0 else -1.0\n        x[i, :] = sign * (10.0 + i * 0.5)\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8325,
+        "completion_tokens": 4898,
+        "total_tokens": 13223,
+        "reasoning_tokens": 2002
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "When group==num_groups, writes group_means[num_groups] which aliases group_vars[0]. If batch i has uniform values (var=0, inv_std≈316) and batch i+1 has mean=1e4, mutant uses inv_std≈0.01. Normalized values differ by 31600x, far exceeding rtol+atol threshold.",
+      "survival_reason": "Previous attempt used uniform scaling which still allowed the GEMM+BatchNorm outputs to have similar magnitudes across batches. After BatchNorm normalization, the batch-to-batch differences were attenuated. The new approach uses extreme alternating constants (0.001 vs 100) combined with random structure to ensure the phantom group reads values with dramatically different means than the actual group variance, creating maximum divergence in the inv_std computation.",
+      "killable": true,
+      "kill_strategy": "Create inputs where even batches have near-zero input magnitudes and odd batches have very large magnitudes. After GEMM, this produces GroupNorm inputs where adjacent batches have dramatically different means. The corrupted group_vars[0] (phantom mean from next batch) will differ enormously from the actual near-zero variance.",
+      "recommendations": "Loop bounds involving shared memory indices should have assertions or static analysis to verify they cannot exceed allocated sizes. The off-by-one bug (< vs <=) is particularly dangerous as it corrupts unrelated data structures in shared memory.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    # Even batches: tiny constant values → after GEMM, small uniform outputs (var≈0)\n    # Odd batches: large constant values → after GEMM, large mean (corrupts group_vars[0])\n    for i in range(128):\n        if i % 2 == 0:\n            # Small constant - creates near-zero variance in GEMM output\n            x[i, :] = 0.001\n        else:\n            # Large constant - creates large mean that corrupts group_vars[0]\n            x[i, :] = 100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8623,
+        "completion_tokens": 5851,
+        "total_tokens": 14474,
+        "reasoning_tokens": 2616
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Zero input → GELU ≈ 0 → var(group0) ≈ 0. Large input → GELU ≈ large → mean(group0) ~ O(100). Original inv_std = rsqrtf(0 + 1e-5) ≈ 316. Mutant inv_std = rsqrtf(100 + 1e-5) ≈ 0.1. Difference in normalization factor > 1000x propagates through mean calculation.",
+      "survival_reason": "Previous attempts used non-zero constant inputs for all batches. After GEMM with random weights, both even and odd batches had similar variance distributions in their outputs. The GELU activation didn't create the extreme variance-vs-mean mismatch needed. By using exact zeros for even batches, GELU outputs are exactly 0 (variance=0), while large positive inputs produce large GELU outputs (large mean), creating the necessary mismatch for the corruption to be detectable.",
+      "killable": true,
+      "kill_strategy": "Use zero inputs for even batches (producing GELU output ≈ 0, variance ≈ 0) and large positive inputs for odd batches (producing large GELU output, large mean). The corrupted group_vars[0] will contain a large mean instead of near-zero variance, causing inv_std to differ by orders of magnitude.",
+      "recommendations": "Test GroupNorm kernels with inputs where consecutive batches have dramatically different statistical properties (one near-zero variance, one large mean) to expose off-by-one errors in group iteration bounds.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    # Odd batches get large positive values\n    # Even batches stay zero\n    x[1::2, :] = 1000.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 8826,
+        "completion_tokens": 4692,
+        "total_tokens": 13518,
+        "reasoning_tokens": 2180
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "The mutation causes `group_means[num_groups]` to alias `group_vars[0]`, corrupting it with the phantom group's mean. However, after averaging over all channels and passing through ReLU (which clamps negatives), the corruption gets diluted. With constant inputs per batch, the GELU outputs have similar statistics across batches after the random GEMM transformation, making phantom_mean ≈ actual_variance within tolerance.",
+      "survival_reason": "Previous attempts used constant inputs per batch. After random GEMM weights transform these inputs, adjacent batches get similar statistical properties. The phantom group reads next batch's group-0 region, computing its mean. When this overwrites group_vars[0], the corrupted inv_std differs from correct inv_std, but the difference is diluted across channels (128 features) and survives only if positive after ReLU. The key is that constant inputs produce GELU outputs where cross-batch statistics are similar. To kill this mutant, I need inputs where the GELU output for group 0 has dramatically different mean vs variance properties between consecutive batches.",
+      "killable": true,
+      "kill_strategy": "Use inputs with bimodal distribution within each batch - half elements at +large, half at -large. This creates high variance (due to spread) but near-zero mean. When the phantom group computes the mean of the next batch's bimodal data, it writes ~0 to group_vars[0]. But the actual variance should be large (~value²). This makes inv_std differ by orders of magnitude: rsqrt(~0 + eps) vs rsqrt(large_variance + eps).",
+      "recommendations": "When testing kernels with shared memory aliasing bugs, use inputs that create maximally different statistics (mean vs variance) to expose corruption in statistical computations. Bimodal distributions are particularly effective because mean≈0 while variance is large.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(128, 512, device=device, dtype=torch.float32)\n    for i in range(128):\n        # Bimodal: half positive, half negative\n        # Creates high variance but mean near zero\n        val = 10.0 * (1 + i / 128.0)  # Vary magnitude by batch\n        x[i, :256] = val\n        x[i, 256:] = -val\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9109,
+        "completion_tokens": 5301,
+        "total_tokens": 14410,
+        "reasoning_tokens": 2337
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With high within-batch variance V≈10000 but mean≈0, original inv_std=rsqrt(10000)≈0.01, mutant inv_std=rsqrt(0+eps)≈316. For elements with (val-mean)≈100, normalized values differ by factor of 31600, far exceeding atol+rtol*|ref|.",
+      "survival_reason": "Previous attempts used constant values per batch, creating zero within-batch variance. When group_vars[0] was corrupted, the normalization (val-mean)*inv_std still produced ~0 because (val-mean)≈0 for constant inputs. The infection couldn't propagate through the multiplication by zero. Using random inputs with high variance within each batch creates non-zero (val-mean) terms that amplify the inv_std corruption.",
+      "killable": true,
+      "kill_strategy": "Use random inputs with mean≈0 and high variance. This creates intermediate values with high within-group variance but near-zero batch means. The corrupted group_vars[0] (containing next batch's mean≈0) vs actual variance≈large will cause inv_std to differ by orders of magnitude.",
+      "recommendations": "Test loop boundary conditions with inputs that have high within-element variance, not just different means across batches. Boundary mutations often corrupt statistics that only matter when the data has actual spread.",
+      "suggested_code": "def generate_inputs(device):\n    # Random inputs with mean=0, high variance\n    # This creates intermediate outputs with high within-group variance\n    # but near-zero mean per batch, maximizing the impact of\n    # group_vars[0] corruption (mean vs variance)\n    torch.manual_seed(42)\n    x = torch.randn(128, 512, device=device, dtype=torch.float32) * 50.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 493.69
+}

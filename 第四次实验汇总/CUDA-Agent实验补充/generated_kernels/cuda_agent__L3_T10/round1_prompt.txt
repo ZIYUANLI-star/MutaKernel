@@ -1,0 +1,188 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+# From https://github.com/karpathy/minGPT/blob/master/mingpt/model.py
+
+class NewGELU(nn.Module):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
+    Reference: Gaussian Error Linear Units (GELU) paper: https://arxiv.org/abs/1606.08415
+    """
+    def __init__(self):
+        super(NewGELU, self).__init__()
+    
+    def forward(self, x):
+        return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
+
+class Model(nn.Module):
+    """
+    A multi-head masked self-attention layer with a projection at the end that uses ReLU instead of Softmax.
+    It is possible to use torch.nn.MultiheadAttention here but I am including an
+    explicit implementation here to show that there is nothing too scary here.
+    """
+
+    def __init__(self, n_embd, n_head, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    def forward(self, x):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att = F.relu(att)
+
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        return y
+
+batch_size = 16
+max_seqlen = 1024
+n_embd = 768  # Hidden dimension, typical for BERT-base size
+n_head = 12   # Number of attention heads, typical for BERT-base size
+
+def get_inputs():
+    return [torch.rand(batch_size, max_seqlen, n_embd)]
+
+def get_init_inputs():
+    return [n_embd, n_head, max_seqlen]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+import math
+
+
+# Enable TensorFloat32 for better performance on supported GPUs
+torch.set_float32_matmul_precision('high')
+
+
+class ModelNew(nn.Module):
+    """
+    Optimized version of the masked self-attention layer using TensorFloat32.
+    """
+
+    def __init__(self, n_embd, n_head, max_seqlen):
+        super().__init__()
+        assert n_embd % n_head == 0
+        # key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
+        # output projection
+        self.c_proj = nn.Linear(n_embd, n_embd)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(max_seqlen, max_seqlen, dtype=torch.bool))
+                                     .view(1, 1, max_seqlen, max_seqlen))
+        self.n_head = n_head
+        self.n_embd = n_embd
+
+    @torch.compile(backend='inductor')
+    def forward(self, x):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        head_dim = C // self.n_head
+
+        # Step 1: Calculate q, k, v using linear projection
+        qkv = torch.addmm(self.c_attn.bias, x.reshape(B*T, C), self.c_attn.weight.t())
+        qkv = qkv.reshape(B, T, 3*C)
+        
+        # Step 2: Split into q, k, v
+        q, k, v = qkv.chunk(3, dim=-1)
+        
+        # Step 3: Reshape and transpose for multi-head attention
+        q = q.reshape(B, T, self.n_head, head_dim).permute(0, 2, 1, 3)  # (B, nh, T, hs)
+        k = k.reshape(B, T, self.n_head, head_dim).permute(0, 2, 1, 3)  # (B, nh, T, hs)
+        v = v.reshape(B, T, self.n_head, head_dim).permute(0, 2, 1, 3)  # (B, nh, T, hs)
+
+        # Step 4: Compute attention scores using TF32
+        att = q @ k.transpose(-1, -2)
+        att *= 1.0 / math.sqrt(head_dim)
+
+        # Step 5: Apply causal mask and relu
+        att.masked_fill_(~self.bias[:, :, :T, :T], float('-inf'))
+        att = att.clamp_min(0.0)
+
+        # Step 6: Compute output using TF32
+        y = att @ v
+
+        # Step 7: Re-assemble all head outputs
+        y = y.permute(0, 2, 1, 3).reshape(B, T, C)
+
+        return y
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 69
+Failing dimensions: value_stress, dtype_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (34 failures)
+  - [large_magnitude seed=50000] max_diff=1.755149e+07, mean_diff=1.677964e+06, ref_range=[-2.9745e+10,2.6734e+10], orig_range=[-2.9746e+10,2.6742e+10]
+  - [large_magnitude seed=50001] max_diff=1.920614e+07, mean_diff=1.681541e+06, ref_range=[-2.9748e+10,3.1051e+10], orig_range=[-2.9747e+10,3.1051e+10]
+  - [all_negative seed=50008] max_diff=4.136960e+05, mean_diff=1.104498e+04, ref_range=[-9.8139e+08,9.1538e+08], orig_range=[-9.8146e+08,9.1550e+08]
+  - [all_negative seed=50009] max_diff=5.619200e+05, mean_diff=9.595968e+03, ref_range=[-1.1278e+09,8.6047e+08], orig_range=[-1.1278e+09,8.6039e+08]
+  - [all_positive seed=50010] max_diff=6.946560e+05, mean_diff=1.286244e+04, ref_range=[-1.3499e+09,1.0208e+09], orig_range=[-1.3503e+09,1.0207e+09]
+  - [all_positive seed=50011] max_diff=6.461120e+05, mean_diff=1.228200e+04, ref_range=[-1.1022e+09,1.0173e+09], orig_range=[-1.1026e+09,1.0176e+09]
+  - [mixed_extremes seed=50012] max_diff=6.787564e+09, mean_diff=5.941069e+08, ref_range=[-1.0106e+13,9.9208e+12], orig_range=[-1.0106e+13,9.9217e+12]
+  - [mixed_extremes seed=50013] max_diff=6.563824e+09, mean_diff=5.958169e+08, ref_range=[-9.9081e+12,1.0955e+13], orig_range=[-9.9054e+12,1.0956e+13]
+  ... and 26 more failures
+
+### dtype_stress (2 failures)
+  - [? seed=60000] 
+  - [? seed=60001] 
+
+### training_stress (33 failures)
+  - [large_magnitude seed=70000] max_diff=1.835827e+07, mean_diff=1.681045e+06, ref_range=[-3.2482e+10,3.2352e+10], orig_range=[-3.2481e+10,3.2352e+10]
+  - [large_magnitude seed=70001] max_diff=1.725235e+07, mean_diff=1.683138e+06, ref_range=[-2.8237e+10,3.0308e+10], orig_range=[-2.8231e+10,3.0303e+10]
+  - [all_negative seed=70008] max_diff=4.766720e+05, mean_diff=9.223579e+03, ref_range=[-9.5073e+08,9.8668e+08], orig_range=[-9.5084e+08,9.8695e+08]
+  - [all_negative seed=70009] max_diff=4.484480e+05, mean_diff=1.123909e+04, ref_range=[-9.3332e+08,9.1950e+08], orig_range=[-9.3311e+08,9.1947e+08]
+  - [all_positive seed=70010] max_diff=5.496960e+05, mean_diff=8.834093e+03, ref_range=[-1.0376e+09,8.9303e+08], orig_range=[-1.0377e+09,8.9329e+08]
+  - [all_positive seed=70011] max_diff=5.385920e+05, mean_diff=1.194619e+04, ref_range=[-1.1350e+09,1.0575e+09], orig_range=[-1.1350e+09,1.0574e+09]
+  - [mixed_extremes seed=70012] max_diff=6.260261e+09, mean_diff=5.942518e+08, ref_range=[-1.0784e+13,1.0559e+13], orig_range=[-1.0785e+13,1.0557e+13]
+  - [mixed_extremes seed=70013] max_diff=6.130303e+09, mean_diff=5.943990e+08, ref_range=[-1.0263e+13,1.0618e+13], orig_range=[-1.0263e+13,1.0616e+13]
+  ... and 25 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

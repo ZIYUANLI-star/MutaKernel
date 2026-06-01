@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P100__sync_remove__0",
+  "operator_name": "sync_remove",
+  "kernel_name": "L1_P100",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4348,
+        "completion_tokens": 3490,
+        "total_tokens": 7838,
+        "reasoning_tokens": 1400
+      },
+      "reason_category": "unknown",
+      "proof_sketch": "With 128 elements and block_size=256, we get 1 block. Threads 0-127 compute thread_loss from data; threads 128-255 write 0.0f. Without __syncthreads() before reduction, first iteration (stride=128) has threads 0-127 reading shared_mem[128-255] potentially before threads 128-255 write. Cross-warp reads have no implicit sync guarantee.",
+      "survival_reason": "The race condition is non-deterministic. Threads within a warp (32 threads) execute in lockstep, but cross-warp ordering is undefined. With only 128 data elements and 256 threads, the writes to shared_mem[128-255] (all 0.0f) may typically complete before the reduction reads them due to scheduling patterns. The 112 test rounds passed because the race didn't manifest in those particular executions. The uninitialized shared memory's garbage values might coincidentally be zero or cancel out.",
+      "killable": true,
+      "kill_strategy": "Use values that make all 128 thread_loss values identical and non-zero (e.g., 1.0), so the expected mean is exactly 1.0. Any garbage read from uninitialized shared_mem[128:255] during the first reduction step would add to the sum, causing a detectable deviation. Run multiple times as the race is non-deterministic.",
+      "recommendations": "Synchronization removal mutations for shared memory operations should be tested with stress configurations that maximize cross-warp timing variation. Consider running tests multiple times per input and flagging any non-determinism as a potential kill.",
+      "suggested_code": "def generate_inputs(device):\n    # pred=0, target=1 => margin = 1-0*1 = 1.0, thread_loss = 1.0\n    # Expected mean = 128*1.0/128 = 1.0\n    # Any garbage from race will cause deviation\n    predictions = torch.zeros(128, 1, dtype=torch.float32, device=device)\n    targets = torch.ones(128, 1, dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4259,
+        "completion_tokens": 4008,
+        "total_tokens": 8267,
+        "reasoning_tokens": 1822
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "The mutation removes __syncthreads() before the reduction loop, creating a race between threads 128-255 writing zeros to shared_mem[128:255] and threads 0-127 reading those positions. With input size=128 and block_size=256, only 1 block launches. The race window is the first reduction iteration only (stride=128). Race manifestation depends on GPU scheduling timing, NOT input values. Shared memory contains undefined garbage initially; if threads 128-255 don't write before threads 0-127 read, garbage affects the sum. However, this is non-deterministic timing behavior, not value-dependent.",
+      "survival_reason": "Round 1 failed because race conditions are fundamentally timing-dependent, not value-dependent. The mutation survived 112 rounds because: (1) GPU warp-level scheduling typically completes all shared_mem writes before any thread begins the reduction loop due to natural instruction ordering, (2) compiler optimizations may insert implicit barriers or reorder instructions safely, (3) the specific GPU hardware used likely executes the code path synchronously by accident. Input values cannot control thread scheduling timing. The all-zeros pattern didn't change timing behavior any differently than random values.",
+      "killable": false,
+      "kill_strategy": "This mutation is likely UNKILLABLE through value-level testing. The bug is a classic CUDA race condition that depends on thread scheduling timing, not on computational values. To trigger the race would require: (1) hardware/driver conditions that expose the race, (2) repeated execution hoping for non-deterministic failure, or (3) artificially slowing specific threads (impossible via values alone). Recommend marking as equivalent for this specific input size, or testing on different GPU architectures where warp scheduling differs.",
+      "recommendations": "For mutation testing of __syncthreads() removal: (1) Test on multiple GPU architectures (different warp scheduling), (2) Run many iterations per test case to catch non-deterministic races, (3) Consider input sizes that span multiple blocks where inter-block timing is less predictable, (4) Use CUDA memory sanitizers (compute-sanitizer --tool racecheck) to detect races statically rather than relying on value-level testing.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 136.25
+}

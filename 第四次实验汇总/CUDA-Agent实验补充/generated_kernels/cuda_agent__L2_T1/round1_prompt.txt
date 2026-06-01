@@ -1,0 +1,322 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a GEMM, BatchNorm, GELU, and ReLU in sequence.
+    """
+    def __init__(self, in_features, out_features):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.batch_norm = nn.BatchNorm1d(out_features)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.gemm(x)
+        x = self.batch_norm(x)
+        x = torch.nn.functional.gelu(x)
+        x = torch.relu(x)
+        return x
+
+batch_size = 16384
+in_features = 4096
+out_features = 4096
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_batchnorm_gelu_relu.cu ===
+#include <cuda_runtime.h>
+
+// Fused kernel for BatchNorm + GELU + ReLU with vectorized loads
+__global__ void fused_batchnorm_gelu_relu_kernel(
+    const float* x,
+    const float* weight,
+    const float* bias,
+    const float* running_mean,
+    const float* running_var,
+    float* output) {
+    
+    int total_elements = 16384 * 4096 / 4;
+    const float eps = 1e-05f;
+    const float cdf_coeff = 0.5f;
+    const float inv_sqrt_2 = 0.70710678118f;
+    
+    // Grid-stride loop - each thread processes one float4 at a time
+    for (int idx = blockIdx.x * 256 + threadIdx.x; idx < total_elements; idx += gridDim.x * 256) {
+        // Load 4 consecutive elements from x
+        float4 xv = reinterpret_cast<const float4*>(x)[idx];
+        
+        // Calculate base feature index for these 4 elements
+        int base_feat = (idx * 4) % 4096;
+        
+        // Load batch norm parameters for the 4 features
+        float w0 = weight[base_feat + 0];
+        float w1 = weight[base_feat + 1];
+        float w2 = weight[base_feat + 2];
+        float w3 = weight[base_feat + 3];
+        
+        float b0 = bias[base_feat + 0];
+        float b1 = bias[base_feat + 1]; 
+        float b2 = bias[base_feat + 2];
+        float b3 = bias[base_feat + 3];
+        
+        float m0 = running_mean[base_feat + 0];
+        float m1 = running_mean[base_feat + 1];
+        float m2 = running_mean[base_feat + 2];
+        float m3 = running_mean[base_feat + 3];
+        
+        float v0 = running_var[base_feat + 0];
+        float v1 = running_var[base_feat + 1];
+        float v2 = running_var[base_feat + 2];
+        float v3 = running_var[base_feat + 3];
+        
+        // Compute inverse standard deviations
+        float inv_std0 = rsqrt(v0 + eps);
+        float inv_std1 = rsqrt(v1 + eps);
+        float inv_std2 = rsqrt(v2 + eps);
+        float inv_std3 = rsqrt(v3 + eps);
+        
+        // Compute batch normalization for each element
+        float n0 = w0 * (xv.x - m0) * inv_std0 + b0;
+        float n1 = w1 * (xv.y - m1) * inv_std1 + b1;
+        float n2 = w2 * (xv.z - m2) * inv_std2 + b2;
+        float n3 = w3 * (xv.w - m3) * inv_std3 + b3;
+        
+        // Compute GELU using erf approximation
+        float cdf0 = cdf_coeff * (1.0f + erf(n0 * inv_sqrt_2));
+        float cdf1 = cdf_coeff * (1.0f + erf(n1 * inv_sqrt_2));
+        float cdf2 = cdf_coeff * (1.0f + erf(n2 * inv_sqrt_2));
+        float cdf3 = cdf_coeff * (1.0f + erf(n3 * inv_sqrt_2));
+        
+        float gelu0 = n0 * cdf0;
+        float gelu1 = n1 * cdf1;
+        float gelu2 = n2 * cdf2;
+        float gelu3 = n3 * cdf3;
+        
+        // Compute ReLU
+        float r0 = max(gelu0, 0.0f);
+        float r1 = max(gelu1, 0.0f);
+        float r2 = max(gelu2, 0.0f);
+        float r3 = max(gelu3, 0.0f);
+        
+        // Write the 4 elements back to output
+        float4 ov = make_float4(r0, r1, r2, r3);
+        reinterpret_cast<float4*>(output)[idx] = ov;
+    }
+}
+
+// C-interface launcher
+extern "C" void fused_batchnorm_gelu_relu_launcher(
+    const float* x,
+    const float* weight,
+    const float* bias,
+    const float* running_mean,
+    const float* running_var,
+    float* output,
+    cudaStream_t stream) {
+    
+    int blocks = 1024 * 128;  // 131072 blocks
+    int threads = 256;
+    
+    fused_batchnorm_gelu_relu_kernel<<<blocks, threads, 0, stream>>>(
+        x, weight, bias, running_mean, running_var, output
+    );
+}
+
+"""
+
+_cpp_sources = """
+// === fused_batchnorm_gelu_relu_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_batchnorm_gelu_relu_launcher(
+    const float* x,
+    const float* weight,
+    const float* bias,
+    const float* running_mean,
+    const float* running_var,
+    float* output,
+    cudaStream_t stream
+);
+
+torch::Tensor fused_batchnorm_gelu_relu_forward(
+    torch::Tensor x,
+    torch::Tensor weight,
+    torch::Tensor bias,
+    torch::Tensor running_mean,
+    torch::Tensor running_var) {
+    
+    TORCH_CHECK(x.is_cuda(), "Input x must be a CUDA tensor");
+    TORCH_CHECK(weight.is_cuda(), "Input weight must be a CUDA tensor");
+    TORCH_CHECK(bias.is_cuda(), "Input bias must be a CUDA tensor");
+    TORCH_CHECK(running_mean.is_cuda(), "Input running_mean must be a CUDA tensor");
+    TORCH_CHECK(running_var.is_cuda(), "Input running_var must be a CUDA tensor");
+    
+    TORCH_CHECK(x.is_contiguous(), "Input x must be contiguous");
+    TORCH_CHECK(weight.is_contiguous(), "Input weight must be contiguous");
+    TORCH_CHECK(bias.is_contiguous(), "Input bias must be contiguous");
+    TORCH_CHECK(running_mean.is_contiguous(), "Input running_mean must be contiguous");
+    TORCH_CHECK(running_var.is_contiguous(), "Input running_var must be contiguous");
+    
+    TORCH_CHECK(x.dtype() == torch::kFloat32, "Input x must be float32");
+    TORCH_CHECK(weight.dtype() == torch::kFloat32, "Input weight must be float32");
+    TORCH_CHECK(bias.dtype() == torch::kFloat32, "Input bias must be float32");
+    TORCH_CHECK(running_mean.dtype() == torch::kFloat32, "Input running_mean must be float32");
+    TORCH_CHECK(running_var.dtype() == torch::kFloat32, "Input running_var must be float32");
+    
+    TORCH_CHECK(x.dim() == 2 && x.size(1) == weight.size(0), 
+               "Input x must be 2D with x.size(1) == weight.size(0)");
+    
+    auto output = torch::empty_like(x);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+    
+    fused_batchnorm_gelu_relu_launcher(
+        x.data_ptr<float>(),
+        weight.data_ptr<float>(),
+        bias.data_ptr<float>(),
+        running_mean.data_ptr<float>(),
+        running_var.data_ptr<float>(),
+        output.data_ptr<float>(),
+        stream
+    );
+    
+    return output;
+}
+
+void register_fused_batchnorm_gelu_relu(pybind11::module& m) {
+    m.def("fused_batchnorm_gelu_relu_forward", &fused_batchnorm_gelu_relu_forward,
+          "Fused BatchNorm + GELU + ReLU forward",
+          py::arg("x"),
+          py::arg("weight"),
+          py::arg("bias"),
+          py::arg("running_mean"),
+          py::arg("running_var"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_batchnorm_gelu_relu_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that uses cuBLAS for GEMM with TF32 and a fused kernel for BatchNorm + GELU + ReLU.
+    """
+    def __init__(self, in_features, out_features):
+        super(ModelNew, self).__init__()
+        # Initialize parameters to match the original model's state_dict structure
+        self.gemm = nn.Module()
+        self.gemm.weight = nn.Parameter(torch.randn(out_features, in_features))
+        self.gemm.bias = nn.Parameter(torch.zeros(out_features))
+        
+        self.batch_norm = nn.Module()
+        self.batch_norm.weight = nn.Parameter(torch.ones(out_features))
+        self.batch_norm.bias = nn.Parameter(torch.zeros(out_features))
+        self.batch_norm.running_mean = nn.Parameter(torch.zeros(out_features), requires_grad=False)
+        self.batch_norm.running_var = nn.Parameter(torch.ones(out_features), requires_grad=False)
+        self.batch_norm.num_batches_tracked = nn.Parameter(torch.tensor(0), requires_grad=False)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        # Enable TF32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        # Use PyTorch's optimized addmm (fuses matmul and addition)
+        x = torch.addmm(self.gemm.bias, x, self.gemm.weight.t())
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        # Use fused kernel for BatchNorm + GELU + ReLU
+        x = cuda_extension.fused_batchnorm_gelu_relu_forward(
+            x, self.batch_norm.weight, self.batch_norm.bias,
+            self.batch_norm.running_mean, self.batch_norm.running_var
+        )
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 62
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=8.626709e-01, mean_diff=6.403311e-02, ref_range=[0.0000e+00,3.3625e+03], orig_range=[0.0000e+00,3.3624e+03]
+  - [large_magnitude seed=50001] max_diff=8.770142e-01, mean_diff=6.403361e-02, ref_range=[0.0000e+00,3.6945e+03], orig_range=[0.0000e+00,3.6947e+03]
+  - [near_overflow seed=50002] max_diff=8.981941e+26, mean_diff=6.389217e+25, ref_range=[0.0000e+00,3.1163e+30], orig_range=[0.0000e+00,3.1162e+30]
+  - [near_overflow seed=50003] max_diff=9.010275e+26, mean_diff=6.387777e+25, ref_range=[0.0000e+00,3.8161e+30], orig_range=[0.0000e+00,3.8160e+30]
+  - [all_negative seed=50008] max_diff=9.334433e-02, mean_diff=6.353803e-03, ref_range=[0.0000e+00,3.0663e+02], orig_range=[0.0000e+00,3.0665e+02]
+  - [all_negative seed=50009] max_diff=8.713150e-02, mean_diff=6.534086e-03, ref_range=[0.0000e+00,2.8910e+02], orig_range=[0.0000e+00,2.8912e+02]
+  - [all_positive seed=50010] max_diff=9.386444e-02, mean_diff=6.410239e-03, ref_range=[0.0000e+00,2.8871e+02], orig_range=[0.0000e+00,2.8870e+02]
+  - [all_positive seed=50011] max_diff=9.259415e-02, mean_diff=6.348124e-03, ref_range=[0.0000e+00,3.1096e+02], orig_range=[0.0000e+00,3.1096e+02]
+  ... and 20 more failures
+
+### training_stress (34 failures)
+  - [large_magnitude seed=70000] max_diff=1.251437e+01, mean_diff=8.917171e-01, ref_range=[0.0000e+00,5.7830e+00], orig_range=[0.0000e+00,1.8297e+01]
+  - [large_magnitude seed=70001] max_diff=1.192719e+01, mean_diff=8.915524e-01, ref_range=[0.0000e+00,5.5141e+00], orig_range=[0.0000e+00,1.7441e+01]
+  - [all_negative seed=70008] max_diff=2.280630e+01, mean_diff=1.781002e+00, ref_range=[0.0000e+00,5.9386e+00], orig_range=[0.0000e+00,2.7540e+01]
+  - [all_negative seed=70009] max_diff=2.296093e+01, mean_diff=1.744807e+00, ref_range=[0.0000e+00,5.5923e+00], orig_range=[0.0000e+00,2.7350e+01]
+  - [all_positive seed=70010] max_diff=2.201201e+01, mean_diff=1.781690e+00, ref_range=[0.0000e+00,5.4759e+00], orig_range=[0.0000e+00,2.6625e+01]
+  - [all_positive seed=70011] max_diff=2.209987e+01, mean_diff=1.717691e+00, ref_range=[0.0000e+00,6.0972e+00], orig_range=[0.0000e+00,2.7124e+01]
+  - [mixed_extremes seed=70012] max_diff=1.286083e+01, mean_diff=8.917830e-01, ref_range=[0.0000e+00,5.9471e+00], orig_range=[0.0000e+00,1.8808e+01]
+  - [mixed_extremes seed=70013] max_diff=1.307581e+01, mean_diff=8.917135e-01, ref_range=[0.0000e+00,6.0301e+00], orig_range=[0.0000e+00,1.9106e+01]
+  ... and 26 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

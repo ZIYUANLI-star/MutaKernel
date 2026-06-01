@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P33__mask_boundary__6",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P33",
+  "tier": 3,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9842,
+        "completion_tokens": 4968,
+        "total_tokens": 14810,
+        "reasoning_tokens": 2250
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "num_features=64, update_blocks=1, blockDim.x=256 → idx ∈ [0,255]. Original guard: idx≥64 returns. Mutated guard: idx≥65 returns. Thread idx=64 now executes with OOB access to *[64] on 64-element tensors. BUT: update_running_stats_kernel only called when training=True. Test results show 'Training Mode SKIPPED', so mutation never executed.",
+      "survival_reason": "The mutation is located in `update_running_stats_kernel` which is only invoked when the model is in training mode (`self.training=True`). All test rounds were executed in evaluation mode, as evidenced by 'Training Mode (.train()) SKIPPED: operator_not_applicable'. In eval mode, the code takes the `batchnorm2d_forward_inference_kernel` path which does not contain the mutation. The mutated code was never reached during any test.",
+      "killable": true,
+      "kill_strategy": "Run the model in training mode by calling model.train() before forward pass. This will trigger the training code path where the mutation causes thread idx=64 to perform out-of-bounds memory access to running_mean[64] and running_var[64]. The undefined behavior from this OOB write may corrupt adjacent memory or produce observable differences.",
+      "recommendations": "Always include training mode testing for BatchNorm and similar stateful operators. The test framework should explicitly test both model.train() and model.eval() code paths, as they often execute fundamentally different kernels with different boundary conditions.",
+      "suggested_code": "def generate_inputs(device):\n    # Use a specific seed for reproducibility\n    torch.manual_seed(99999)\n    # Large magnitude values to make any corruption more observable\n    x = torch.randn(16, 64, 256, 256, device=device, dtype=torch.float32) * 100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 9371,
+        "completion_tokens": 3152,
+        "total_tokens": 12523,
+        "reasoning_tokens": 1405
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "Kernel launch: update_blocks = (64 + 256 - 1) / 256 = 1, so 256 threads launched (idx 0-255). Original: idx >= 64 exits (threads 64-255 idle). Mutant: idx >= 65 exits (thread 64 executes, writes to running_mean[64]/running_var[64] OOB). However, output in training mode uses batch_mean[0:63] and batch_var[0:63] computed in apply_batchnorm_kernel. The OOB write at index 64 never affects indices 0-63 that determine output.",
+      "survival_reason": "The mutation allows thread idx=64 to execute in update_running_stats_kernel, causing out-of-bounds writes to running_mean[64] and running_var[64]. However, this infection cannot propagate to the forward pass output for two reasons: (1) During training mode, the output tensor is computed by apply_batchnorm_kernel using batch_mean and batch_var (computed from the current batch), not running_mean/running_var. The update to running stats happens AFTER output computation. (2) Even the corrupted running_mean[64] would only be read during inference mode at feature index 64, but the model only has 64 features (indices 0-63), so index 64 is never accessed in any normalization path. The test framework compares forward pass outputs, and no output depends on the corrupted memory location.",
+      "killable": false,
+      "kill_strategy": "This mutation is unkillable under the given testing contract. The mutation affects internal buffer state (running_mean/running_var at an out-of-bounds index) that never propagates to the forward pass output. To kill this mutation would require either: (1) testing internal state changes rather than outputs, (2) testing multi-forward-pass scenarios where corrupted running stats propagate in eval mode, or (3) having num_features such that the OOB write corrupts memory that IS used. With num_features=64 and buffer size=64, the OOB write at index 64 doesn't affect any used memory.",
+      "recommendations": "Mutation testing for GPU kernels should include internal state verification (checking buffers like running_mean/running_var), not just output comparison. Additionally, boundary-guard mutations in statistics-update kernels require multi-pass testing where training-mode state changes are verified through subsequent inference-mode outputs.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 177.79
+}

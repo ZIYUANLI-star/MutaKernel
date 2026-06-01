@@ -1,0 +1,131 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Model that performs a transposed convolution, multiplies by a scalar, applies global average pooling, 
+    another global average pooling
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super(Model, self).__init__()
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size, stride=stride, padding=padding, output_padding=output_padding)
+        self.multiplier = multiplier
+
+    def forward(self, x):
+        x = self.conv_transpose(x)
+        x = x * self.multiplier
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # First global average pooling
+        x = torch.mean(x, dim=[2, 3], keepdim=True)  # Second global average pooling
+        return x
+
+batch_size = 16
+in_channels = 64
+out_channels = 128
+height, width = 128, 128
+kernel_size = 3
+stride = 2
+padding = 1
+output_padding = 1
+multiplier = 0.5
+
+def get_inputs():
+    return [torch.rand(batch_size, in_channels, height, width)]
+
+def get_init_inputs():
+    return [in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+
+class ModelNew(nn.Module):
+    """
+    Final optimized model using PyTorch's functional API with TF32 and fast math
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, stride, padding, output_padding, multiplier):
+        super().__init__()
+        # Initialize with the original weight shape
+        self.conv_transpose_weight = nn.Parameter(torch.randn(in_channels, out_channels, 3, 3))
+        self.conv_transpose_bias = nn.Parameter(torch.zeros(out_channels))
+        self.multiplier = multiplier
+        # Store parameters for functional API
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.output_padding = output_padding
+
+    @torch.compile(backend='inductor', options={
+        'max_autotune': True,
+        'epilogue_fusion': True,
+        'coordinate_descent_tuning': True,
+        'cpp.enable_unsafe_math_opt_flag': True,
+        'cpp.enable_floating_point_contract_flag': True,
+    })
+    def forward(self, x):
+        # Enable TF32 and fast math
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cuda.use_fast_math = True
+        
+        # Use PyTorch's functional transposed convolution
+        x = torch.conv_transpose2d(x, self.conv_transpose_weight, self.conv_transpose_bias,
+                                   self.stride, self.padding, self.output_padding)
+        
+        # Fuse multiply by 0.5 and global average pool
+        x = x * self.multiplier
+        x = x.reshape(x.shape[0], x.shape[1], -1).mean(dim=-1, keepdim=True)
+        x = x.reshape(x.shape[0], x.shape[1], 1, 1)
+        
+        # Disable optimizations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+        torch.backends.cuda.use_fast_math = False
+        return x
+
+    def load_state_dict(self, state_dict):
+        # Map the original state dict keys to the new ones
+        new_state_dict = {
+            'conv_transpose_weight': state_dict['conv_transpose.weight'],
+            'conv_transpose_bias': state_dict['conv_transpose.bias']
+        }
+        super().load_state_dict(new_state_dict)
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 2
+Failing dimensions: repeated_run
+Tolerance used: atol=0.01, rtol=0.01
+
+### repeated_run (2 failures)
+  - [? seed=80000] 
+  - [? seed=80001] 
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

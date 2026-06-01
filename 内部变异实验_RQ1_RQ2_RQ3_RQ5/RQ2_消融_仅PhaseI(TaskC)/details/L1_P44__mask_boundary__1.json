@@ -1,0 +1,62 @@
+{
+  "mutant_id": "L1_P44__mask_boundary__1",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P44",
+  "phase1_status": "candidate_equivalent",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5921,
+        "completion_tokens": 5867,
+        "total_tokens": 11788,
+        "reasoning_tokens": 2413
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "output_pos=125 thread proceeds in mutant (not original), writes to output index 125 which is OOB for channel 0 (size 125), corrupting output[0,1,0]. With input[0,0,125:128]=1000 and input[0,1,0:4]=0, mutant writes ~750 instead of 0.",
+      "survival_reason": "The EMD testing likely used random uniform distributions where the average of input[b,c,125:128] happened to be close to the average of input[b,c+1,0:4] by chance, or the specific model configuration used different parameters. With adversarial input values where these regions differ significantly, the out-of-bounds write from the extra thread corrupts valid output positions detectably.",
+      "killable": true,
+      "kill_strategy": "Set input values such that the last few elements of each channel (indices 125-127) have drastically different values than the first kernel_size elements of the next channel. This makes the corrupted value differ significantly from the correct value.",
+      "recommendations": "Boundary mutations that loosen guards can cause out-of-bounds writes that corrupt adjacent memory regions. Test with adversarial value patterns at tensor boundaries, not just random distributions, to detect such corruption.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 32, 128, device=device, dtype=torch.float32)\n    # For all batch/channel pairs, set contrasting values\n    # End of each channel (positions 125-127): large positive\n    # Start of each channel (positions 0-3): zero (already)\n    for b in range(16):\n        for c in range(32):\n            x[b, c, 125:128] = 1000.0\n            # Positions 0:4 stay at 0.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5811,
+        "completion_tokens": 5480,
+        "total_tokens": 11291,
+        "reasoning_tokens": 2153
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "output_length=125, so errant thread output_pos=125 writes to idx=(batch*32+ch)*125+125 which equals (batch*32+ch+1)*125 = start of next channel. Legitimate thread for (batch, ch+1, pos=0) writes same address. CUDA scheduler consistently orders block ch+1 after block ch, so legitimate write overwrites errant write.",
+      "survival_reason": "The previous attempt correctly identified the corruption mechanism but failed because both errant and legitimate threads write to the same memory location. The CUDA thread scheduler's block execution order is deterministic for this grid configuration (512 blocks_x × 1 blocks_y), consistently running higher-indexed blocks after lower-indexed ones. Since block (ch+1) executes after block (ch), the legitimate value always overwrites the corrupted value. No value-level input variation can change thread scheduling behavior - it's determined by hardware and grid geometry, not by data values.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable under fixed shapes because the mutation's effect (out-of-bounds write) consistently races with a legitimate write, and CUDA's deterministic scheduling resolves the race identically across all runs. Killing would require configuration changes (different output_length causing different blocks_y, or different batch/channel counts) that alter the race dynamics.",
+      "recommendations": "Mutation testing for GPU kernels should track out-of-bounds writes separately from semantic correctness. Consider using CUDA sanitizers (compute-sanitizer) as part of mutation testing to catch memory safety violations that may not manifest as incorrect outputs due to race condition masking.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 394.46
+}

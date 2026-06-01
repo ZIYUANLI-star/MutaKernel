@@ -1,0 +1,67 @@
+{
+  "mutant_id": "L1_P48__const_perturb__1",
+  "operator_name": "const_perturb",
+  "kernel_name": "L1_P48",
+  "tier": 1,
+  "executed": true,
+  "trigger": "task_a_phase2_rerun_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 5068,
+        "completion_tokens": 3961,
+        "total_tokens": 9029,
+        "reasoning_tokens": 1546
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "shared_sums[255] declared as size 255, but tid=0..255 means thread 255 accesses out-of-bounds. Due to CUDA shared memory alignment (typically rounds up to 256 floats = 1024 bytes), index 255 likely falls within padded allocation, making accesses valid despite declared size.",
+      "survival_reason": "The mutation reduces shared memory from 256 to 255 elements, but CUDA shared memory allocation often pads to alignment boundaries. For 255 floats (1020 bytes), the allocation likely rounds to 1024 bytes (256 floats), making index 255 accidentally valid. Thread 255's write and subsequent read during reduction both access the same physical memory location, producing correct results. This is undefined behavior that happens to work due to hardware memory layout.",
+      "killable": true,
+      "kill_strategy": "Create input where ONLY element index 255 in the reduction dimension contains a significant value (e.g., 256.0) and all other elements are 0. Expected mean = 1.0. If thread 255's contribution is lost due to actual OOB issues on different hardware/runs, mean ≈ 0.0.",
+      "recommendations": "When testing mutations to shared memory sizes, always create inputs that isolate the contribution of boundary thread indices (e.g., the last thread) to detect off-by-one allocation bugs that may be masked by hardware memory padding.",
+      "suggested_code": "def generate_inputs(device):\n    x = torch.zeros(16, 256, 256, dtype=torch.float32, device=device)\n    x[:, 255, :] = 256.0  # Only last element in reduction dim has value\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_V2",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 4483,
+        "completion_tokens": 3576,
+        "total_tokens": 8059,
+        "reasoning_tokens": 1298
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "shared_sums[255] (255 elements) with block_size=256 causes thread 255 to write OOB at index 255. In reduction, thread 127 reads index 255. CUDA shared memory alignment typically rounds to 256+ bytes, so both OOB accesses hit the same padding memory location. Write-then-read of same location = correct behavior regardless of input values.",
+      "survival_reason": "The mutation reduces shared memory from 256 to 255 elements, but CUDA's shared memory allocation alignment means the OOB index 255 still maps to valid padding memory. Thread 255 writes its partial sum to this location, and thread 127 correctly reads it back during the reduction phase. Since no other shared memory variables exist to corrupt, and the OOB location is consistently accessed for both write and read, the mutation produces bit-identical results. This is an architectural equivalence that cannot be detected through value manipulation.",
+      "killable": false,
+      "kill_strategy": "This mutant is unkillable with value-level tests. The shared memory alignment on CUDA hardware makes the OOB access functionally equivalent. To kill this mutant would require either: (1) a different CUDA architecture with stricter bounds checking, (2) additional shared memory variables that could be corrupted, or (3) source-level static analysis flagging the array size mismatch with block_size.",
+      "recommendations": "Shared memory buffer size mutations are often equivalent due to alignment padding. Mutation testing tools should: (1) correlate shared memory array sizes with blockDim constants, (2) flag mutations where array_size < blockDim as potentially benign due to alignment, (3) consider adding static analysis rules that compare shared memory bounds against thread count to catch these at compile time rather than relying on runtime testing.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "deepseek_baseline": {
+    "executed": true,
+    "killed": false,
+    "rounds_count": 1
+  },
+  "elapsed_sec": 210.66
+}

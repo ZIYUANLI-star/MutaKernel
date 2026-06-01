@@ -1,0 +1,271 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that computes Hinge Loss for binary classification tasks.
+
+    Parameters:
+        None
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+
+    def forward(self, predictions, targets):
+        return torch.mean(torch.clamp(1 - predictions * targets, min=0))
+
+batch_size = 32768
+input_shape = (32768,)
+dim = 1
+
+def get_inputs():
+    return [torch.rand(batch_size, *input_shape), torch.randint(0, 2, (batch_size,)).float() * 2 - 1]
+
+def get_init_inputs():
+    return []
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === hinge_loss.cu ===
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    for (int i = 16; i > 0; i >>= 1) {
+        val += __shfl_xor_sync(0xffffffff, val, i);
+    }
+    return val;
+}
+
+__device__ __forceinline__ float block_reduce_sum(float val, __shared__ float* smem, int block_size) {
+    int tid = threadIdx.x;
+    
+    // First reduce within warp
+    val = warp_reduce_sum(val);
+    
+    // Write warp sums to shared memory
+    if ((tid % 32) == 0) {
+        smem[tid / 32] = val;
+    }
+    __syncthreads();
+    
+    // Now reduce the warp sums
+    int num_warps = block_size / 32;
+    if (tid < 32) {
+        val = (tid < num_warps) ? smem[tid] : 0.0f;
+        val = warp_reduce_sum(val);
+    }
+    
+    return val;
+}
+
+__global__ void fused_hinge_loss_sum_kernel(float* output, const float* predictions, const float* targets) {
+    const int block_size = 1024;
+    const int num_blocks = 2048;
+
+    __shared__ float smem[32];  // 32 warp sums per block
+
+    const int tid = threadIdx.x;
+    const int bid = blockIdx.x;
+
+    float sum = 0.0f;
+
+    const int total_elements = 32768 * 32768;
+    const int threads = block_size * num_blocks;
+
+    // Calculate starting index for this thread - use larger steps
+    int step = threads * 8;  // 8 elements per iteration
+    int base_idx = bid * block_size + tid;
+
+    for (long long i = base_idx * 8LL; i < total_elements; i += step) {
+        // Calculate batch indices - all 8 elements belong to the same batch row
+        int batch_idx = static_cast<int>(i / 32768LL);
+        float t = targets[batch_idx];
+
+        // Load 8 elements from predictions using vectorized loads
+        float p[8];
+        float4 p4_0 = reinterpret_cast<const float4*>(predictions)[i / 4];
+        float4 p4_1 = reinterpret_cast<const float4*>(predictions)[i / 4 + 1];
+        
+        p[0] = p4_0.x; p[1] = p4_0.y; p[2] = p4_0.z; p[3] = p4_0.w;
+        p[4] = p4_1.x; p[5] = p4_1.y; p[6] = p4_1.z; p[7] = p4_1.w;
+
+        // Calculate values
+        for (int j = 0; j < 8; j++) {
+            float val = 1.0f - p[j] * t;
+            sum += max(val, 0.0f);
+        }
+    }
+
+    // Reduce within block
+    sum = block_reduce_sum(sum, smem, block_size);
+
+    if (tid == 0) {
+        output[bid] = sum;
+    }
+}
+
+__global__ void sum_reduction_kernel(float* output, const float* block_sums, int num_blocks) {
+    const int block_size = 1024;
+    __shared__ float smem[32];
+
+    const int tid = threadIdx.x;
+
+    float sum = 0.0f;
+
+    // Read block sums
+    for (int i = tid; i < num_blocks; i += block_size) {
+        sum += block_sums[i];
+    }
+
+    // Reduce within block
+    sum = block_reduce_sum(sum, smem, block_size);
+
+    if (tid == 0) {
+        *output = sum;
+    }
+}
+
+extern "C" void fused_hinge_loss_sum_launcher(float* output, const float* predictions, const float* targets, cudaStream_t stream) {
+    const int num_blocks = 2048;
+
+    // Allocate temporary storage for block sums
+    float* d_block_sums;
+    cudaMalloc(&d_block_sums, num_blocks * sizeof(float));
+
+    // Step 1: Compute sum of each block
+    fused_hinge_loss_sum_kernel<<<num_blocks, 1024, 32 * sizeof(float), stream>>>(d_block_sums, predictions, targets);
+
+    // Step 2: Reduce block sums to total sum
+    sum_reduction_kernel<<<1, 1024, 32 * sizeof(float), stream>>>(output, d_block_sums, num_blocks);
+
+    // Free temporary storage
+    cudaFree(d_block_sums);
+}
+
+"""
+
+_cpp_sources = """
+// === hinge_loss_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_hinge_loss_sum_launcher(float* output, const float* predictions, const float* targets, cudaStream_t stream);
+
+torch::Tensor fused_hinge_loss_forward(torch::Tensor predictions, torch::Tensor targets) {
+    // Input validation
+    TORCH_CHECK(predictions.is_cuda(), "Predictions must be a CUDA tensor");
+    TORCH_CHECK(targets.is_cuda(), "Targets must be a CUDA tensor");
+    TORCH_CHECK(predictions.is_contiguous(), "Predictions must be contiguous");
+    TORCH_CHECK(targets.is_contiguous(), "Targets must be contiguous");
+    TORCH_CHECK(predictions.dtype() == torch::kFloat32, "Predictions must be float32");
+    TORCH_CHECK(targets.dtype() == torch::kFloat32, "Targets must be float32");
+
+    auto output = torch::empty(1, predictions.options());
+
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
+
+    fused_hinge_loss_sum_launcher(
+        output.data_ptr<float>(),
+        predictions.data_ptr<float>(),
+        targets.data_ptr<float>(),
+        stream
+    );
+
+    return output[0];
+}
+
+void register_hinge_loss(pybind11::module& m) {
+    m.def("fused_hinge_loss_forward", &fused_hinge_loss_forward,
+          "Fused hinge loss sum calculation",
+          py::arg("predictions"),
+          py::arg("targets"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_hinge_loss_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized Hinge Loss model using fused CUDA kernel
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+
+    def forward(self, predictions, targets):
+        # Use the fused kernel to compute sum of clamped values
+        sum_val = cuda_extension.fused_hinge_loss_forward(predictions, targets)
+        # Compute mean - total elements = 32768 * 32768
+        return sum_val / (32768 * 32768)
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 21
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (10 failures)
+  - [alternating_sign seed=50014] max_diff=3.193755e+03, mean_diff=3.193755e+03, ref_range=[3.0813e-04,3.0813e-04], orig_range=[3.1938e+03,3.1938e+03]
+  - [alternating_sign seed=50015] max_diff=3.180627e+03, mean_diff=3.180627e+03, ref_range=[3.8871e-04,3.8871e-04], orig_range=[3.1806e+03,3.1806e+03]
+  - [structured_ramp seed=50020] max_diff=8.333087e-02, mean_diff=8.333087e-02, ref_range=[7.5001e-01,7.5001e-01], orig_range=[6.6667e-01,6.6667e-01]
+  - [structured_ramp seed=50021] max_diff=8.333087e-02, mean_diff=8.333087e-02, ref_range=[7.5001e-01,7.5001e-01], orig_range=[6.6667e-01,6.6667e-01]
+  - [head_heavy seed=50024] max_diff=6.014568e+06, mean_diff=6.014568e+06, ref_range=[2.0053e+06,2.0053e+06], orig_range=[8.0199e+06,8.0199e+06]
+  - [head_heavy seed=50025] max_diff=6.031898e+06, mean_diff=6.031898e+06, ref_range=[2.0103e+06,2.0103e+06], orig_range=[8.0422e+06,8.0422e+06]
+  - [tail_heavy seed=50026] max_diff=5.893651e+06, mean_diff=5.893651e+06, ref_range=[1.9641e+06,1.9641e+06], orig_range=[7.8578e+06,7.8578e+06]
+  - [tail_heavy seed=50027] max_diff=5.918494e+06, mean_diff=5.918494e+06, ref_range=[1.9744e+06,1.9744e+06], orig_range=[7.8929e+06,7.8929e+06]
+  ... and 2 more failures
+
+### training_stress (11 failures)
+  - [alternating_sign seed=70014] max_diff=3.172156e+03, mean_diff=3.172156e+03, ref_range=[3.4802e-04,3.4802e-04], orig_range=[3.1722e+03,3.1722e+03]
+  - [alternating_sign seed=70015] max_diff=3.160630e+03, mean_diff=3.160630e+03, ref_range=[3.8633e-04,3.8633e-04], orig_range=[3.1606e+03,3.1606e+03]
+  - [structured_ramp seed=70020] max_diff=8.333087e-02, mean_diff=8.333087e-02, ref_range=[7.5001e-01,7.5001e-01], orig_range=[6.6667e-01,6.6667e-01]
+  - [structured_ramp seed=70021] max_diff=8.333087e-02, mean_diff=8.333087e-02, ref_range=[7.5001e-01,7.5001e-01], orig_range=[6.6667e-01,6.6667e-01]
+  - [head_heavy seed=70024] max_diff=5.992846e+06, mean_diff=5.992846e+06, ref_range=[1.9973e+06,1.9973e+06], orig_range=[7.9901e+06,7.9901e+06]
+  - [head_heavy seed=70025] max_diff=5.946249e+06, mean_diff=5.946249e+06, ref_range=[1.9833e+06,1.9833e+06], orig_range=[7.9295e+06,7.9295e+06]
+  - [tail_heavy seed=70026] max_diff=5.945098e+06, mean_diff=5.945098e+06, ref_range=[1.9822e+06,1.9822e+06], orig_range=[7.9273e+06,7.9273e+06]
+  - [tail_heavy seed=70027] max_diff=5.819175e+06, mean_diff=5.819175e+06, ref_range=[1.9406e+06,1.9406e+06], orig_range=[7.7597e+06,7.7597e+06]
+  ... and 3 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

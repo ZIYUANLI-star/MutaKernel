@@ -1,0 +1,632 @@
+You are a GPU kernel engineering expert (CUDA / Triton) specializing in writing correctness-robust optimized kernels.
+
+A `ModelNew` kernel passes KernelBench's standard correctness test (random
+inputs from `get_inputs()`) but fails Phase II stress testing on N specific
+adversarial inputs. Your task is to **regenerate a strengthened version of
+this kernel** that fixes those failures *without* breaking the standard
+KernelBench test.
+
+────────────────────────────────────────────────────────────────────────────
+## 1. Reference PyTorch implementation (ground truth — DO NOT modify)
+
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    Simple model that performs a Tanh activation.
+    """
+    def __init__(self):
+        super(Model, self).__init__()
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Tanh activation to the input tensor.
+
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+
+        Returns:
+            torch.Tensor: Output tensor with Tanh applied, same shape as input.
+        """
+        return torch.tanh(x)
+
+batch_size = 16
+dim = 16384
+
+def get_inputs():
+    x = torch.randn(batch_size, dim)
+    return [x]
+
+def get_init_inputs():
+    return []  # No special initialization inputs needed
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 2. Current optimized kernel (buggy under stress inputs)
+
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define the custom CUDA kernel for Tanh activation with vectorized loads
+tanh_kernel_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_fp16.h>
+
+template<typename T>
+__device__ __forceinline__ T fast_tanh(T x) {
+    // More accurate approximation with better numerical stability
+    T x2 = x * x;
+    T a = x * (T(135135.0) + x2 * (T(17325.0) + x2 * (T(378.0) + x2)));
+    T b = T(135135.0) + x2 * (T(62370.0) + x2 * (T(3150.0) + x2 * T(28.0)));
+    return a / b;
+}
+
+// Vectorized kernel for float4 (4 floats per thread)
+template<typename T>
+__global__ void tanh_activation_kernel_vectorized(const T* __restrict__ input, 
+                                                   T* __restrict__ output, 
+                                                   int64_t size) {
+    constexpr int VEC_SIZE = 4;
+    int64_t idx = (blockIdx.x * blockDim.x + threadIdx.x) * VEC_SIZE;
+    
+    if (idx + VEC_SIZE - 1 < size) {
+        // Load 4 elements at once
+        T vals[VEC_SIZE];
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; i++) {
+            vals[i] = input[idx + i];
+        }
+        
+        // Process 4 elements
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; i++) {
+            vals[i] = fast_tanh(vals[i]);
+        }
+        
+        // Store 4 elements at once
+        #pragma unroll
+        for (int i = 0; i < VEC_SIZE; i++) {
+            output[idx + i] = vals[i];
+        }
+    } else {
+        // Handle remainder elements
+        for (int i = 0; i < VEC_SIZE; i++) {
+            int64_t elem_idx = idx + i;
+            if (elem_idx < size) {
+                output[elem_idx] = fast_tanh(input[elem_idx]);
+            }
+        }
+    }
+}
+
+// Specialized kernel for half precision (fp16)
+__global__ void tanh_activation_kernel_half(const __half* __restrict__ input,
+                                            __half* __restrict__ output,
+                                            int64_t size) {
+    int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+        float val = __half2float(input[idx]);
+        float result = fast_tanh(val);
+        output[idx] = __float2half(result);
+    }
+}
+
+torch::Tensor tanh_activation_cuda(torch::Tensor input) {
+    auto size = input.numel();
+    auto output = torch::empty_like(input);
+    
+    const int block_size = 512;  // Increased block size for better occupancy
+    const int vec_size = 4;
+    const int num_blocks = (size + block_size * vec_size - 1) / (block_size * vec_size);
+    
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    
+    AT_DISPATCH_FLOATING_TYPES_AND_HALF(input.scalar_type(), "tanh_activation", [&] {
+        if constexpr (std::is_same<scalar_t, at::Half>::value) {
+            tanh_activation_kernel_half<<<num_blocks, block_size, 0, stream>>>(
+                reinterpret_cast<__half*>(input.data_ptr<scalar_t>()),
+                reinterpret_cast<__half*>(output.data_ptr<scalar_t>()),
+                size
+            );
+        } else {
+            tanh_activation_kernel_vectorized<scalar_t><<<num_blocks, block_size, 0, stream>>>(
+                input.data_ptr<scalar_t>(),
+                output.data_ptr<scalar_t>(),
+                size
+            );
+        }
+    });
+    
+    return output;
+}
+"""
+
+tanh_cpp_source = "torch::Tensor tanh_activation_cuda(torch::Tensor input);"
+
+# Compile the inline CUDA code with optimization flags
+tanh_activation = load_inline(
+    name="tanh_activation",
+    cpp_sources=tanh_cpp_source,
+    cuda_sources=tanh_kernel_source,
+    functions=["tanh_activation_cuda"],
+    verbose=False,
+    extra_cflags=["-O3", "-march=native"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Tanh activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.tanh_op = tanh_activation
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies optimized Tanh activation to the input tensor.
+        
+        Args:
+            x (torch.Tensor): Input tensor of any shape.
+            
+        Returns:
+            torch.Tensor: Output tensor with Tanh applied, same shape as input.
+        """
+        # Only use custom kernel if tensor is on CUDA
+        if x.is_cuda:
+            return self.tanh_op.tanh_activation_cuda(x)
+        else:
+            # Fall back to PyTorch implementation for CPU tensors
+            return torch.tanh(x)
+```
+
+────────────────────────────────────────────────────────────────────────────
+## 3. Failing inputs that broke this kernel (N = 257)
+
+Each failing case is described by:
+- `policy`     — stress policy name (which value-distribution generator was used)
+- `seed`       — random seed (so inputs are reproducible)
+- `mode`       — eval or train (governs BN/Dropout/LayerNorm running stats)
+- `ref_range`  — output range of the reference implementation [min, max]
+- `orig_range` — output range of the current kernel (often diverging)
+- `max_diff`   — max element-wise |ref - orig|
+- `mean_diff`  — mean element-wise |ref - orig|
+- `error`      — exception message (if the kernel crashed instead of diverging)
+
+[1] policy=large_magnitude, seed=42, mode=eval_value:
+      max_diff=1.643262e+02, mean_diff=2.758926e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6395e+02,1.6533e+02]
+[2] policy=large_magnitude, seed=43, mode=eval_value:
+      max_diff=1.586678e+02, mean_diff=2.754244e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5967e+02,1.5896e+02]
+[3] policy=large_magnitude, seed=44, mode=eval_value:
+      max_diff=1.841174e+02, mean_diff=2.749461e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.8512e+02,1.5303e+02]
+[4] policy=mixed_extremes, seed=45, mode=eval_value:
+      max_diff=1.688578e+03, mean_diff=1.415634e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5684e+03,1.6896e+03]
+[5] policy=mixed_extremes, seed=46, mode=eval_value:
+      max_diff=1.577630e+03, mean_diff=1.429599e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5786e+03,1.5052e+03]
+[6] policy=mixed_extremes, seed=47, mode=eval_value:
+      max_diff=1.557608e+03, mean_diff=1.419400e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5586e+03,1.5397e+03]
+[7] policy=near_overflow, seed=51, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[8] policy=near_overflow, seed=52, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[9] policy=near_overflow, seed=53, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[10] policy=all_negative, seed=60, mode=eval_value:
+      max_diff=1.565788e+01, mean_diff=2.073672e+00, ref_range=[-1.0000e+00,-5.1653e-04], orig_range=[-1.6658e+01,-5.1653e-04]
+[11] policy=all_negative, seed=61, mode=eval_value:
+      max_diff=1.758368e+01, mean_diff=2.080481e+00, ref_range=[-1.0000e+00,-9.4133e-05], orig_range=[-1.8584e+01,-9.4133e-05]
+[12] policy=all_negative, seed=62, mode=eval_value:
+      max_diff=1.472616e+01, mean_diff=2.080229e+00, ref_range=[-1.0000e+00,-2.7001e-04], orig_range=[-1.5726e+01,-2.7001e-04]
+[13] policy=all_positive, seed=63, mode=eval_value:
+      max_diff=1.593814e+01, mean_diff=2.080433e+00, ref_range=[8.1263e-04,1.0000e+00], orig_range=[8.1263e-04,1.6938e+01]
+[14] policy=all_positive, seed=64, mode=eval_value:
+      max_diff=1.501741e+01, mean_diff=2.079498e+00, ref_range=[4.7903e-04,1.0000e+00], orig_range=[4.7903e-04,1.6017e+01]
+[15] policy=all_positive, seed=65, mode=eval_value:
+      max_diff=1.472205e+01, mean_diff=2.077605e+00, ref_range=[9.4177e-04,1.0000e+00], orig_range=[9.4177e-04,1.5722e+01]
+[16] policy=alternating_sign, seed=66, mode=eval_value:
+      max_diff=1.527965e+01, mean_diff=2.081536e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6001e+01,1.6280e+01]
+[17] policy=alternating_sign, seed=67, mode=eval_value:
+      max_diff=1.720391e+01, mean_diff=2.078859e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5472e+01,1.8204e+01]
+[18] policy=alternating_sign, seed=68, mode=eval_value:
+      max_diff=1.572007e+01, mean_diff=2.074012e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6720e+01,1.6707e+01]
+[19] policy=sparse, seed=69, mode=eval_value:
+      max_diff=1.241457e+01, mean_diff=2.099648e-01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.3415e+01,1.2994e+01]
+[20] policy=sparse, seed=70, mode=eval_value:
+      max_diff=1.485855e+01, mean_diff=2.064732e-01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5091e+01,1.5859e+01]
+[21] policy=sparse, seed=71, mode=eval_value:
+      max_diff=1.400929e+01, mean_diff=2.092695e-01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4585e+01,1.5009e+01]
+[22] policy=uniform_constant, seed=72, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[23] policy=uniform_constant, seed=73, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[24] policy=uniform_constant, seed=74, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[25] policy=boundary_last_element, seed=78, mode=eval_value:
+      max_diff=3.561438e+02, mean_diff=1.358619e-03, ref_range=[-9.9951e-01,1.0000e+00], orig_range=[-9.9953e-01,3.5714e+02]
+[26] policy=boundary_last_element, seed=79, mode=eval_value:
+      max_diff=3.561438e+02, mean_diff=1.358620e-03, ref_range=[-9.9987e-01,1.0000e+00], orig_range=[-9.9995e-01,3.5714e+02]
+[27] policy=boundary_last_element, seed=80, mode=eval_value:
+      max_diff=3.561438e+02, mean_diff=1.358621e-03, ref_range=[-9.9998e-01,1.0000e+00], orig_range=[-1.0003e+00,3.5714e+02]
+[28] policy=head_heavy, seed=81, mode=eval_value:
+      max_diff=1.530064e+03, mean_diff=7.137814e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5311e+03,1.4587e+03]
+[29] policy=head_heavy, seed=82, mode=eval_value:
+      max_diff=1.595885e+03, mean_diff=7.120816e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5024e+03,1.5969e+03]
+[30] policy=head_heavy, seed=83, mode=eval_value:
+      max_diff=1.728580e+03, mean_diff=7.092780e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.3684e+03,1.7296e+03]
+[31] policy=tail_heavy, seed=84, mode=eval_value:
+      max_diff=1.546943e+03, mean_diff=7.093481e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5479e+03,1.4574e+03]
+[32] policy=tail_heavy, seed=85, mode=eval_value:
+      max_diff=1.515222e+03, mean_diff=7.087449e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5162e+03,1.5028e+03]
+[33] policy=tail_heavy, seed=86, mode=eval_value:
+      max_diff=1.516495e+03, mean_diff=7.063637e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5175e+03,1.4469e+03]
+[34] policy=extreme_magnitude, seed=90, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[35] policy=extreme_magnitude, seed=91, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[36] policy=extreme_magnitude, seed=92, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[37] policy=reduction_adversarial, seed=96, mode=eval_value:
+      max_diff=3.561453e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[38] policy=reduction_adversarial, seed=97, mode=eval_value:
+      max_diff=3.561454e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[39] policy=reduction_adversarial, seed=98, mode=eval_value:
+      max_diff=3.561455e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[40] policy=init_sensitive, seed=99, mode=eval_value:
+      max_diff=1.502812e+01, mean_diff=2.081087e+00, ref_range=[-1.0000e+00,-7.5861e-04], orig_range=[-1.6028e+01,-7.5861e-04]
+[41] policy=init_sensitive, seed=100, mode=eval_value:
+      max_diff=1.664206e+01, mean_diff=2.086547e+00, ref_range=[-1.0000e+00,-3.3099e-05], orig_range=[-1.7642e+01,-3.3099e-05]
+[42] policy=init_sensitive, seed=101, mode=eval_value:
+      max_diff=1.729400e+01, mean_diff=2.079242e+00, ref_range=[-1.0000e+00,-1.9123e-03], orig_range=[-1.8294e+01,-1.9123e-03]
+[43] policy=sparse_extreme, seed=102, mode=eval_value:
+      max_diff=1.226410e+03, mean_diff=2.913323e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2274e+03,1.0765e+03]
+[44] policy=sparse_extreme, seed=103, mode=eval_value:
+      max_diff=1.221398e+03, mean_diff=2.926247e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2224e+03,1.1726e+03]
+[45] policy=sparse_extreme, seed=104, mode=eval_value:
+      max_diff=1.249568e+03, mean_diff=2.765278e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.1218e+03,1.2506e+03]
+[46] policy=near_overflow, seed=42, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[47] policy=near_overflow, seed=43, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[48] policy=near_overflow, seed=44, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[49] policy=near_overflow, seed=45, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[50] policy=near_overflow, seed=46, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[51] policy=all_positive, seed=52, mode=eval_value:
+      max_diff=1.572484e+01, mean_diff=2.075911e+00, ref_range=[1.3712e-03,1.0000e+00], orig_range=[1.3712e-03,1.6725e+01]
+[52] policy=all_positive, seed=53, mode=eval_value:
+      max_diff=1.522219e+01, mean_diff=2.084295e+00, ref_range=[1.6738e-04,1.0000e+00], orig_range=[1.6738e-04,1.6222e+01]
+[53] policy=all_positive, seed=54, mode=eval_value:
+      max_diff=1.724928e+01, mean_diff=2.084021e+00, ref_range=[2.7961e-04,1.0000e+00], orig_range=[2.7961e-04,1.8249e+01]
+[54] policy=all_positive, seed=55, mode=eval_value:
+      max_diff=1.663095e+01, mean_diff=2.069936e+00, ref_range=[3.1880e-05,1.0000e+00], orig_range=[3.1880e-05,1.7631e+01]
+[55] policy=all_positive, seed=56, mode=eval_value:
+      max_diff=1.655031e+01, mean_diff=2.074694e+00, ref_range=[3.4073e-04,1.0000e+00], orig_range=[3.4073e-04,1.7550e+01]
+[56] policy=mixed_extremes, seed=57, mode=eval_value:
+      max_diff=1.621978e+03, mean_diff=1.420121e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6166e+03,1.6230e+03]
+[57] policy=mixed_extremes, seed=58, mode=eval_value:
+      max_diff=1.701404e+03, mean_diff=1.422704e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5822e+03,1.7024e+03]
+[58] policy=mixed_extremes, seed=59, mode=eval_value:
+      max_diff=1.621494e+03, mean_diff=1.419100e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5509e+03,1.6225e+03]
+[59] policy=mixed_extremes, seed=60, mode=eval_value:
+      max_diff=1.643363e+03, mean_diff=1.415842e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4723e+03,1.6444e+03]
+[60] policy=mixed_extremes, seed=61, mode=eval_value:
+      max_diff=1.855544e+03, mean_diff=1.420074e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5080e+03,1.8565e+03]
+[61] policy=alternating_sign, seed=62, mode=eval_value:
+      max_diff=1.472616e+01, mean_diff=2.080229e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5726e+01,1.5592e+01]
+[62] policy=alternating_sign, seed=63, mode=eval_value:
+      max_diff=1.593814e+01, mean_diff=2.080433e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6938e+01,1.6447e+01]
+[63] policy=alternating_sign, seed=64, mode=eval_value:
+      max_diff=1.501741e+01, mean_diff=2.079498e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5835e+01,1.6017e+01]
+[64] policy=alternating_sign, seed=65, mode=eval_value:
+      max_diff=1.472205e+01, mean_diff=2.077605e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5722e+01,1.5042e+01]
+[65] policy=uniform_constant, seed=67, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[66] policy=uniform_constant, seed=68, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[67] policy=uniform_constant, seed=69, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[68] policy=uniform_constant, seed=70, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[69] policy=uniform_constant, seed=71, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[70] policy=head_heavy, seed=72, mode=eval_value:
+      max_diff=1.739014e+03, mean_diff=7.098680e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4071e+03,1.7400e+03]
+[71] policy=head_heavy, seed=73, mode=eval_value:
+      max_diff=1.643704e+03, mean_diff=7.087524e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6447e+03,1.5354e+03]
+[72] policy=head_heavy, seed=74, mode=eval_value:
+      max_diff=1.558668e+03, mean_diff=7.057886e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5597e+03,1.4446e+03]
+[73] policy=head_heavy, seed=75, mode=eval_value:
+      max_diff=1.545319e+03, mean_diff=7.123524e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4840e+03,1.5463e+03]
+[74] policy=head_heavy, seed=76, mode=eval_value:
+      max_diff=1.660258e+03, mean_diff=7.149905e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5394e+03,1.6613e+03]
+[75] policy=tail_heavy, seed=77, mode=eval_value:
+      max_diff=1.731474e+03, mean_diff=7.125321e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.7325e+03,1.6309e+03]
+[76] policy=tail_heavy, seed=78, mode=eval_value:
+      max_diff=1.501489e+03, mean_diff=7.074231e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5025e+03,1.4844e+03]
+[77] policy=tail_heavy, seed=79, mode=eval_value:
+      max_diff=1.464255e+03, mean_diff=7.075557e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4653e+03,1.4560e+03]
+[78] policy=tail_heavy, seed=80, mode=eval_value:
+      max_diff=1.549141e+03, mean_diff=7.125096e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5140e+03,1.5501e+03]
+[79] policy=tail_heavy, seed=81, mode=eval_value:
+      max_diff=1.530064e+03, mean_diff=7.137814e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5311e+03,1.4587e+03]
+[80] policy=extreme_magnitude, seed=87, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[81] policy=extreme_magnitude, seed=88, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[82] policy=extreme_magnitude, seed=89, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[83] policy=reduction_adversarial, seed=99, mode=eval_value:
+      max_diff=3.561454e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[84] policy=reduction_adversarial, seed=100, mode=eval_value:
+      max_diff=3.561455e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[85] policy=reduction_adversarial, seed=101, mode=eval_value:
+      max_diff=3.561456e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[86] policy=init_sensitive, seed=102, mode=eval_value:
+      max_diff=1.506228e+01, mean_diff=2.074298e+00, ref_range=[-1.0000e+00,-3.1418e-04], orig_range=[-1.6062e+01,-3.1418e-04]
+[87] policy=init_sensitive, seed=103, mode=eval_value:
+      max_diff=1.586695e+01, mean_diff=2.083051e+00, ref_range=[5.8924e-04,1.0000e+00], orig_range=[5.8924e-04,1.6867e+01]
+[88] policy=init_sensitive, seed=104, mode=eval_value:
+      max_diff=1.502523e+01, mean_diff=2.074190e+00, ref_range=[6.3007e-04,1.0000e+00], orig_range=[6.3007e-04,1.6025e+01]
+[89] policy=init_sensitive, seed=105, mode=eval_value:
+      max_diff=1.665228e+01, mean_diff=2.076265e+00, ref_range=[-1.0000e+00,-1.9000e-04], orig_range=[-1.7652e+01,-1.9000e-04]
+[90] policy=init_sensitive, seed=106, mode=eval_value:
+      max_diff=1.521275e+01, mean_diff=2.079821e+00, ref_range=[-1.0000e+00,-4.3886e-04], orig_range=[-1.6213e+01,-4.3886e-04]
+[91] policy=sparse_extreme, seed=112, mode=eval_value:
+      max_diff=1.273177e+03, mean_diff=2.733914e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.1177e+03,1.2742e+03]
+[92] policy=sparse_extreme, seed=113, mode=eval_value:
+      max_diff=1.363225e+03, mean_diff=2.829249e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.3642e+03,1.0593e+03]
+[93] policy=sparse_extreme, seed=114, mode=eval_value:
+      max_diff=1.280784e+03, mean_diff=2.818676e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2818e+03,1.2621e+03]
+[94] policy=sparse_extreme, seed=115, mode=eval_value:
+      max_diff=1.281184e+03, mean_diff=2.866882e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2822e+03,1.2031e+03]
+[95] policy=sparse_extreme, seed=116, mode=eval_value:
+      max_diff=1.216396e+03, mean_diff=2.713156e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2042e+03,1.2174e+03]
+[96] policy=all_negative, seed=57, mode=eval_value:
+      max_diff=1.525064e+01, mean_diff=2.080162e+00, ref_range=[-1.0000e+00,-2.6392e-04], orig_range=[-1.6251e+01,-2.6392e-04]
+[97] policy=all_negative, seed=58, mode=eval_value:
+      max_diff=1.604392e+01, mean_diff=2.084087e+00, ref_range=[-1.0000e+00,-5.4149e-04], orig_range=[-1.7044e+01,-5.4149e-04]
+[98] policy=all_negative, seed=59, mode=eval_value:
+      max_diff=1.526691e+01, mean_diff=2.076984e+00, ref_range=[-1.0000e+00,-5.0790e-04], orig_range=[-1.6267e+01,-5.0790e-04]
+[99] policy=all_positive, seed=62, mode=eval_value:
+      max_diff=1.472616e+01, mean_diff=2.080229e+00, ref_range=[2.7001e-04,1.0000e+00], orig_range=[2.7001e-04,1.5726e+01]
+[100] policy=all_positive, seed=66, mode=eval_value:
+      max_diff=1.527965e+01, mean_diff=2.081536e+00, ref_range=[1.7865e-03,1.0000e+00], orig_range=[1.7865e-03,1.6280e+01]
+[101] policy=mixed_extremes, seed=67, mode=eval_value:
+      max_diff=1.817529e+03, mean_diff=1.420814e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5450e+03,1.8185e+03]
+[102] policy=mixed_extremes, seed=68, mode=eval_value:
+      max_diff=1.466600e+03, mean_diff=1.414308e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4613e+03,1.4676e+03]
+[103] policy=mixed_extremes, seed=69, mode=eval_value:
+      max_diff=1.563427e+03, mean_diff=1.418819e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.3760e+03,1.5644e+03]
+[104] policy=mixed_extremes, seed=70, mode=eval_value:
+      max_diff=1.621951e+03, mean_diff=1.418275e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5591e+03,1.6230e+03]
+[105] policy=mixed_extremes, seed=71, mode=eval_value:
+      max_diff=1.493493e+03, mean_diff=1.418468e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4945e+03,1.4787e+03]
+[106] policy=alternating_sign, seed=72, mode=eval_value:
+      max_diff=1.552818e+01, mean_diff=2.085396e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5597e+01,1.6528e+01]
+[107] policy=alternating_sign, seed=73, mode=eval_value:
+      max_diff=1.567575e+01, mean_diff=2.072380e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6501e+01,1.6676e+01]
+[108] policy=alternating_sign, seed=74, mode=eval_value:
+      max_diff=1.586430e+01, mean_diff=2.080849e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6864e+01,1.5479e+01]
+[109] policy=alternating_sign, seed=75, mode=eval_value:
+      max_diff=1.618331e+01, mean_diff=2.082593e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6626e+01,1.7183e+01]
+[110] policy=alternating_sign, seed=76, mode=eval_value:
+      max_diff=1.755637e+01, mean_diff=2.077044e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.8556e+01,1.5841e+01]
+[111] policy=uniform_constant, seed=77, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[112] policy=uniform_constant, seed=78, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[113] policy=uniform_constant, seed=79, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[114] policy=uniform_constant, seed=80, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[115] policy=uniform_constant, seed=81, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[116] policy=sparse_extreme, seed=42, mode=eval_value:
+      max_diff=1.451031e+03, mean_diff=2.918797e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2242e+03,1.4520e+03]
+[117] policy=sparse_extreme, seed=43, mode=eval_value:
+      max_diff=1.366025e+03, mean_diff=2.873620e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.3670e+03,1.3089e+03]
+[118] policy=sparse_extreme, seed=44, mode=eval_value:
+      max_diff=1.325113e+03, mean_diff=2.872948e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.3261e+03,1.2981e+03]
+[119] policy=sparse_extreme, seed=45, mode=eval_value:
+      max_diff=1.273913e+03, mean_diff=2.766415e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2749e+03,1.2604e+03]
+[120] policy=sparse_extreme, seed=46, mode=eval_value:
+      max_diff=1.227643e+03, mean_diff=2.925100e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.2210e+03,1.2286e+03]
+[121] policy=near_overflow, seed=47, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[122] policy=near_overflow, seed=48, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[123] policy=near_overflow, seed=49, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[124] policy=near_overflow, seed=50, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[125] policy=all_negative, seed=63, mode=eval_value:
+      max_diff=1.593814e+01, mean_diff=2.080433e+00, ref_range=[-1.0000e+00,-8.1263e-04], orig_range=[-1.6938e+01,-8.1263e-04]
+[126] policy=all_negative, seed=64, mode=eval_value:
+      max_diff=1.501741e+01, mean_diff=2.079498e+00, ref_range=[-1.0000e+00,-4.7903e-04], orig_range=[-1.6017e+01,-4.7903e-04]
+[127] policy=all_negative, seed=65, mode=eval_value:
+      max_diff=1.472205e+01, mean_diff=2.077605e+00, ref_range=[-1.0000e+00,-9.4177e-04], orig_range=[-1.5722e+01,-9.4177e-04]
+[128] policy=all_negative, seed=66, mode=eval_value:
+      max_diff=1.527965e+01, mean_diff=2.081536e+00, ref_range=[-1.0000e+00,-1.7865e-03], orig_range=[-1.6280e+01,-1.7865e-03]
+[129] policy=all_positive, seed=67, mode=eval_value:
+      max_diff=1.720391e+01, mean_diff=2.078859e+00, ref_range=[1.0727e-04,1.0000e+00], orig_range=[1.0727e-04,1.8204e+01]
+[130] policy=all_positive, seed=68, mode=eval_value:
+      max_diff=1.572007e+01, mean_diff=2.074012e+00, ref_range=[9.0065e-04,1.0000e+00], orig_range=[9.0065e-04,1.6720e+01]
+[131] policy=all_positive, seed=69, mode=eval_value:
+      max_diff=1.519902e+01, mean_diff=2.086579e+00, ref_range=[5.4895e-04,1.0000e+00], orig_range=[5.4895e-04,1.6199e+01]
+[132] policy=all_positive, seed=70, mode=eval_value:
+      max_diff=1.525037e+01, mean_diff=2.081460e+00, ref_range=[5.5240e-04,1.0000e+00], orig_range=[5.5240e-04,1.6250e+01]
+[133] policy=all_positive, seed=71, mode=eval_value:
+      max_diff=1.569921e+01, mean_diff=2.080872e+00, ref_range=[9.0677e-05,1.0000e+00], orig_range=[9.0677e-05,1.6699e+01]
+[134] policy=mixed_extremes, seed=72, mode=eval_value:
+      max_diff=1.556548e+03, mean_diff=1.419895e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5227e+03,1.5575e+03]
+[135] policy=mixed_extremes, seed=73, mode=eval_value:
+      max_diff=1.664542e+03, mean_diff=1.413740e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6480e+03,1.6655e+03]
+[136] policy=mixed_extremes, seed=74, mode=eval_value:
+      max_diff=1.683420e+03, mean_diff=1.418888e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5290e+03,1.6844e+03]
+[137] policy=mixed_extremes, seed=75, mode=eval_value:
+      max_diff=1.682427e+03, mean_diff=1.423930e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6606e+03,1.6834e+03]
+[138] policy=mixed_extremes, seed=76, mode=eval_value:
+      max_diff=1.852811e+03, mean_diff=1.421629e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.8538e+03,1.4456e+03]
+[139] policy=alternating_sign, seed=77, mode=eval_value:
+      max_diff=1.585356e+01, mean_diff=2.080781e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6854e+01,1.5170e+01]
+[140] policy=alternating_sign, seed=78, mode=eval_value:
+      max_diff=1.506601e+01, mean_diff=2.074735e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6066e+01,1.4843e+01]
+[141] policy=alternating_sign, seed=79, mode=eval_value:
+      max_diff=1.625441e+01, mean_diff=2.078931e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5431e+01,1.7254e+01]
+[142] policy=alternating_sign, seed=80, mode=eval_value:
+      max_diff=1.947119e+01, mean_diff=2.084544e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-2.0471e+01,1.5601e+01]
+[143] policy=alternating_sign, seed=81, mode=eval_value:
+      max_diff=1.589800e+01, mean_diff=2.074069e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6898e+01,1.6515e+01]
+[144] policy=uniform_constant, seed=82, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[145] policy=uniform_constant, seed=83, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[146] policy=uniform_constant, seed=84, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[147] policy=uniform_constant, seed=85, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[148] policy=uniform_constant, seed=86, mode=eval_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[149] policy=extreme_magnitude, seed=93, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[150] policy=extreme_magnitude, seed=94, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[151] policy=extreme_magnitude, seed=95, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[152] policy=extreme_magnitude, seed=96, mode=eval_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[153] policy=reduction_adversarial, seed=102, mode=eval_value:
+      max_diff=3.561454e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[154] policy=reduction_adversarial, seed=103, mode=eval_value:
+      max_diff=3.561455e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[155] policy=reduction_adversarial, seed=104, mode=eval_value:
+      max_diff=3.561454e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[156] policy=reduction_adversarial, seed=105, mode=eval_value:
+      max_diff=3.561454e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[157] policy=reduction_adversarial, seed=106, mode=eval_value:
+      max_diff=3.561454e+02, mean_diff=3.561438e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-3.5715e+02,3.5715e+02]
+[158] policy=init_sensitive, seed=107, mode=eval_value:
+      max_diff=1.690985e+01, mean_diff=2.078577e+00, ref_range=[3.1013e-04,1.0000e+00], orig_range=[3.1013e-04,1.7910e+01]
+[159] policy=init_sensitive, seed=108, mode=eval_value:
+      max_diff=1.513646e+01, mean_diff=2.082974e+00, ref_range=[1.6866e-04,1.0000e+00], orig_range=[1.6866e-04,1.6136e+01]
+[160] policy=init_sensitive, seed=109, mode=eval_value:
+      max_diff=1.504056e+01, mean_diff=2.086118e+00, ref_range=[2.9156e-05,1.0000e+00], orig_range=[2.9156e-05,1.6041e+01]
+[161] policy=init_sensitive, seed=110, mode=eval_value:
+      max_diff=1.536664e+01, mean_diff=2.081798e+00, ref_range=[4.1431e-04,1.0000e+00], orig_range=[4.1431e-04,1.6367e+01]
+[162] policy=init_sensitive, seed=111, mode=eval_value:
+      max_diff=1.522511e+01, mean_diff=2.078362e+00, ref_range=[1.1542e-03,1.0000e+00], orig_range=[1.1542e-03,1.6225e+01]
+[163] policy=head_heavy, seed=84, mode=eval_value:
+      max_diff=1.546943e+03, mean_diff=7.093481e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5479e+03,1.4574e+03]
+[164] policy=head_heavy, seed=85, mode=eval_value:
+      max_diff=1.515222e+03, mean_diff=7.087449e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5162e+03,1.5028e+03]
+[165] policy=head_heavy, seed=86, mode=eval_value:
+      max_diff=1.516495e+03, mean_diff=7.063637e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5175e+03,1.4469e+03]
+[166] policy=tail_heavy, seed=87, mode=eval_value:
+      max_diff=1.705134e+03, mean_diff=7.091290e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5032e+03,1.7061e+03]
+[167] policy=tail_heavy, seed=88, mode=eval_value:
+      max_diff=1.545791e+03, mean_diff=7.124825e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5283e+03,1.5468e+03]
+[168] policy=tail_heavy, seed=89, mode=eval_value:
+      max_diff=1.548654e+03, mean_diff=7.080743e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4588e+03,1.5497e+03]
+[169] policy=tail_heavy, seed=90, mode=eval_value:
+      max_diff=1.603746e+03, mean_diff=7.103862e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5337e+03,1.6047e+03]
+[170] policy=tail_heavy, seed=91, mode=eval_value:
+      max_diff=1.565519e+03, mean_diff=7.056564e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5483e+03,1.5665e+03]
+[171] policy=large_magnitude, seed=342, mode=train_value:
+      max_diff=1.664859e+02, mean_diff=2.752882e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6344e+02,1.6749e+02]
+[172] policy=large_magnitude, seed=343, mode=train_value:
+      max_diff=1.746773e+02, mean_diff=2.754828e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6386e+02,1.7568e+02]
+[173] policy=large_magnitude, seed=344, mode=train_value:
+      max_diff=1.709156e+02, mean_diff=2.750094e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6372e+02,1.7192e+02]
+[174] policy=mixed_extremes, seed=345, mode=train_value:
+      max_diff=1.565833e+03, mean_diff=1.421504e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5668e+03,1.5483e+03]
+[175] policy=mixed_extremes, seed=346, mode=train_value:
+      max_diff=1.723573e+03, mean_diff=1.421294e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.7114e+03,1.7246e+03]
+[176] policy=mixed_extremes, seed=347, mode=train_value:
+      max_diff=1.516963e+03, mean_diff=1.426100e+02, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4678e+03,1.5180e+03]
+[177] policy=near_overflow, seed=351, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[178] policy=near_overflow, seed=352, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[179] policy=near_overflow, seed=353, mode=train_value:
+      max_diff=nan, mean_diff=nan, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[nan,nan]
+[180] policy=all_negative, seed=360, mode=train_value:
+      max_diff=1.541850e+01, mean_diff=2.074641e+00, ref_range=[-1.0000e+00,-7.8893e-04], orig_range=[-1.6418e+01,-7.8893e-04]
+[181] policy=all_negative, seed=361, mode=train_value:
+      max_diff=1.589605e+01, mean_diff=2.077693e+00, ref_range=[-1.0000e+00,-3.2775e-05], orig_range=[-1.6896e+01,-3.2775e-05]
+[182] policy=all_negative, seed=362, mode=train_value:
+      max_diff=1.700270e+01, mean_diff=2.071061e+00, ref_range=[-1.0000e+00,-3.8159e-04], orig_range=[-1.8003e+01,-3.8159e-04]
+[183] policy=all_positive, seed=363, mode=train_value:
+      max_diff=1.455773e+01, mean_diff=2.084636e+00, ref_range=[7.7436e-05,1.0000e+00], orig_range=[7.7436e-05,1.5558e+01]
+[184] policy=all_positive, seed=364, mode=train_value:
+      max_diff=1.582655e+01, mean_diff=2.080127e+00, ref_range=[1.2084e-04,1.0000e+00], orig_range=[1.2084e-04,1.6827e+01]
+[185] policy=all_positive, seed=365, mode=train_value:
+      max_diff=1.534030e+01, mean_diff=2.074395e+00, ref_range=[4.4847e-04,1.0000e+00], orig_range=[4.4847e-04,1.6340e+01]
+[186] policy=alternating_sign, seed=366, mode=train_value:
+      max_diff=1.630672e+01, mean_diff=2.075847e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6846e+01,1.7307e+01]
+[187] policy=alternating_sign, seed=367, mode=train_value:
+      max_diff=1.626594e+01, mean_diff=2.070652e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.7266e+01,1.5159e+01]
+[188] policy=alternating_sign, seed=368, mode=train_value:
+      max_diff=1.525506e+01, mean_diff=2.080733e+00, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5764e+01,1.6255e+01]
+[189] policy=sparse, seed=369, mode=train_value:
+      max_diff=1.432111e+01, mean_diff=2.079119e-01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5056e+01,1.5321e+01]
+[190] policy=sparse, seed=370, mode=train_value:
+      max_diff=1.515378e+01, mean_diff=2.060010e-01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.6154e+01,1.4887e+01]
+[191] policy=sparse, seed=371, mode=train_value:
+      max_diff=1.369460e+01, mean_diff=2.138439e-01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4165e+01,1.4695e+01]
+[192] policy=uniform_constant, seed=372, mode=train_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[193] policy=uniform_constant, seed=373, mode=train_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[194] policy=uniform_constant, seed=374, mode=train_value:
+      max_diff=2.249843e+00, mean_diff=2.249843e+00, ref_range=[1.0000e+00,1.0000e+00], orig_range=[3.2498e+00,3.2498e+00]
+[195] policy=boundary_last_element, seed=378, mode=train_value:
+      max_diff=3.561438e+02, mean_diff=1.358620e-03, ref_range=[-9.9982e-01,1.0000e+00], orig_range=[-9.9988e-01,3.5714e+02]
+[196] policy=boundary_last_element, seed=379, mode=train_value:
+      max_diff=3.561438e+02, mean_diff=1.358620e-03, ref_range=[-9.9983e-01,1.0000e+00], orig_range=[-9.9990e-01,3.5714e+02]
+[197] policy=boundary_last_element, seed=380, mode=train_value:
+      max_diff=3.561438e+02, mean_diff=1.358619e-03, ref_range=[-9.9964e-01,1.0000e+00], orig_range=[-9.9967e-01,3.5714e+02]
+[198] policy=head_heavy, seed=381, mode=train_value:
+      max_diff=1.494250e+03, mean_diff=7.068077e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4884e+03,1.4953e+03]
+[199] policy=head_heavy, seed=382, mode=train_value:
+      max_diff=1.578383e+03, mean_diff=7.105869e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.5069e+03,1.5794e+03]
+[200] policy=head_heavy, seed=383, mode=train_value:
+      max_diff=1.515958e+03, mean_diff=7.112605e+01, ref_range=[-1.0000e+00,1.0000e+00], orig_range=[-1.4521e+03,1.5170e+03]
+  ... (57 more cases omitted; same policies/distributions as above)
+
+────────────────────────────────────────────────────────────────────────────
+## 4. Validation criteria you must satisfy
+
+- **V_stress** (on the N failing inputs above):
+      torch.allclose(ref_out, new_out, atol=1e-2, rtol=1e-2)
+      AND new_out is NaN/Inf-free
+      → must pass on EVERY one of the N inputs
+
+- **V_kb** (KernelBench default `get_inputs()` across 5 random seeds):
+      torch.allclose(ref_out, new_out, atol=1e-3, rtol=1e-3)
+      → must pass on EVERY one of the 5 seeds
+      (prevents regression on the standard test)
+
+────────────────────────────────────────────────────────────────────────────
+## 5. Your task
+
+Regenerate a strengthened `ModelNew` so that:
+  1. The class name `ModelNew` and its `__init__` / `forward` signatures
+     remain identical to the buggy kernel above.
+  2. All N failing inputs above produce outputs matching the reference under
+     `atol=1e-2, rtol=1e-2` (V_stress).
+  3. The 5 default KernelBench seeds still pass (V_kb).
+  4. Performance characteristics are preserved where possible (do not collapse
+     to a trivial pure-PyTorch implementation unless absolutely necessary).
+
+Output ONLY a single fenced ```python``` code block containing the complete,
+self-contained, executable kernel source (imports + load_inline + ModelNew).
+Do NOT include any prose, explanation, or commentary outside the code block.

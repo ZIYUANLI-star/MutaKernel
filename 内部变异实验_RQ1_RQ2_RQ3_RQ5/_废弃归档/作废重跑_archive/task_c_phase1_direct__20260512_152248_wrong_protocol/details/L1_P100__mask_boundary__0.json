@@ -1,0 +1,75 @@
+{
+  "mutant_id": "L1_P100__mask_boundary__0",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P100",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3136,
+        "completion_tokens": 2103,
+        "total_tokens": 5239,
+        "reasoning_tokens": 753
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "Input shape [128,1] → size=128 after view(-1). Launch: 1 block of 256 threads. idx ranges 0-255, but only idx<128 processes data. Original: idx<128 includes idx=127 (last element). Mutated: idx<127 excludes idx=127. The last element at index 127 is never processed by the mutant.",
+      "survival_reason": "The mutation changes the boundary condition from `idx < size` to `idx < size - 1`. With size=128, the original processes indices 0-127, while the mutant processes indices 0-126. This means the mutant skips the last element (index 127) of the flattened input tensor. If the last element contributes a non-zero hinge loss, the mutant will compute a different (smaller) sum, while still dividing by the full size (128). This creates a measurable and bitwise-different output when the last element has a non-zero hinge loss contribution.",
+      "killable": true,
+      "kill_strategy": "Construct inputs where only the last element (index 127) has a non-zero hinge loss. Set first 127 elements with pred*target >= 1 (zero loss), and last element with pred*target < 1 (positive loss). Original computes correct mean, mutant returns 0/128=0.",
+      "recommendations": "Mutation testing for boundary conditions should always include test cases that specifically exercise the last valid index. For reduction kernels, design tests where boundary elements contribute non-trivially to verify complete coverage.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.full((128, 1), 2.0, dtype=torch.float32, device=device)\n    predictions[127, 0] = 0.0  # Last element will contribute hinge loss of 1.0\n    targets = torch.ones((128, 1), dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 3078,
+        "completion_tokens": 3734,
+        "total_tokens": 6812,
+        "reasoning_tokens": 1599
+      },
+      "reason_category": "infection_no_propagation",
+      "proof_sketch": "With predictions=0 and targets=1 for all 128 elements, each element contributes loss=max(0, 1-0*1)=1.0. Original sums 128 elements → 128.0, mean=1.0. Mutant skips index 127, sums 127 elements → 127.0, mean=127/128=0.9921875. Bitwise difference guaranteed.",
+      "survival_reason": "The previous attempt set only the last element to have non-zero loss (0.0 * 1.0 = 0, margin = 1), but this created a small 1/128 difference. There may have been a floating-point comparison edge case or an issue with how the test was structured. By making ALL elements contribute uniform loss of 1.0, the mutant's omission of the last element results in a clearly distinguishable mean: 1.0 (original) vs 0.9921875 (mutant). This uniform contribution pattern eliminates any possibility of the difference being masked.",
+      "killable": true,
+      "kill_strategy": "Set all predictions to 0.0 and all targets to 1.0, so every element has hinge loss = 1.0. The mutant skips the last element, giving sum=127 instead of sum=128, resulting in mean=0.9921875 vs mean=1.0.",
+      "recommendations": "When testing boundary mutations that skip the last element, use uniform non-zero contributions across all elements to ensure the skipped element's absence clearly affects the aggregate result, avoiding edge cases where sparse contributions might be masked.",
+      "suggested_code": "def generate_inputs(device):\n    predictions = torch.zeros((128, 1), dtype=torch.float32, device=device)\n    targets = torch.ones((128, 1), dtype=torch.float32, device=device)\n    return [predictions, targets]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "error": "Bedrock invoke_model failed in 312345 ms: Read timeout on endpoint URL: \"https://bedrock-runtime.us-west-2.amazonaws.com/model/us.anthropic.claude-opus-4-5-20251101-v1%3A0/invoke\"",
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 444.61
+}

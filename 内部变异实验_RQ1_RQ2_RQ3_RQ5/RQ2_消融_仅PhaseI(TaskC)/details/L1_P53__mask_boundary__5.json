@@ -1,0 +1,143 @@
+{
+  "mutant_id": "L1_P53__mask_boundary__5",
+  "operator_name": "mask_boundary",
+  "kernel_name": "L1_P53",
+  "phase1_status": "survived",
+  "executed": true,
+  "trigger": "task_c_phase1_direct_opus45",
+  "max_rounds": 5,
+  "rounds": [
+    {
+      "round": 1,
+      "prompt_type": "ANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6124,
+        "completion_tokens": 4105,
+        "total_tokens": 10229,
+        "reasoning_tokens": 1445
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "When row=[1.0, 0.0, 0.0...], original finds min=0.0 but mutant keeps thread_min=1.0 because 0.0 < 1.0-1 = 0.0 is false. Difference of 1.0 >> tolerance.",
+      "survival_reason": "The 112 random test rounds used continuous random distributions where values differing by exactly 1.0 are astronomically unlikely. The mutation specifically fails when a value equals thread_min - 1 exactly. Standard random testing with continuous distributions has near-zero probability of generating such precise relationships, explaining why all rounds passed despite the semantic difference.",
+      "killable": true,
+      "kill_strategy": "Set first column to V+1 and all other columns to V. When processing dim=2, the mutant will see V+1 first, then fail to update when seeing V because V < (V+1)-1 = V is false.",
+      "recommendations": "When testing min/max reduction kernels with boundary mutations, include adversarial patterns where consecutive values differ by the exact mutation delta (here, 1.0). Random continuous distributions miss such edge cases.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 256, 256] - testing dim=2 reduction\n    # First column = 1.0, rest = 0.0\n    # Original min along dim2 = 0.0\n    # Mutant min along dim2 = 1.0 (fails to capture 0.0)\n    x = torch.zeros(16, 256, 256, device=device, dtype=torch.float32)\n    x[:, :, 0] = 1.0  # First element of each row is 1.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 2,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6023,
+        "completion_tokens": 5051,
+        "total_tokens": 11074,
+        "reasoning_tokens": 2211
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation changes `val < thread_min` to `val < thread_min - 1` in min_reduction_dim2_kernel. For the bug to manifest: need `thread_min - 1 <= val < thread_min`, i.e., val is exactly 1.0 less than current minimum. With first col=V and rest=V-1, original finds V-1, mutant returns V since (V-1) < (V-1) is false.",
+      "survival_reason": "The previous attempt used values 1.0 and 0.0 (difference of 1.0). This should trigger the bug where the mutant fails to update thread_min when seeing 0.0 because 0.0 < (1.0-1)=0.0 is false. The test may have failed if the model was configured with dim≠2 (the only dimension with the mutation), or if there was an issue with how the test was executed. Using a different value pattern with explicit V and V-1 values (like 100.0 and 99.0) ensures the mutation condition is clearly triggered and the numerical difference (1.0) significantly exceeds the tolerance threshold even for moderate reference values.",
+      "killable": true,
+      "kill_strategy": "Use values where the first column equals V and all remaining columns equal V-1 (exactly 1.0 less). The mutant's condition `val < thread_min - 1` becomes `(V-1) < (V-1)` which is false, so it keeps V. Original correctly finds V-1. Using V=100.0 and V-1=99.0 gives reference=99.0 and mutant=100.0, difference=1.0 >> atol+rtol*99=0.01+0.99=1.0.",
+      "recommendations": "When testing min/max reduction kernels with boundary mutations, use explicit integer-like float values (e.g., 100.0 and 99.0) that are exactly 1.0 apart to clearly trigger off-by-one comparison bugs. Also ensure test coverage includes verification that the correct reduction dimension kernel is being invoked.",
+      "suggested_code": "def generate_inputs(device):\n    # Create tensor where first column = 100.0, rest = 99.0\n    # For dim=2 reduction: original min = 99.0, mutant min = 100.0\n    # The mutant fails because 99.0 < (100.0 - 1) = 99.0 is FALSE\n    x = torch.full((16, 256, 256), 99.0, device=device, dtype=torch.float32)\n    x[:, :, 0] = 100.0  # First element along dim2 is 100.0\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 3,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6354,
+        "completion_tokens": 6435,
+        "total_tokens": 12789,
+        "reasoning_tokens": 2564
+      },
+      "reason_category": "value_insensitive",
+      "proof_sketch": "For tolerance atol=0.01, rtol=0.01: when ref=0.5, tolerance=0.01+0.005=0.015. Mutant outputs 2.0 (first element), original outputs 0.5. Difference=1.5 >> 0.015. This exceeds tolerance by ~100x.",
+      "survival_reason": "Round 2 failed because with V=99, tolerance=1.0 exactly equals the difference of 1.0 (100-99). Round 1 likely failed due to dim!=2 being tested, or a subtle test framework issue. By using a larger value gap (1.5 instead of 1.0) AND smaller base values (0.5), the difference far exceeds the tolerance threshold. Using 2.0 as first value and 0.5 elsewhere gives diff=1.5 with tolerance≈0.015.",
+      "killable": true,
+      "kill_strategy": "Use first column value = 2.0 and all other columns = 0.5. The mutant condition (0.5 < 2.0-1 = 1.0) is TRUE so mutant DOES update. Need to use first=1.5, rest=0.5 so (0.5 < 1.5-1=0.5) is FALSE. Difference=1.0 with tolerance=0.015 clearly kills.",
+      "recommendations": "When testing boundary mutations involving arithmetic offsets like '-1', ensure test values create differences that exceed tolerance by a significant margin (2x-10x), not just at the boundary. Small base values maximize relative error detection.",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 256, 256] - testing dim=2 reduction\n    # First column = 1.5, rest = 0.5\n    # Original: 0.5 < 1.5? YES -> min = 0.5\n    # Mutant: 0.5 < 1.5-1=0.5? NO -> min = 1.5\n    # Difference = 1.0, tolerance = 0.01 + 0.01*0.5 = 0.015\n    # 1.0 >> 0.015 -> KILLED\n    x = torch.full((16, 256, 256), 0.5, device=device, dtype=torch.float32)\n    x[:, :, 0] = 1.5  # First element along dim2\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 4,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 6722,
+        "completion_tokens": 4103,
+        "total_tokens": 10825,
+        "reasoning_tokens": 1692
+      },
+      "reason_category": "path_not_triggered",
+      "proof_sketch": "The mutation is in min_reduction_dim2_kernel which only executes when dim=2. Previous tests show bitwise equivalence across 112 rounds, suggesting the test framework may be using dim=1 (not dim=2). If dim=2 IS being used, the condition val < thread_min-1 creates a gap [thread_min-1, thread_min) where updates are skipped. For first_val=V, subsequent val=V-1 gives: original (V-1 < V) TRUE, mutant (V-1 < V-1) FALSE.",
+      "survival_reason": "All three previous rounds used patterns that should theoretically distinguish the mutant if dim=2 kernel runs: Round 1 (1.0 first, 0.0 rest), Round 2 (100.0 first, 99.0 rest), Round 3 (1.5 first, 0.5 rest). All failed, suggesting either: (1) the testing framework uses dim!=2 so the mutated kernel never executes, or (2) there's a subtle issue with the test harness. I'll try negative values with a 1.0 gap, as negative arithmetic may behave differently and using values far from FLT_MAX eliminates any floating-point representation concerns at extreme magnitudes.",
+      "killable": true,
+      "kill_strategy": "Use negative values where first column equals -1.0 and all other columns equal -2.0. When processing dim=2: thread_min starts at FLT_MAX, first value -1.0 updates it. For subsequent -2.0 values: original (-2.0 < -1.0) TRUE updates to -2.0, mutant (-2.0 < -2.0) FALSE keeps -1.0. Output difference = 1.0 exceeds tolerance of ~0.03.",
+      "recommendations": "Mutation testing frameworks should explicitly document which model configurations (like dim parameter) are tested, and ensure all code paths with mutations are exercised. For min-reduction kernels, the comparison condition should be covered by test cases that systematically probe values exactly at the boundary thresholds (val == thread_min - epsilon for various epsilon).",
+      "suggested_code": "def generate_inputs(device):\n    # Shape: [16, 256, 256] - testing dim=2 reduction\n    # First column = -1.0, rest = -2.0\n    # Original: sees -1.0 first, then -2.0 < -1.0 TRUE -> min = -2.0\n    # Mutant: sees -1.0 first, then -2.0 < -2.0 FALSE -> min = -1.0\n    # Difference = 1.0, tolerance = 0.01 + 0.01*|-2.0| = 0.03\n    x = torch.full((16, 256, 256), -2.0, device=device, dtype=torch.float32)\n    x[:, :, 0] = -1.0  # First element along dim2\n    return [x]",
+      "execution_result": {
+        "killed": false,
+        "ref_ok": true,
+        "original_ok": true,
+        "mutant_ok": true,
+        "diff_summary": "",
+        "error": ""
+      },
+      "killed": false
+    },
+    {
+      "round": 5,
+      "prompt_type": "REANALYSIS_PROMPT_C",
+      "model": "claude-opus-4-5-20251101",
+      "usage": {
+        "prompt_tokens": 7096,
+        "completion_tokens": 4124,
+        "total_tokens": 11220,
+        "reasoning_tokens": 1734
+      },
+      "reason_category": "requires_config_change",
+      "proof_sketch": "The mutation is in `min_reduction_dim2_kernel` (line 62), which is ONLY invoked when `dim=2` is passed to the model constructor. All previous input-value attempts correctly constructed patterns that would expose the mutation (e.g., first col = 1.5, rest = 0.5: original returns 0.5, mutant returns 1.5). However, these failed because the model's `dim` parameter (fixed at initialization) is not set to 2, meaning the mutated kernel `min_reduction_dim2_kernel` is never executed regardless of input values.",
+      "survival_reason": "All four previous attempts designed correct value patterns for the dim2 kernel mutation: setting first column to V and remaining columns to V-1 such that (V-1) < V-1 is false. For example, Round 3's {1.5, 0.5} pattern should yield ref=0.5 vs mutant=1.5 (difference=1.0 >> tolerance=0.015). Round 4's {-1.0, -2.0} should yield ref=-2.0 vs mutant=-1.0. These patterns correctly target the mutated condition `val < thread_min - 1`. The consistent failure across multiple mathematically-sound attempts indicates the dim2_kernel code path is unreachable because the model's `dim` initialization parameter is fixed to a value other than 2 (likely dim=1 based on common patterns). Since only input VALUES can change (not model initialization), the mutated code is never executed.",
+      "killable": false,
+      "kill_strategy": "The mutation is unkillable through value changes alone. The mutated code resides in `min_reduction_dim2_kernel`, which requires `ModelNew(dim=2)` to be instantiated. The test framework appears to initialize the model with dim!=2 (likely dim=1), causing `min_reduction_dim1_kernel` to execute instead. Killing this mutant requires changing the model's initialization parameter `dim` to 2.",
+      "recommendations": "Mutation testing frameworks should ensure all kernel variants are exercised by varying initialization parameters. For multi-kernel implementations selected by constructor arguments, test coverage requires: (1) testing each kernel variant separately with appropriate initialization, and (2) ensuring mutations in each variant have a corresponding test configuration that exercises that code path.",
+      "suggested_code": "",
+      "execution_result": null,
+      "killed": false
+    }
+  ],
+  "killed": false,
+  "killing_round": 0,
+  "model_id": "claude-opus-4-5-20251101",
+  "elapsed_sec": 425.93
+}

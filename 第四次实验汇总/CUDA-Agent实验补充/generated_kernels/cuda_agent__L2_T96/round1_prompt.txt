@@ -1,0 +1,315 @@
+You are a GPU kernel expert specializing in CUDA/Triton and numerical computing.
+The following optimized PyTorch/CUDA kernel passes basic correctness tests but
+fails enhanced numerical stress tests that expose numerical instability.
+
+## Reference Implementation (correct behavior)
+```python
+import torch
+import torch.nn as nn
+
+class Model(nn.Module):
+    """
+    A model that performs a GEMM, BiasAdd, Hardtanh, Mish, and GroupNorm operations in sequence.
+    """
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(Model, self).__init__()
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(bias_shape))
+        self.hardtanh = nn.Hardtanh()
+        self.mish = nn.Mish()
+        self.groupnorm = nn.GroupNorm(num_groups=num_groups, num_channels=out_features)
+
+    def forward(self, x):
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, out_features).
+        """
+        x = self.gemm(x)
+        x = x + self.bias
+        x = self.hardtanh(x)
+        x = self.mish(x)
+        x = self.groupnorm(x)
+        return x
+
+
+batch_size = 1024
+in_features = 8192
+out_features = 8192
+bias_shape = (out_features,)
+num_groups = 256
+
+def get_inputs():
+    return [torch.rand(batch_size, in_features)]
+
+def get_init_inputs():
+    return [in_features, out_features, bias_shape, num_groups]
+```
+
+## Buggy Optimized Kernel (needs fixing)
+```python
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+_cuda_sources = """
+// === fused_all_after_gemm.cu ===
+#include <cuda_runtime.h>
+
+__device__ __forceinline__ float mish_activation(float x) {
+    float exp_val = exp(x);
+    float log_val = log1pf(exp_val);  // log1p is log(1 + x)
+    float tanh_val = tanh(log_val);
+    return x * tanh_val;
+}
+
+__global__ void fused_all_after_gemm_kernel(float* output, const float* input, const float* gemm_bias,
+                                            const float* extra_bias, const float* gn_gamma, const float* gn_beta) {
+    __shared__ float sum_val[128];
+    __shared__ float sq_sum_val[128];
+    
+    int idx = threadIdx.x;
+    int block = blockIdx.x;
+    
+    int batch_size = 1024;
+    int features = 8192;
+    int num_groups = 256;
+    int group_size = features / num_groups;
+    
+    int batch = block / num_groups;
+    int group = block % num_groups;
+    
+    float sum = 0.0f;
+    float sq_sum = 0.0f;
+    
+    // Step 1: Compute all operations for this block's group and accumulate sum/sq_sum
+    for (int i = idx; i < group_size; i += 128) {
+        int feature = group * group_size + i;
+        int linear_idx = batch * features + feature;
+        
+        float x_val = input[linear_idx];  // This is the output of the linear layer (matmul without bias)
+        x_val += gemm_bias[feature];      // First bias (from linear layer)
+        x_val += extra_bias[feature];     // Second bias
+        
+        // Hardtanh and Mish
+        x_val = max(-1.0f, min(1.0f, x_val));
+        float exp_val = exp(x_val);
+        float log_val = log1pf(exp_val);
+        float tanh_val = tanh(log_val);
+        x_val *= tanh_val;
+        
+        // Accumulate for mean and variance
+        sum += x_val;
+        sq_sum += x_val * x_val;
+    }
+    
+    sum_val[idx] = sum;
+    sq_sum_val[idx] = sq_sum;
+    __syncthreads();
+    
+    // Step 2: Reduce sum and sq_sum across threads in the block
+    for (int i = 64; i > 0; i >>= 1) {
+        if (idx < i) {
+            sum_val[idx] += sum_val[idx + i];
+            sq_sum_val[idx] += sq_sum_val[idx + i];
+        }
+        __syncthreads();
+    }
+    
+    float inv_n = 1.0f / group_size;
+    float mean = sum_val[0] * inv_n;
+    float var = (sq_sum_val[0] * inv_n - mean * mean);
+    float inv_std = rsqrt(var + 1e-5f);
+    __syncthreads();
+    
+    // Step 3: Normalize each element in the group
+    for (int i = idx; i < group_size; i += 128) {
+        int feature = group * group_size + i;
+        int linear_idx = batch * features + feature;
+        
+        float x_val = input[linear_idx];
+        x_val += gemm_bias[feature];
+        x_val += extra_bias[feature];
+        
+        x_val = max(-1.0f, min(1.0f, x_val));
+        float exp_val = exp(x_val);
+        float log_val = log1pf(exp_val);
+        float tanh_val = tanh(log_val);
+        x_val *= tanh_val;
+        
+        float normalized_val = gn_gamma[feature] * (x_val - mean) * inv_std + gn_beta[feature];
+        output[linear_idx] = normalized_val;
+    }
+}
+
+extern "C" void fused_all_after_gemm_launcher(float* output, const float* input, const float* gemm_bias,
+                                              const float* extra_bias, const float* gn_gamma, const float* gn_beta) {
+    int blocks = 1024 * 256;  // batch_size * num_groups
+    fused_all_after_gemm_kernel<<<blocks, 128>>>(output, input, gemm_bias, extra_bias, gn_gamma, gn_beta);
+}
+
+"""
+
+_cpp_sources = """
+// === fused_all_after_gemm_binding.cpp ===
+#include <torch/types.h>
+#include <torch/csrc/utils/pybind.h>
+
+#include <cuda_runtime.h>
+#include <c10/cuda/CUDAStream.h>
+
+
+extern "C" void fused_all_after_gemm_launcher(float* output, const float* input, const float* gemm_bias,
+                                              const float* extra_bias, const float* gn_gamma, const float* gn_beta);
+
+torch::Tensor fused_all_after_gemm_forward(torch::Tensor input, torch::Tensor gemm_bias, torch::Tensor extra_bias, 
+                                          torch::Tensor gn_gamma, torch::Tensor gn_beta) {
+    TORCH_CHECK(input.is_cuda(), "Input must be a CUDA tensor");
+    TORCH_CHECK(input.is_contiguous(), "Input must be contiguous");
+    TORCH_CHECK(input.dtype() == torch::kFloat32, "Input must be float32");
+    
+    TORCH_CHECK(gemm_bias.is_cuda(), "GEMM bias must be a CUDA tensor");
+    TORCH_CHECK(gemm_bias.is_contiguous(), "GEMM bias must be contiguous");
+    TORCH_CHECK(gemm_bias.dtype() == torch::kFloat32, "GEMM bias must be float32");
+    
+    TORCH_CHECK(extra_bias.is_cuda(), "Extra bias must be a CUDA tensor");
+    TORCH_CHECK(extra_bias.is_contiguous(), "Extra bias must be contiguous");
+    TORCH_CHECK(extra_bias.dtype() == torch::kFloat32, "Extra bias must be float32");
+    
+    TORCH_CHECK(gn_gamma.is_cuda(), "GroupNorm gamma must be a CUDA tensor");
+    TORCH_CHECK(gn_gamma.is_contiguous(), "GroupNorm gamma must be contiguous");
+    TORCH_CHECK(gn_gamma.dtype() == torch::kFloat32, "GroupNorm gamma must be float32");
+    
+    TORCH_CHECK(gn_beta.is_cuda(), "GroupNorm beta must be a CUDA tensor");
+    TORCH_CHECK(gn_beta.is_contiguous(), "GroupNorm beta must be contiguous");
+    TORCH_CHECK(gn_beta.dtype() == torch::kFloat32, "GroupNorm beta must be float32");
+
+    auto output = torch::empty_like(input);
+
+    fused_all_after_gemm_launcher(
+        output.data_ptr<float>(),
+        input.data_ptr<float>(),
+        gemm_bias.data_ptr<float>(),
+        extra_bias.data_ptr<float>(),
+        gn_gamma.data_ptr<float>(),
+        gn_beta.data_ptr<float>()
+    );
+
+    return output;
+}
+
+void register_fused_all_after_gemm(pybind11::module& m) {
+    m.def("fused_all_after_gemm_forward", &fused_all_after_gemm_forward,
+          "Fused all operations after GEMM (bias, hardtanh, mish, groupnorm) forward",
+          py::arg("input"),
+          py::arg("gemm_bias"),
+          py::arg("extra_bias"),
+          py::arg("gn_gamma"),
+          py::arg("gn_beta"));
+}
+
+
+
+"""
+
+cuda_extension = load_inline(
+    name="cuda_extension",
+    cpp_sources=[_cpp_sources],
+    cuda_sources=[_cuda_sources],
+    functions=["fused_all_after_gemm_forward"],
+    verbose=False,
+    extra_cuda_cflags=["-O2"],
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that fuses all operations (Linear bias, additional bias, Hardtanh, Mish, and GroupNorm).
+    """
+    def __init__(self, in_features, out_features, bias_shape, num_groups):
+        super(ModelNew, self).__init__()
+        # Initialize parameters with names that match the original model
+        self.gemm = nn.Linear(in_features, out_features)
+        self.bias = nn.Parameter(torch.randn(out_features))
+        self.groupnorm = nn.GroupNorm(num_groups=num_groups, num_channels=out_features)
+        self.num_groups = num_groups
+
+    def load_state_dict(self, state_dict, strict=True):
+        # Map original state_dict to our parameters
+        new_state_dict = {}
+        for key, val in state_dict.items():
+            if key == 'gemm.weight':
+                new_state_dict['gemm.weight'] = val
+            elif key == 'gemm.bias':
+                new_state_dict['gemm.bias'] = val
+            elif key == 'bias':
+                new_state_dict['bias'] = val
+            elif key == 'groupnorm.weight':
+                new_state_dict['groupnorm.weight'] = val
+            elif key == 'groupnorm.bias':
+                new_state_dict['groupnorm.bias'] = val
+        super().load_state_dict(new_state_dict, strict=strict)
+
+    def forward(self, x):
+        # Enable TensorFloat32 for faster matrix multiplication
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Step 1: Linear layer - just the matmul part (no bias)
+        x = torch.matmul(x, self.gemm.weight.T)
+        
+        # Step 2: Fuse ALL operations - gemm bias, additional bias, hardtanh, mish, and groupnorm
+        x = cuda_extension.fused_all_after_gemm_forward(x, self.gemm.bias, self.bias, 
+                                                      self.groupnorm.weight, self.groupnorm.bias)
+        
+        # Disable TF32 for subsequent operations
+        torch.backends.cuda.matmul.allow_tf32 = False
+        
+        return x
+```
+
+## Test Failures (Round 1 input)
+Total discrepancies: 55
+Failing dimensions: value_stress, training_stress
+Tolerance used: atol=0.01, rtol=0.01
+
+### value_stress (28 failures)
+  - [large_magnitude seed=50000] max_diff=9.687044e-01, mean_diff=3.736525e-04, ref_range=[-3.1090e+00,2.6457e+00], orig_range=[-3.1090e+00,2.6457e+00]
+  - [large_magnitude seed=50001] max_diff=9.645610e-01, mean_diff=3.742271e-04, ref_range=[-2.6457e+00,3.1090e+00], orig_range=[-2.6457e+00,3.1090e+00]
+  - [near_overflow seed=50002] max_diff=2.370155e+00, mean_diff=3.652546e-04, ref_range=[-2.6457e+00,2.6457e+00], orig_range=[-2.6457e+00,2.6457e+00]
+  - [near_overflow seed=50003] max_diff=2.370155e+00, mean_diff=3.750793e-04, ref_range=[-3.1090e+00,3.1090e+00], orig_range=[-3.1090e+00,3.1090e+00]
+  - [all_negative seed=50008] max_diff=1.130996e-01, mean_diff=3.600067e-04, ref_range=[-2.2106e+00,2.6457e+00], orig_range=[-2.2145e+00,2.6457e+00]
+  - [all_negative seed=50009] max_diff=1.314207e-01, mean_diff=3.634385e-04, ref_range=[-2.6457e+00,2.6456e+00], orig_range=[-2.6457e+00,2.6456e+00]
+  - [all_positive seed=50010] max_diff=1.283702e-01, mean_diff=3.611541e-04, ref_range=[-2.3237e+00,2.6457e+00], orig_range=[-2.3237e+00,2.6457e+00]
+  - [all_positive seed=50011] max_diff=1.429964e-01, mean_diff=3.612714e-04, ref_range=[-2.9852e+00,3.1090e+00], orig_range=[-2.9995e+00,3.1090e+00]
+  ... and 20 more failures
+
+### training_stress (27 failures)
+  - [large_magnitude seed=70000] max_diff=9.881347e-01, mean_diff=3.726168e-04, ref_range=[-2.6457e+00,3.1090e+00], orig_range=[-2.6457e+00,3.1090e+00]
+  - [large_magnitude seed=70001] max_diff=1.019663e+00, mean_diff=3.707162e-04, ref_range=[-3.1090e+00,2.6457e+00], orig_range=[-3.1090e+00,2.6457e+00]
+  - [near_overflow seed=70002] max_diff=2.261156e+00, mean_diff=3.669129e-04, ref_range=[-2.6457e+00,2.6457e+00], orig_range=[-2.6457e+00,2.6457e+00]
+  - [near_overflow seed=70003] max_diff=2.261156e+00, mean_diff=3.720489e-04, ref_range=[-3.1090e+00,3.1090e+00], orig_range=[-3.1090e+00,3.1090e+00]
+  - [all_negative seed=70008] max_diff=1.117323e-01, mean_diff=3.603724e-04, ref_range=[-2.3237e+00,2.6457e+00], orig_range=[-2.3237e+00,2.6457e+00]
+  - [all_negative seed=70009] max_diff=1.335418e-01, mean_diff=3.567013e-04, ref_range=[-2.6847e+00,3.1090e+00], orig_range=[-2.6860e+00,3.1090e+00]
+  - [all_positive seed=70010] max_diff=1.356804e-01, mean_diff=3.598267e-04, ref_range=[-2.6457e+00,3.0972e+00], orig_range=[-2.6457e+00,3.0974e+00]
+  - [all_positive seed=70011] max_diff=1.195121e-01, mean_diff=3.605820e-04, ref_range=[-3.1090e+00,2.6457e+00], orig_range=[-3.1090e+00,2.6457e+00]
+  ... and 19 more failures
+
+## Your Task
+Fix the ModelNew class so its outputs numerically match the reference Model
+under these stress test conditions (extreme values, low precision dtypes,
+training mode with gradients, etc.).
+
+Common causes of failures:
+- TF32/mixed precision causing precision loss (disable torch.backends.cudnn.allow_tf32)
+- Missing epsilon in normalization (division by zero or near-zero)
+- Type casting errors (float16 overflow with large values)
+- Non-deterministic reductions (parallel reduction order)
+- Missing .float() cast before accumulation in custom CUDA kernels
+
+CRITICAL RULES:
+1. Return ONLY the complete fixed Python module (no markdown, no explanation)
+2. The module must contain 'class ModelNew' with the same interface
+3. Preserve all performance optimizations that don't affect correctness
+4. If using custom CUDA via load_inline, ensure numerical stability
+
+Return ONLY the Python code, starting with imports:

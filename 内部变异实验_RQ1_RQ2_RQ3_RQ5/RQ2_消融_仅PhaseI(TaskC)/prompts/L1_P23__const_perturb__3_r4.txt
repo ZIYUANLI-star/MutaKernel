@@ -1,0 +1,496 @@
+You are a GPU kernel expert. A mutation testing tool applied a mutation to a
+GPU kernel. The mutant survived:
+- EMD 4-layer equivalence detection (0 rounds)
+- AND your previous suggested inputs (see below)
+
+**NO downstream deterministic stress testing has been applied.** Re-analyze
+with the failure information and try a fundamentally different value-level
+strategy.
+
+## Testing Contract (fixed-shape, variable-value)
+- Input tensor shapes from `get_inputs()` are FIXED. Batch size is also fixed.
+- Only VALUES can vary. Comparison uses `torch.allclose(atol=1e-2, rtol=1e-2)`
+  (NaN-aware). To kill, design inputs whose max |ref - mut| > `atol + rtol * |ref|`.
+- **Do NOT suggest shape or batch size changes.**
+
+## Full Original Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for numerically stable softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__global__ void softmax_kernel(
+    const T* input,
+    T* output,
+    const int batch_size,
+    const int num_features
+) {
+    // Each block processes one batch element
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const T* batch_input = input + batch_idx * num_features;
+    T* batch_output = output + batch_idx * num_features;
+    
+    // Shared memory for max and sum reductions
+    extern __shared__ float shared_mem[];
+    float* shared_max = shared_mem;
+    float* shared_sum = shared_mem + blockDim.x;
+    
+    // First pass: find max value in the row
+    float thread_max = -INFINITY;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        thread_max = fmaxf(thread_max, val);
+    }
+    
+    // Parallel reduction for max
+    shared_max[tid] = thread_max;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+        }
+        __syncthreads();
+    }
+    
+    float row_max = shared_max[0];
+    
+    // Second pass: compute exponentials and sum
+    float thread_sum = 0.0f;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        float exp_val = expf(val - row_max);
+        batch_output[i] = static_cast<T>(exp_val);
+        thread_sum += exp_val;
+    }
+    
+    // Parallel reduction for sum
+    shared_sum[tid] = thread_sum;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    float row_sum = shared_sum[0];
+    
+    // Third pass: normalize by sum
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_output[i]);
+        batch_output[i] = static_cast<T>(val / row_sum);
+    }
+}
+
+torch::Tensor softmax_cuda(torch::Tensor input) {
+    auto sizes = input.sizes();
+    auto batch_size = sizes[0];
+    auto num_features = sizes[1];
+    
+    auto output = torch::empty_like(input);
+    
+    // Configure kernel launch parameters
+    const int threads_per_block = 256;
+    const int blocks_per_grid = batch_size;
+    
+    // Shared memory size: 2 * threads_per_block * sizeof(float)
+    size_t shared_mem_size = 2 * threads_per_block * sizeof(float);
+    
+    // Launch kernel based on data type
+    if (input.scalar_type() == torch::kFloat32) {
+        softmax_kernel<float><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kFloat16) {
+        softmax_kernel<at::Half><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::Half>(),
+            output.data_ptr<at::Half>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kBFloat16) {
+        softmax_kernel<at::BFloat16><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::BFloat16>(),
+            output.data_ptr<at::BFloat16>(),
+            batch_size,
+            num_features
+        );
+    }
+    
+    // Check for CUDA errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    // Synchronize to ensure kernel completes
+    cudaDeviceSynchronize();
+    
+    return output;
+}
+"""
+
+softmax_cpp_source = """
+torch::Tensor softmax_cuda(torch::Tensor input);
+"""
+
+# Compile the inline CUDA code
+softmax_module = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softmax activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softmax_cuda = softmax_module.softmax_cuda
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+            
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        # Use custom kernel for CUDA tensors with 2 dimensions
+        if x.is_cuda and x.dim() == 2:
+            return self.softmax_cuda(x)
+        else:
+            # Fallback to PyTorch's implementation for other cases
+            return torch.softmax(x, dim=1)
+```
+
+## Full Mutated Source Code
+```
+import torch
+import torch.nn as nn
+from torch.utils.cpp_extension import load_inline
+
+# Define custom CUDA kernel for numerically stable softmax
+softmax_source = """
+#include <torch/extension.h>
+#include <cuda_runtime.h>
+#include <math.h>
+
+template<typename T>
+__global__ void softmax_kernel(
+    const T* input,
+    T* output,
+    const int batch_size,
+    const int num_features
+) {
+    // Each block processes one batch element
+    const int batch_idx = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    const T* batch_input = input + batch_idx * num_features;
+    T* batch_output = output + batch_idx * num_features;
+    
+    // Shared memory for max and sum reductions
+    extern __shared__ float shared_mem[];
+    float* shared_max = shared_mem;
+    float* shared_sum = shared_mem + blockDim.x;
+    
+    // First pass: find max value in the row
+    float thread_max = -INFINITY;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        thread_max = fmaxf(thread_max, val);
+    }
+    
+    // Parallel reduction for max
+    shared_max[tid] = thread_max;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_max[tid] = fmaxf(shared_max[tid], shared_max[tid + s]);
+        }
+        __syncthreads();
+    }
+    
+    float row_max = shared_max[0];
+    
+    // Second pass: compute exponentials and sum
+    float thread_sum = 0.0f;
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_input[i]);
+        float exp_val = expf(val - row_max);
+        batch_output[i] = static_cast<T>(exp_val);
+        thread_sum += exp_val;
+    }
+    
+    // Parallel reduction for sum
+    shared_sum[tid] = thread_sum;
+    __syncthreads();
+    
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shared_sum[tid] += shared_sum[tid + s];
+        }
+        __syncthreads();
+    }
+    
+    float row_sum = shared_sum[0];
+    
+    // Third pass: normalize by sum
+    for (int i = tid; i < num_features; i += stride) {
+        float val = static_cast<float>(batch_output[i]);
+        batch_output[i] = static_cast<T>(val / row_sum);
+    }
+}
+
+torch::Tensor softmax_cuda(torch::Tensor input) {
+    auto sizes = input.sizes();
+    auto batch_size = sizes[0];
+    auto num_features = sizes[1];
+    
+    auto output = torch::empty_like(input);
+    
+    // Configure kernel launch parameters
+    const int threads_per_block = 256;
+    const int blocks_per_grid = batch_size;
+    
+    // Shared memory size: 2 * threads_per_block * sizeof(float)
+    size_t shared_mem_size = 2 * threads_per_block * sizeof(float);
+    
+    // Launch kernel based on data type
+    if (input.scalar_type() == torch::kFloat32) {
+        softmax_kernel<float><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<float>(),
+            output.data_ptr<float>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kFloat16) {
+        softmax_kernel<at::Half><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::Half>(),
+            output.data_ptr<at::Half>(),
+            batch_size,
+            num_features
+        );
+    } else if (input.scalar_type() == torch::kBFloat16) {
+        softmax_kernel<at::BFloat16><<<blocks_per_grid, threads_per_block, shared_mem_size>>>(
+            input.data_ptr<at::BFloat16>(),
+            output.data_ptr<at::BFloat16>(),
+            batch_size,
+            num_features
+        );
+    }
+    
+    // Check for CUDA errors
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cudaGetErrorString(err));
+    }
+    
+    // Synchronize to ensure kernel completes
+    cudaDeviceSynchronize();
+    
+    return output;
+}
+"""
+
+softmax_cpp_source = """
+torch::Tensor softmax_cuda(torch::Tensor input);
+"""
+
+# Compile the inline CUDA code
+softmax_module = load_inline(
+    name="softmax",
+    cpp_sources=softmax_cpp_source,
+    cuda_sources=softmax_source,
+    functions=["softmax_cuda"],
+    verbose=False,
+    extra_cflags=["-O3"],
+    extra_ldflags=[""],
+    with_cuda=True,
+)
+
+class ModelNew(nn.Module):
+    """
+    Optimized model that performs Softmax activation using custom CUDA kernel.
+    """
+    def __init__(self):
+        super(ModelNew, self).__init__()
+        self.softmax_cuda = softmax_module.softmax_cuda
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Applies Softmax activation to the input tensor using custom CUDA kernel.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, num_features).
+            
+        Returns:
+            torch.Tensor: Output tensor with Softmax applied, same shape as input.
+        """
+        # Use custom kernel for CUDA tensors with 2 dimensions
+        if x.is_cuda and x.dim() == 1:
+            return self.softmax_cuda(x)
+        else:
+            # Fallback to PyTorch's implementation for other cases
+            return torch.softmax(x, dim=1)
+```
+
+## Mutation Details
+- Operator: const_perturb — Perturb a numeric constant by a small delta
+- Location: line 168
+- Original fragment: `2`
+- node_type: const:int-1
+
+## Input Specification (FIXED)
+forward() expects 1 argument(s):
+  arg[0]: Tensor shape=[16, 16384], dtype=torch.float32
+
+These shapes are FIXED and NEVER change during testing.
+Only the numerical values inside these tensors vary.
+
+## Equivalence Detection Evidence (EMD Layer 0-3)
+
+NOTE: Previous LLM analysis at Layer 3 (if shown) may contain errors. Reason
+independently.
+
+### Layer 0 (Source Normalization)
+- CUDA identical: N/A
+- Python host identical: N/A
+- Verdict: cuda_identical_host_differs
+- Mutation location: inside class ModelNew
+- Mutated variable: None
+- Used in ModelNew: None
+- Used in get_inputs: None
+- Mutation site line: 168
+- Original fragment: `2`
+### Layer 1 (Static Rules)
+- Matched rule: none
+- Rules checked: boundary_unreachable, dead_write, mask_noreach, dead_host_constant
+### Layer 2 (Dynamic Bitwise Comparison)
+- Is equivalent (bitwise): False
+- Total rounds: 0
+- CUDA was identical (L0): True
+- Tested seeds: [10000]
+- Divergence found: round_type=random, seed=10000, policy=None
+
+## Previous Round(s) — failed attempts
+
+### Round 1
+- Strategy: Use random values with moderate magnitude and high variance to maximize accumulated floating-point differences between the custom CUDA kernel's parallel reduction and PyTorch's softmax implementation. The seed 10000 was already identified by EMD as producing divergence.
+- Suggested code:
+```python
+def generate_inputs(device):
+    torch.manual_seed(10000)
+    # Moderate magnitude random values to stress accumulation differences
+    x = torch.randn(16, 16384, device=device, dtype=torch.float32) * 5.0
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 2
+- Strategy: Use extreme magnitude values (scale ~500-1000) to create overflow conditions where exp() might produce inf in edge cases, or where the parallel reduction accumulation differs from serial accumulation due to catastrophic cancellation in intermediate sums. Values that span a huge range will stress numerical precision limits differently between implementations.
+- Suggested code:
+```python
+def generate_inputs(device):
+    torch.manual_seed(42)
+    # Extreme magnitude to cause overflow/underflow edge cases
+    # This creates values in roughly [-1500, +1500] range
+    # After max subtraction, exp() of very negative values underflows differently
+    x = torch.randn(16, 16384, device=device, dtype=torch.float32) * 500.0
+    # Add some specific extreme values to stress edge cases
+    x[0, 0] = 1000.0  # Force a known max
+    x[0, 1] = -1000.0  # Force extreme underflow
+    x[0, 2] = 999.99  # Near-max value for precision stress
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=True, original_ok=True, mutant_ok=True
+
+### Round 3
+- Strategy: Inject NaN values into the input tensor. The CUDA kernel's use of `fmaxf` will ignore NaN when finding the row maximum, while PyTorch's `torch.softmax` handles NaN differently. This can cause one implementation to produce valid outputs where the other produces NaN, or produce different NaN patterns that fail NaN-aware comparison.
+- Suggested code:
+```python
+def generate_inputs(device):
+    torch.manual_seed(12345)
+    x = torch.randn(16, 16384, device=device, dtype=torch.float32)
+    # Insert NaN at specific positions across multiple batch elements
+    x[0, 0] = float('nan')
+    x[1, 100] = float('nan')
+    x[2, 8192] = float('nan')  # Mid-range position
+    # Also try positive infinity which causes inf - inf = nan behavior
+    x[3, 0] = float('inf')
+    x[4, 500] = float('inf')
+    return [x]
+```
+- Verification result: NOT KILLED
+- Detail: ref_ok=False, original_ok=False, mutant_ok=False
+- Error: ref NaN/Inf and original also invalid on LLM input
+
+
+## Mandatory Reasoning Steps
+
+**Step 1 — Failure post-mortem**: For each previous attempt, explain why it
+failed to distinguish (which path/branch was triggered or skipped, which
+values would have changed but did not propagate).
+
+**Step 2 — Pivot strategy**: Identify a fundamentally different value pattern
+that has NOT been tried (different magnitude, different sparsity, different
+sign pattern, near-zero/large-magnitude, special integer boundaries, etc.).
+
+**Step 3 — Construct concrete input**: Build one new value-pattern test
+respecting the fixed shapes.
+
+**Step 4 — Conclusion**: Output `killable: true` only if the new pattern is
+concretely reachable and provably distinguishing.
+
+Respond in **strict JSON** (no text before or after):
+{
+  "reason_category": "<one of: predicate_unreachable | path_not_triggered | value_insensitive | infection_no_propagation | requires_config_change | unknown>",
+  "proof_sketch": "<short bound/range derivation>",
+  "survival_reason": "<why earlier attempts failed and why this one is different — 3-8 sentences>",
+  "killable": true | false,
+  "kill_strategy": "<VALUE-LEVEL strategy or why unkillable>",
+  "suggested_test": {
+    "description": "<what this tests — SAME shapes as input_spec>",
+    "python_code": "<def generate_inputs(device): ... returning list of tensors>"
+  },
+  "recommendations": "<one concrete test-coverage or kernel-robustness lesson>"
+}
+
+CRITICAL rules for suggested_test.python_code:
+- Define `def generate_inputs(device): ...` that returns a LIST of tensors
+- The returned list MUST have EXACTLY the same number of tensors as forward() expects
+- Tensor shapes MUST EXACTLY MATCH those in Input Specification
+- Use ONLY torch and math modules (already imported)
+- If you believe the mutant is truly unkillable, set "suggested_test" to null
