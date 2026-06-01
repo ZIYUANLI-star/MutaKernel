@@ -18,13 +18,13 @@
 本报告所有数值与论文最终方法（EuroSys 投稿 #303）一致，且均可由仓库内实验数据复现：
 
 1. **MutaKernel 杀伤链 = 5 个确定性 stress 维度**（`value_stress / dtype_stress / training_stress / repeated_run / config_stress`）+ Tier 1 回放。Phase II 早期内嵌的 DeepSeek-R1 LLM 迭代分析层**不属于最终方法**，其产生的 kill **不计入** MutaKernel 杀数。
-   - 因此 Phase II 新增杀数以每个 `stress_enhance_results/details/*.json` 的 `kill_summary.deterministic_killed=true` 统计，记为 **166**；而原始字段 `any_killed`（含 LLM）为 169，二者差 3（见 §3.8），这 3 个改由 Task A（RQ2 审计）处理。
-   - 复算脚本：`RQ3_MutaKernel五维增强(PhaseII)/_论文口径_无LLM/recount_paper_no_llm.py`。
+  - 因此 Phase II 新增杀数以每个 `stress_enhance_results/details/*.json` 的 `kill_summary.deterministic_killed=true` 统计，记为 **166**；而原始字段 `any_killed`（含 LLM）为 169，二者差 3（见 §3.8），这 3 个改由 Task A（RQ2 审计）处理。
+  - 复算脚本：`RQ3_MutaKernel五维增强(PhaseII)/_论文口径_无LLM/recount_paper_no_llm.py`。
 2. **MutaKernel 总杀数 = 939（Phase I）+ 166（Phase II 确定性）= 1105**，对应论文 Table 7。Task C 用越界输入（违反固定 shape & dtype 合同）多杀的 1 个不计入（见 §5.4）。
 3. **三档变异分数分母**（来源：`full_block12_results/summary.json`）：
-   - 保守分母 = Total − Stillborn − Strict_Eq = 1646 − 163 − 10 = **1473**
-   - 乐观分母 = 1473 − Cand_Eq_remaining(243) = **1230**
-   - 审计分母 = 1473 − Prov_Eq(349) − Op_Indist(17) = **1107**
+  - 保守分母 = Total − Stillborn − Strict_Eq = 1646 − 163 − 10 = **1473**
+  - 乐观分母 = 1473 − Cand_Eq_remaining(243) = **1230**
+  - 审计分母 = 1473 − Prov_Eq(349) − Op_Indist(17) = **1107**
 4. **Task A 审计池 = 368**（= Phase II 后存活 534 − 166；含 2026-05-15 补跑的 3 个）。
 
 ---
@@ -161,11 +161,11 @@ Phase 2 对 Phase 1 中所有 Survived（270 个）和 Candidate Equivalent（26
 ### 3.2 增强测试总体结果
 
 
-| 指标                | 数值      | 数据来源                             |
-| ----------------- | ------- | -------------------------------- |
-| 增强测试变异体总数         | 534     | detail 文件计数                      |
+| 指标                | 数值      | 数据来源                                                                                       |
+| ----------------- | ------- | ------------------------------------------------------------------------------------------ |
+| 增强测试变异体总数         | 534     | detail 文件计数                                                                                |
 | **新增杀死 (Killed)** | **166** | detail 中 `kill_summary.deterministic_killed=true` 计数（论文口径，5 维确定性；不含已移除的 LLM 兜底层，见 §0、§3.8） |
-| 仍存活 (Survived)    | 368     | 534 − 166 |
+| 仍存活 (Survived)    | 368     | 534 − 166                                                                                  |
 
 
 **增强测试杀死率公式**: Phase 2 Kill Rate = P2_Killed / P2_Total = 166 / 534 = **31.09%**
@@ -177,8 +177,8 @@ Phase 2 对 Phase 1 中所有 Survived（270 个）和 Candidate Equivalent（26
 > 来源: 每个 detail JSON 的 `tier` 字段和 `any_killed` 字段
 
 
-| Tier                     | 总数  | Killed | Survived | Kill Rate | 计算      |
-| ------------------------ | --- | ------ | -------- | --------- | ------- |
+| Tier                     | 总数  | Killed | Survived | Kill Rate  | 计算      |
+| ------------------------ | --- | ------ | -------- | ---------- | ------- |
 | Tier 1 (L2-rejected)     | 151 | 128    | 23       | **84.77%** | 128/151 |
 | Tier 2 (LLM-rejected)    | 119 | 17     | 102      | **14.29%** | 17/119  |
 | Tier 3 (Candidate Equiv) | 264 | 21     | 243      | **7.95%**  | 21/264  |
@@ -193,14 +193,14 @@ Phase 2 对 Phase 1 中所有 Survived（270 个）和 Candidate Equivalent（26
 > 来源: 每个 detail JSON 的 `first_kill_mode` 字段
 
 
-| 首次杀死来源                          | 数量  | 占比    | 计算      |
-| ------------------------------- | --- | ----- | ------- |
-| value_stress (值域压力)             | 137 | 82.53% | 137/166 |
-| tier1_replay (Tier1 回放)         | 12  | 7.23%  | 12/166  |
-| config_stress (配置压力)            | 9   | 5.42%  | 9/166   |
-| dtype_stress (数据类型压力)           | 3   | 1.81%  | 3/166   |
-| training_stress (训练压力)          | 3   | 1.81%  | 3/166   |
-| repeated_run (重复运行)             | 2   | 1.20%  | 2/166   |
+| 首次杀死来源                  | 数量  | 占比     | 计算      |
+| ----------------------- | --- | ------ | ------- |
+| value_stress (值域压力)     | 137 | 82.53% | 137/166 |
+| tier1_replay (Tier1 回放) | 12  | 7.23%  | 12/166  |
+| config_stress (配置压力)    | 9   | 5.42%  | 9/166   |
+| dtype_stress (数据类型压力)   | 3   | 1.81%  | 3/166   |
+| training_stress (训练压力)  | 3   | 1.81%  | 3/166   |
+| repeated_run (重复运行)     | 2   | 1.20%  | 2/166   |
 
 
 > 完整性校验: 137+12+9+3+3+2 = 166 = P2_Killed ✓
@@ -322,16 +322,16 @@ Phase 2 对 Phase 1 中所有 Survived（270 个）和 Candidate Equivalent（26
 ### 4.1 合并后总体统计
 
 
-| 指标                            | 数值       | 来源 / 计算                                                                                       |
-| ----------------------------- | -------- | --------------------------------------------------------------------------------------------- |
-| 变异体总数                         | 1646     | summary.json → `total_mutants`                                                                |
-| Phase 1 杀死                    | 939      | summary.json → `total_killed`                                                                 |
-| Phase 2 新增杀死                  | 166      | 534 个 detail 中 `kill_summary.deterministic_killed=true` 计数（论文口径，不含已移除 LLM 兜底）           |
-| **总杀死（Phase 1 + Phase 2）**    | **1105** | 939 + 166（= 论文 Table 7 的 MutaKernel killed）                                                  |
-| Stillborn                     | 163      | summary.json → `total_stillborn`                                                              |
-| Strict Equivalent             | 10       | summary.json → `total_strict_equivalent`                                                      |
-| Candidate Equivalent (最终)     | 243      | Tier 3 总数(264) − Tier 3 被五维 stress 杀死(21)                                                     |
-| 最终存活 (非等价, 未被杀死, Tier 1+2 残留)  | 125      | 1646 − 1105 − 163 − 10 − 243                                                                  |
+| 指标                            | 数值       | 来源 / 计算                                                                       |
+| ----------------------------- | -------- | ----------------------------------------------------------------------------- |
+| 变异体总数                         | 1646     | summary.json → `total_mutants`                                                |
+| Phase 1 杀死                    | 939      | summary.json → `total_killed`                                                 |
+| Phase 2 新增杀死                  | 166      | 534 个 detail 中 `kill_summary.deterministic_killed=true` 计数（论文口径，不含已移除 LLM 兜底） |
+| **总杀死（Phase 1 + Phase 2）**    | **1105** | 939 + 166（= 论文 Table 7 的 MutaKernel killed）                                   |
+| Stillborn                     | 163      | summary.json → `total_stillborn`                                              |
+| Strict Equivalent             | 10       | summary.json → `total_strict_equivalent`                                      |
+| Candidate Equivalent (最终)     | 243      | Tier 3 总数(264) − Tier 3 被五维 stress 杀死(21)                                     |
+| 最终存活 (非等价, 未被杀死, Tier 1+2 残留) | 125      | 1646 − 1105 − 163 − 10 − 243                                                  |
 
 
 > **完整性校验**: 1105 + 125 + 163 + 10 + 243 = 1646 ✓
@@ -343,11 +343,11 @@ Phase 2 对 Phase 1 中所有 Survived（270 个）和 Candidate Equivalent（26
 ### 4.2 最终变异分数（三档口径）
 
 
-| 口径                        | 公式                                                                       | 计算                                                | 数值                         |
-| ------------------------- | ------------------------------------------------------------------------ | ------------------------------------------------- | -------------------------- |
-| **保守 (Conservative)** | Killed / (Total − Stillborn − Strict_Eq)                       | 1105 / (1646 − 163 − 10) = 1105 / 1473             | **75.02%** |
-| **乐观 (Optimistic)**   | Killed / (Total − Stillborn − Strict_Eq − Cand_Eq_remaining)   | 1105 / (1646 − 163 − 10 − 243) = 1105 / 1230       | **89.84%** |
-| **审计 (Audited)**      | Killed / (Total − Stillborn − Strict_Eq − Prov_Eq − Op_Indist) | 1105 / (1646 − 163 − 10 − 349 − 17) = 1105 / 1107  | **99.82%** |
+| 口径                    | 公式                                                             | 计算                                                | 数值         |
+| --------------------- | -------------------------------------------------------------- | ------------------------------------------------- | ---------- |
+| **保守 (Conservative)** | Killed / (Total − Stillborn − Strict_Eq)                       | 1105 / (1646 − 163 − 10) = 1105 / 1473            | **75.02%** |
+| **乐观 (Optimistic)**   | Killed / (Total − Stillborn − Strict_Eq − Cand_Eq_remaining)   | 1105 / (1646 − 163 − 10 − 243) = 1105 / 1230      | **89.84%** |
+| **审计 (Audited)**      | Killed / (Total − Stillborn − Strict_Eq − Prov_Eq − Op_Indist) | 1105 / (1646 − 163 − 10 − 349 − 17) = 1105 / 1107 | **99.82%** |
 
 
 > **三档口径差异**（与论文 Table 5 / Table 7 一致）：
@@ -369,17 +369,18 @@ Phase 2 对 Phase 1 中所有 Survived（270 个）和 Candidate Equivalent（26
 ### 5.1 等价变异体最终分类（更新：纳入 Task A 二次验证 + Task C 独立 kill）
 
 
-| 分类                                | 数量  | 说明                                                       |
-| --------------------------------- | --- | -------------------------------------------------------- |
-| Strict Equivalent                       | 10  | Layer 0 文本等价 或 Layer 1 静态规则确认 |
-| Candidate Equivalent (Phase 2 五维未杀, Tier 3 残留) | 243 | 264 − 被五维 stress 杀的 21 |
-| Candidate Equivalent (被五维 stress 杀)    | 21  | 原 Candidate Equivalent 被 Phase 2 五维 stress 杀 |
-| Phase 1 非等价存活 (被五维 stress 杀)         | 145 | Tier 1(128) + Tier 2(17) |
-| **Phase 2 后 Tier 1+2 残留**             | 125 | = 368 − 243(Tier 3 残留)；Task A 审计分解：113 provably-equivalent + 11 operationally-indistinguishable + 1 MutaKernel-missed(`L1_P49__init_modify__0`) |
+| 分类                                             | 数量  | 说明                                                                                                                                              |
+| ---------------------------------------------- | --- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| Strict Equivalent                              | 10  | Layer 0 文本等价 或 Layer 1 静态规则确认                                                                                                                   |
+| Candidate Equivalent (Phase 2 五维未杀, Tier 3 残留) | 243 | 264 − 被五维 stress 杀的 21                                                                                                                          |
+| Candidate Equivalent (被五维 stress 杀)            | 21  | 原 Candidate Equivalent 被 Phase 2 五维 stress 杀                                                                                                    |
+| Phase 1 非等价存活 (被五维 stress 杀)                   | 145 | Tier 1(128) + Tier 2(17)                                                                                                                        |
+| **Phase 2 后 Tier 1+2 残留**                      | 125 | = 368 − 243(Tier 3 残留)；Task A 审计分解：113 provably-equivalent + 11 operationally-indistinguishable + 1 MutaKernel-missed(`L1_P49__init_modify__0`) |
 
 
 > **校验 1**（MutaKernel 五维 stress 杀数）：145（非等价存活被杀）+ 21（Cand_Eq 被杀）= **166** = Phase 2 deterministic killed ✓
 > **校验 2**（Task A 审计池 368 的两种分解，来源 `task_a_phase2_rerun/details`）：
+>
 > - 按 Tier 残留：Tier 1 (23) + Tier 2 (102) + Tier 3 (243) = 368 ✓
 > - 按审计标签：provably-equivalent **349**（T1/T2/T3 = 21/92/236）+ operationally-indistinguishable **17**（2/9/6）+ MutaKernel-missed **2**（T2 `L1_P49__init_modify__0`、T3 `L1_P23__init_modify__0`）= 368 ✓
 > **校验 3**：Tier 1+2 残留 **125** = 113 prov_eq + 11 op_indist + 1 missed(T2) ✓；Tier 3 残留 **243** = 236 prov_eq + 6 op_indist + 1 missed(T3) ✓
@@ -408,6 +409,7 @@ Tier 3 残留共 **243** 个（242 个为 Layer 2+3 候选等价，1 个 `L1_P23
 > 来源: `第二次实验汇总_补充/task_a_phase2_rerun/details/*.json` （368 个 = 365 主跑 + 3 补跑）
 
 **5.3.1 实验设置**：
+
 - 输入：Phase 2 五维 stress 后仍存活的全部 **368 个** mutant（= 534 − 166；不论原 Tier 分类；含 2026-05-15 补跑的 3 个原 LLM-only kill）
 - 模型：Claude Opus 4.5（`us.anthropic.claude-opus-4-5-20251101-v1:0`，AWS Bedrock）
 - 配置：5 轮 + Extended Thinking (8000 tokens budget)
@@ -415,38 +417,43 @@ Tier 3 残留共 **243** 个（242 个为 Layer 2+3 候选等价，1 个 `L1_P23
 
 **5.3.2 总体结果**：
 
-| 字段              | 数值       | 数据来源                          |
-| --------------- | -------- | ----------------------------- |
-| Task A 处理总数     | 368      | details JSON 计数（365 主跑 + 3 补跑）       |
-| 成功构造合同内 kill（MutaKernel-missed） | **2** | `L1_P49__init_modify__0`、`L1_P23__init_modify__0`（Opus 给出 fill=−1.5e15 / −2e10 的合同内输入，实测杀死）|
-| 5 轮全 `killable=False`（provably-equivalent） | **349** | 349/368 = 94.8% 被 Opus 强确认等价 |
-| ≥1 轮 `killable=True` 但 5 轮内未杀（operationally-indistinguishable） | **17** | Opus 提出的 kill 输入都违反合同或实测不杀 |
-| 累计 elapsed       | 5.34 h   | sum(`elapsed_sec`)            |
-| 输入 / 输出 tokens   | 340k / 156k | manifest.total_tokens         |
+
+| 字段                                                             | 数值          | 数据来源                                                                                        |
+| -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------- |
+| Task A 处理总数                                                    | 368         | details JSON 计数（365 主跑 + 3 补跑）                                                              |
+| 成功构造合同内 kill（MutaKernel-missed）                                | **2**       | `L1_P49__init_modify__0`、`L1_P23__init_modify__0`（Opus 给出 fill=−1.5e15 / −2e10 的合同内输入，实测杀死） |
+| 5 轮全 `killable=False`（provably-equivalent）                     | **349**     | 349/368 = 94.8% 被 Opus 强确认等价                                                                |
+| ≥1 轮 `killable=True` 但 5 轮内未杀（operationally-indistinguishable） | **17**      | Opus 提出的 kill 输入都违反合同或实测不杀                                                                  |
+| 累计 elapsed                                                     | 5.34 h      | sum(`elapsed_sec`)                                                                          |
+| 输入 / 输出 tokens                                                 | 340k / 156k | manifest.total_tokens                                                                       |
+
 
 > 校验：2 + 349 + 17 = 368 ✓
 
 **5.3.3 按原 Phase 2 Tier 拆分**（关键交叉验证）：
 
-| Tier (Phase 2 后残留) | 数量    | Task A `killable=False` (全 5 轮) | 占比      | 解读                              |
-| ------------------ | ----- | ------------------------------- | ------- | ------------------------------- |
-| Tier 1 残留          | 23    | **21**                          | 91.3%   | 原 EMD 判"非等价"，Opus 4.5 确认等价 |
-| Tier 2 残留          | 102   | **92**                          | 90.2%   | 同上（含 2 个原 LLM-only kill 回归）|
-| Tier 3 残留 (Cand_Eq) | 243  | **236**                         | 97.1%   | 三重确认（Layer 2 + DeepSeek + Opus 4.5） |
-| **合计**             | 368   | **349**                         | **94.8%** | —                               |
+
+| Tier (Phase 2 后残留)  | 数量  | Task A `killable=False` (全 5 轮) | 占比        | 解读                                  |
+| ------------------- | --- | ------------------------------- | --------- | ----------------------------------- |
+| Tier 1 残留           | 23  | **21**                          | 91.3%     | 原 EMD 判"非等价"，Opus 4.5 确认等价          |
+| Tier 2 残留           | 102 | **92**                          | 90.2%     | 同上（含 2 个原 LLM-only kill 回归）         |
+| Tier 3 残留 (Cand_Eq) | 243 | **236**                         | 97.1%     | 三重确认（Layer 2 + DeepSeek + Opus 4.5） |
+| **合计**              | 368 | **349**                         | **94.8%** | —                                   |
 
 
 > **关键发现**：§4.1 中 Tier 1+2 残留的 **125 个** mutant 中，**113 个 (90.4%) 被 Opus 4.5 五轮全否（provably-equivalent），与等价变异体行为难以区分**；11 个 operationally-indistinguishable（Opus 提 kill 假设但 5 轮内未给出有效的合同内输入）；1 个 MutaKernel-missed（`L1_P49__init_modify__0`，Opus 找到合同内 kill）。另有越界可杀的 `L1_P99__cast_remove__2` 仅在 Task C 违反合同（`dtype=float64`）时被杀（见 §5.1、§5.4）。
 
 **5.3.4 reason_category 分布**（Task A 共 **394** 个 round-level 标签；368 个 mutant、部分多轮）：
 
-| reason_category          | 出现次数 | 含义                            |
-| ------------------------ | ---- | ----------------------------- |
-| predicate_unreachable    | 138  | 变异点判断条件在合同输入下永不触发             |
+
+| reason_category          | 出现次数 | 含义                                   |
+| ------------------------ | ---- | ------------------------------------ |
+| predicate_unreachable    | 138  | 变异点判断条件在合同输入下永不触发                    |
 | value_insensitive        | 110  | 算子等价（如 `.float()` 对 float32 是 no-op） |
-| requires_config_change   | 67   | 需要改 shape/dtype 才能区分（违反契约）    |
-| path_not_triggered       | 48   | 控制流不达                         |
-| infection_no_propagation | 31   | 局部改变但未传到输出                    |
+| requires_config_change   | 67   | 需要改 shape/dtype 才能区分（违反契约）           |
+| path_not_triggered       | 48   | 控制流不达                                |
+| infection_no_propagation | 31   | 局部改变但未传到输出                           |
+
 
 > 校验: 138+110+67+48+31 = 394 ✓
 
@@ -457,19 +464,21 @@ Tier 3 残留共 **243** 个（242 个为 Layer 2+3 候选等价，1 个 `L1_P23
 > 来源: `第二次实验汇总_补充/task_c_phase1_direct/details/*.json` （534 个）
 
 **5.4.1 实验设置**：
+
 - 输入：Phase 1 后存活的全部 534 个 mutant（即原 Survived 270 + Candidate Equivalent 264）
 - **关键差异 vs Task A**：prompt 模板 `ANALYSIS_PROMPT_C` 不含 Phase 2 信息，纯净消融对照
 - 其他参数与 Task A 一致（Opus 4.5, 5 轮, extended thinking）
 
 **5.4.2 总体结果**：
 
-| 字段          | 数值        | 来源              |
-| ----------- | --------- | --------------- |
-| 处理总数        | 534       | details 计数      |
-| 杀死数         | **70**    | 遍历 `d["killed"]` |
-| Kill rate   | **13.11%** | 70/534          |
-| 累计 elapsed   | 18.33 h   |                 |
-| 输入 / 输出 tokens | 2.34M / 1.53M | manifest        |
+
+| 字段             | 数值            | 来源               |
+| -------------- | ------------- | ---------------- |
+| 处理总数           | 534           | details 计数       |
+| 杀死数            | **70**        | 遍历 `d["killed"]` |
+| Kill rate      | **13.11%**    | 70/534           |
+| 累计 elapsed     | 18.33 h       |                  |
+| 输入 / 输出 tokens | 2.34M / 1.53M | manifest         |
 
 
 > **数据严谨性 1**：`run_manifest.json` 中 `killed_count=25` 是中途快照；以 details 终态为准 **kill=70**。
@@ -478,11 +487,13 @@ Tier 3 残留共 **243** 个（242 个为 Layer 2+3 候选等价，1 个 `L1_P23
 
 > 口径说明：下表交集是基于历史 `any_killed`=169 的 Phase 2 集合统计的。论文最终口径下 Phase 2 确定性杀数为 **166**（移除 3 个 LLM-only kill）。这一调整不改变本节的定性结论——Task C（纯 Opus）与 Phase 2 的杀集高度重合（≈99%），且 Phase 2 在成本/吞吐/可重复性上不可被纯 LLM 替代。
 
-| 集合关系                | 数量 | 含义                                       |
-| ------------------- | --- | ---------------------------------------- |
-| Task C kill ∩ Phase 2 kill | **69** | 99% 重叠，两者发现的是同一群体              |
-| **Only Task C** (Phase 2 未杀) | **1**  | `L1_P99__cast_remove__2`（Tier 2，边缘策略）|
-| Only Phase 2 (Task C 未杀)   | 100 | Phase 2 stress 维度更广 (config_stress 等)|
+
+| 集合关系                         | 数量     | 含义                                    |
+| ---------------------------- | ------ | ------------------------------------- |
+| Task C kill ∩ Phase 2 kill   | **69** | 99% 重叠，两者发现的是同一群体                     |
+| **Only Task C** (Phase 2 未杀) | **1**  | `L1_P99__cast_remove__2`（Tier 2，边缘策略） |
+| Only Phase 2 (Task C 未杀)     | 100    | Phase 2 stress 维度更广 (config_stress 等) |
+
 
 **5.4.4 解读**：
 

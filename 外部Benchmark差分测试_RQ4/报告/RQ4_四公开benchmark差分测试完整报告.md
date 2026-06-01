@@ -5,10 +5,10 @@
 > **实验框架**: MutaKernel 五维度差分测试引擎  
 > **数据来源**:
 >
-> - CUDA-L1: `第三次实验汇总/results/cuda_l1/checkpoint.json`（及 `details/*.json`，231 个文件）
-> - AI-CUDA-Engineer: `第三次实验汇总/results/ai_cuda_engineer/checkpoint.json`（及 `details/*.json`，222 个文件）
-> - TritonBench-G: `第三次实验汇总/results/tritonbench_g/checkpoint.json`（及 `details/*.json`，139 个文件）
-> - CUDA-Agent: `第四次实验汇总/results/checkpoint.json`（及 `details/*.json`，176 个文件）
+> - CUDA-L1: `外部Benchmark差分测试_RQ4/CUDA-L1/checkpoint.json`（及 `details/*.json`，231 个文件）
+> - AI-CUDA-Engineer: `外部Benchmark差分测试_RQ4/AI-CUDA-Engineer/checkpoint.json`（及 `details/*.json`，222 个文件）
+> - TritonBench-G: `外部Benchmark差分测试_RQ4/TritonBench-G/checkpoint.json`（及 `details/*.json`，139 个文件）
+> - CUDA-Agent: `外部Benchmark差分测试_RQ4/CUDA-Agent/checkpoint.json`（及 `details/*.json`，176 个文件）
 > - 实验执行脚本: `scripts/run_fullscale_diff_test.py`、`scripts/_stress_worker.py`
 
 ---
@@ -643,7 +643,7 @@ ByteDance 与清华联合发布的 CUDA-Agent 论文（arXiv:2602.24286）声称
 
 ### 7.4 内核来源仓库分析（TritonBench-G）
 
-> **数据来源**: `第三次实验汇总/results/tritonbench_g/checkpoint.json` 中各内核的 `repo` 字段，仅统计 COMPLETED 内核
+> **数据来源**: `外部Benchmark差分测试_RQ4/TritonBench-G/checkpoint.json` 中各内核的 `repo` 字段，仅统计 COMPLETED 内核
 
 TritonBench-G 数据集的 138 个已完成测试的内核来自 55 个不同的开源项目，下表展示前 12 个主要来源（覆盖 84 个内核，占 60.9%）：
 
@@ -708,14 +708,14 @@ TritonBench-G 数据集的 138 个已完成测试的内核来自 55 个不同的
 
 | 文件路径                                               | 内容                         | 条目数     |
 | -------------------------------------------------- | -------------------------- | ------- |
-| `第三次实验汇总/results/cuda_l1/checkpoint.json`          | CUDA-L1 全部内核测试结果           | 241 条   |
-| `第三次实验汇总/results/cuda_l1/details/*.json`           | CUDA-L1 各内核详细测试记录          | 231 个文件 |
-| `第三次实验汇总/results/ai_cuda_engineer/checkpoint.json` | AI-CUDA-Engineer 全部内核测试结果  | 229 条   |
-| `第三次实验汇总/results/ai_cuda_engineer/details/*.json`  | AI-CUDA-Engineer 各内核详细测试记录 | 222 个文件 |
-| `第三次实验汇总/results/tritonbench_g/checkpoint.json`    | TritonBench-G 全部内核测试结果     | 141 条   |
-| `第三次实验汇总/results/tritonbench_g/details/*.json`     | TritonBench-G 各内核详细测试记录    | 139 个文件 |
-| `第四次实验汇总/results/checkpoint.json`                  | CUDA-Agent 全部内核测试结果        | 220 条   |
-| `第四次实验汇总/results/details/*.json`                   | CUDA-Agent 各内核详细测试记录       | 176 个文件 |
+| `外部Benchmark差分测试_RQ4/CUDA-L1/checkpoint.json`          | CUDA-L1 全部内核测试结果           | 241 条   |
+| `外部Benchmark差分测试_RQ4/CUDA-L1/details/*.json`           | CUDA-L1 各内核详细测试记录          | 231 个文件 |
+| `外部Benchmark差分测试_RQ4/AI-CUDA-Engineer/checkpoint.json` | AI-CUDA-Engineer 全部内核测试结果  | 229 条   |
+| `外部Benchmark差分测试_RQ4/AI-CUDA-Engineer/details/*.json`  | AI-CUDA-Engineer 各内核详细测试记录 | 222 个文件 |
+| `外部Benchmark差分测试_RQ4/TritonBench-G/checkpoint.json`    | TritonBench-G 全部内核测试结果     | 141 条   |
+| `外部Benchmark差分测试_RQ4/TritonBench-G/details/*.json`     | TritonBench-G 各内核详细测试记录    | 139 个文件 |
+| `外部Benchmark差分测试_RQ4/CUDA-Agent/checkpoint.json`                  | CUDA-Agent 全部内核测试结果        | 220 条   |
+| `外部Benchmark差分测试_RQ4/CUDA-Agent/details/*.json`                   | CUDA-Agent 各内核详细测试记录       | 176 个文件 |
 
 
 > **TritonBench-G detail 文件多 1 个**: `tritonbench__157_rmsnorm_fused.json` 存在于 details 但不在 checkpoint 中，为补跑时生成的副产物，不计入主统计。
