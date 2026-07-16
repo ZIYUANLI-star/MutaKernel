@@ -13,8 +13,9 @@
 | 数据集来源 | BytedTsinghua-SIA/CUDA-Agent |
 | 原始条目 | 246（L1: 99, L2: 99, L3: 48） |
 | 转换成功 | 222（108 纯 PyTorch + 114 CUDA→load_inline） |
+| 进入差分测试（checkpoint 记录） | 220（2 个转换后无法加载，未计入；与论文 §6.1、RQ4 报告口径一致） |
 | 实际完成 | 176 |
-| 编译失败跳过 | 46 |
+| 编译失败跳过（baseline 全错） | 44 |
 | 检测到差异 | **104 (59.1%)** |
 | 运行时间 | 42.5 小时（单 H20 GPU） |
 
@@ -27,7 +28,7 @@
 | L1（基础） | 单算子优化 | 87 | 1 | 38 | **43.7%** | 37 |
 | L2（中级） | 融合多步算子 | 62 | 32 | 46 | **74.2%** | 46 |
 | L3（高级） | 复杂网络结构 | 27 | 11 | 20 | **74.1%** | 18 |
-| **总计** | — | **176** | **46** | **104** | **59.1%** | **101** |
+| **总计** | — | **176** | **44** | **104** | **59.1%** | **101** |
 
 **关键发现**：Level 2/3（复杂优化）的增强检测率（74%）远高于 Level 1（44%），说明越复杂的 CUDA 融合优化越容易在边界条件下表现出行为差异。
 
@@ -90,14 +91,21 @@
 
 ## 七、典型案例
 
-### 高差异 kernel 示例
-- `cuda_agent__L2_T63`：68 处差异（value_stress + training_stress + repeated_run），GEMM+BN 融合优化
-- `cuda_agent__L1_T82`：78 处差异，卷积+激活融合
-- `cuda_agent__L3_T22`：56 处差异，DenseNet 结构优化
+> 说明：「差异数」= 各 kernel 的 `total_discrepancies`（5 维累计的 discrepancy 总次数）。
+> 下列示例均来源于 `details/*.json`，且 baseline（原始输入）全部通过（passed=3, failed=0），属"可靠差异"。
 
-### 零差异 kernel 示例
-- `cuda_agent__L1_T0`：非对称卷积，优化保持完美一致性
-- `cuda_agent__L1_T4`：3D 卷积，简单 TF32 优化无精度影响
+### 高差异 kernel 示例（按 total_discrepancies 排序的真实 Top 案例）
+- `cuda_agent__L3_T20`：**70** 处差异（value_stress=30 + training_stress=38 + repeated_run=2），L3 复杂网络结构，且唯一额外触发非确定性（repeated_run）
+- `cuda_agent__L2_T68`：**68** 处差异（value_stress=28 + training_stress=40），GEMM 通用矩阵乘融合优化
+- `cuda_agent__L2_T0`：**68** 处差异（value_stress=28 + training_stress=40），矩阵乘 + 缩放融合
+- `cuda_agent__L2_T80`：**67** 处差异（value_stress=27 + training_stress=40），卷积 + BatchNorm 融合
+- `cuda_agent__L2_T1`：**62** 处差异（value_stress=28 + training_stress=34），GEMM + BatchNorm + GELU + ReLU 多步融合
+
+### 零差异 kernel 示例（total_discrepancies=0，baseline 通过）
+- `cuda_agent__L3_T45`：LSTM 模型，优化在全部 5 维压力测试下保持完全一致
+- `cuda_agent__L2_T95`：矩阵乘 + 缩放，优化无任何数值偏差
+
+> 共有 72 个 kernel 为零差异，其中 baseline 通过（可靠零差异）70 个。
 
 ---
 
@@ -114,10 +122,10 @@
 
 | 文件 | 路径 |
 |------|------|
-| checkpoint | `第四次实验汇总/results/checkpoint.json` |
-| summary | `第四次实验汇总/results/summary.json` |
-| 逐 kernel 详情 | `第四次实验汇总/results/details/` |
-| 本文档 | `第四次实验汇总/docs/实验结果分析.md` |
+| checkpoint | `外部Benchmark差分测试_RQ4/CUDA-Agent/checkpoint.json` |
+| summary | `外部Benchmark差分测试_RQ4/CUDA-Agent/summary.json` |
+| 逐 kernel 详情 | `外部Benchmark差分测试_RQ4/CUDA-Agent/details/` |
+| 本文档 | `外部Benchmark差分测试_RQ4/报告/CUDA-Agent结果分析.md` |
 | 数据转换脚本 | `scripts/prepare_cuda_agent.py` |
 | 注册表 | `external_benchmarks/cuda_agent/registry.json` |
 | SLURM 日志 | `slurm/logs/mk-cuda-agent_680783.out` |

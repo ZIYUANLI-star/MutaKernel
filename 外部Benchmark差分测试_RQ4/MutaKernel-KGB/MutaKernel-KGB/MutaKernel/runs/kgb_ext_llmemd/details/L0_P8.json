@@ -1,0 +1,1328 @@
+{
+  "kernel": {
+    "problem_id": 8,
+    "level": 0,
+    "problem_name": "softmax__bfloat16__2048x256",
+    "language": "triton"
+  },
+  "summary": {
+    "total": 31,
+    "killed": 12,
+    "survived": 8,
+    "stillborn": 1,
+    "strict_equivalent": 4,
+    "candidate_equivalent": 6,
+    "equivalent": 10,
+    "mutation_score": 0.4615,
+    "mutation_score_optimistic": 0.6,
+    "score_by_category": {
+      "A": 0.4211,
+      "B": 1.0,
+      "C": 0.5,
+      "D": 0.0
+    },
+    "emd_layer3": "claude-opus-4-5"
+  },
+  "mutants": [
+    {
+      "id": "L0_P8__arith_replace__0",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L4",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.7,
+      "site": {
+        "line_start": 4,
+        "line_end": 4,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row+parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (extreme_magnitude,large_magnitude,near_zero...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation only changed a comment/docstring from 'row-parallel' to 'row+parallel' on line 4.",
+          "reasoning": "The diff shows only a change in the docstring comment text inside triple quotes, replacing a hyphen with a plus sign in the phrase 'Online Softmax (row-parallel)' to 'Online Softmax (row+parallel)'. This is purely a documentation change that has no effect on the kernel's execution or output. No actual code, arithmetic operations, or control flow were modified.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "candidate_equivalent",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "equivalent_candidate_confirmed"
+    },
+    {
+      "id": "L0_P8__arith_replace__1",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L28",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 100.9,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row+parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (extreme_magnitude,large_magnitude,near_zero...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation changed a hyphen to a plus sign in the docstring comment, changing 'Row-parallel' to 'Row+parallel'.",
+          "reasoning": "The only change is within a docstring (triple-quoted string serving as documentation), specifically changing the character '-' to '+' in the text 'Row-parallel online softmax'. This is purely a documentation change that has no effect on the kernel's computation, control flow, or any executable code. Docstrings are not executed and do not affect runtime behavior.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "candidate_equivalent",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "equivalent_candidate_confirmed"
+    },
+    {
+      "id": "L0_P8__arith_replace__2",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L31",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 232.1,
+      "site": {
+        "line_start": 31,
+        "line_end": 31,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr - row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__arith_replace__3",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L31",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 12:22:\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softm",
+      "kill_input_seed": 42,
+      "execution_time_ms": 6.0,
+      "site": {
+        "line_start": 31,
+        "line_end": 31,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx / stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__arith_replace__4",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L32",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 97.1,
+      "site": {
+        "line_start": 32,
+        "line_end": 32,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr - row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__arith_replace__5",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L32",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 13:23:\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per ",
+      "kill_input_seed": 42,
+      "execution_time_ms": 5.9,
+      "site": {
+        "line_start": 32,
+        "line_end": 32,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx / stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__arith_replace__6",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L38",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 95.0,
+      "site": {
+        "line_start": 38,
+        "line_end": 38,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input - col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__arith_replace__7",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L42",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 93.7,
+      "site": {
+        "line_start": 42,
+        "line_end": 42,
+        "original_code": "-",
+        "node_type": "Sub"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row + row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at random trial 0"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the numerically stable softmax computation from subtracting the row maximum (row - row_max) to adding it (row + row_max).",
+          "reasoning": "The original kernel subtracts the maximum value to ensure numerical stability before exponentiation. The mutant adds the maximum instead, which will produce completely different intermediate values after exp(). For example, with input [1.0, 2.0], original computes exp([1-2, 2-2]) = exp([-1, 0]) = [0.368, 1.0], while mutant computes exp([1+2, 2+2]) = exp([3, 4]) = [20.09, 54.60]. After normalization, original gives [0.269, 0.731] but mutant gives [0.269, 0.731] - wait, the normalization cancels out the constant factor. However, for inputs where values differ significantly, the ratios change due to overflow/underflow behavior. With input [0, 100], original: exp([-100, 0]) normalized, mutant: exp([100, 200]) will overflow to inf, producing NaN results.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "tolerance_too_loose",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress",
+          "config_stress",
+          "dtype_stress",
+          "repeated_run"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "large_magnitude",
+            "trials": 1,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": true,
+            "killing_policy": "float16",
+            "trials": 1,
+            "reason": "output_differs"
+          },
+          "repeated_run": {
+            "killed": true,
+            "trials": 1,
+            "reason": "output_differs_or_nondeterministic"
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": true,
+            "killing_policy": "batch_64_s2",
+            "trials": 21,
+            "reason": "output_differs"
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P8__arith_replace__8",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L51",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 97.7,
+      "site": {
+        "line_start": 51,
+        "line_end": 51,
+        "original_code": "/",
+        "node_type": "Div"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator * denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__arith_replace__9",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L54",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 100.4,
+      "site": {
+        "line_start": 54,
+        "line_end": 54,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output - col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__arith_replace__10",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L61",
+      "status": "strict_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.7,
+      "site": {
+        "line_start": 61,
+        "line_end": 61,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row+parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "strict",
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation only changed a comment from 'row-parallel' to 'row+parallel', replacing a hyphen with a plus sign in the comment text.",
+          "reasoning": "The diff shows that only a comment on line 60 was modified, changing 'row-parallel' to 'row+parallel'. This is purely a documentation change that does not affect any executable code. Comments have no impact on program behavior, so this mutation is equivalent to the original for all valid inputs.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "strict_equivalent",
+      "post_stress_status": "equivalent_strict"
+    },
+    {
+      "id": "L0_P8__relop_replace__0",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L9",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.0,
+      "site": {
+        "line_start": 9,
+        "line_end": 9,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max ->= subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (relop_boundary_hit,boundary_last_element,structured_ramp...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation only changed a comment on line 9, replacing 'max ->' with 'max ->=' in the docstring description.",
+          "reasoning": "The diff shows the change is on line 9, which is part of the module docstring comment describing the algorithm steps. The actual executable code (the kernel function and all operators) remains completely unchanged. Since comments have no effect on program execution, this mutation is equivalent to the original for all valid inputs.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "candidate_equivalent",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "equivalent_candidate_confirmed"
+    },
+    {
+      "id": "L0_P8__relop_replace__1",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L9",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.8,
+      "site": {
+        "line_start": 9,
+        "line_end": 9,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract ->= exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (relop_boundary_hit,boundary_last_element,structured_ramp...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation only changed a comment in the docstring from 'subtract -> exp' to 'subtract ->= exp', which has no effect on the actual code execution.",
+          "reasoning": "The diff shows that the only change is on line 9, which is part of a docstring/comment describing the algorithm. The change from '->' to '->=' is purely textual within a comment and does not affect any executable code. The actual kernel logic, including the relational operator `col_offsets < n_cols` on line 34, remains unchanged. Since comments do not affect program behavior, this mutation is equivalent to the original.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "candidate_equivalent",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "equivalent_candidate_confirmed"
+    },
+    {
+      "id": "L0_P8__relop_replace__2",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L9",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.6,
+      "site": {
+        "line_start": 9,
+        "line_end": 9,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp ->= sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (relop_boundary_hit,boundary_last_element,structured_ramp...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation only changed text within a docstring comment (line 9), replacing 'exp -> sum' with 'exp ->= sum'.",
+          "reasoning": "The diff shows a change from 'exp -> sum' to 'exp ->= sum' on line 9, which is inside a docstring/comment block describing the algorithm. This is purely documentation text and has no effect on the executable code. The actual kernel logic, including all relational operators in the mask comparison and arithmetic operations, remains completely unchanged.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "candidate_equivalent",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "equivalent_candidate_confirmed"
+    },
+    {
+      "id": "L0_P8__relop_replace__3",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L9",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.6,
+      "site": {
+        "line_start": 9,
+        "line_end": 9,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum ->= divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (relop_boundary_hit,boundary_last_element,structured_ramp...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation only changed a comment string on line 9, replacing '-> divide' with '->= divide' in the docstring description.",
+          "reasoning": "The diff shows the change is only in the docstring comment describing the algorithm steps ('max -> subtract -> exp -> sum -> divide' became 'max -> subtract -> exp -> sum ->= divide'). This is purely a documentation change that does not affect any executable code. The actual kernel logic, including all relational operators in the mask computation (col_offsets < n_cols), remains unchanged. Comments have no effect on program behavior.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "candidate_equivalent",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "equivalent_candidate_confirmed"
+    },
+    {
+      "id": "L0_P8__relop_replace__4",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L35",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 99.8,
+      "site": {
+        "line_start": 35,
+        "line_end": 35,
+        "original_code": "<",
+        "node_type": "Lt"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets <= n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (relop_boundary_hit,boundary_last_element,structured_ramp...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the mask condition from `col_offsets < n_cols` to `col_offsets <= n_cols`, allowing one additional out-of-bounds element to be loaded and stored.",
+          "reasoning": "With the original mask `col_offsets < n_cols`, valid column indices 0 to n_cols-1 are processed. The mutant uses `col_offsets <= n_cols`, which includes index n_cols, an out-of-bounds access. When n_cols < BLOCK_SIZE (which is always true since BLOCK_SIZE is the next power of 2 >= n_cols, and equality only happens when n_cols is already a power of 2), this causes an out-of-bounds load (reading garbage/arbitrary memory) and an out-of-bounds store. For example, with n_cols=3 and BLOCK_SIZE=4, the original processes indices {0,1,2} while the mutant processes {0,1,2,3}, corrupting the output by including invalid data in the softmax computation and writing to an invalid memory location.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P8__relop_replace__5",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L57",
+      "status": "stillborn",
+      "error_message": "Compilation: expected ':' (mutant_L0_P8__relop_replace__5.py, line 57)",
+      "kill_input_seed": null,
+      "execution_time_ms": 0.4,
+      "site": {
+        "line_start": 57,
+        "line_end": 57,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) ->= torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "stillborn",
+      "post_stress_status": "stillborn"
+    },
+    {
+      "id": "L0_P8__relop_replace__6",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L63",
+      "status": "killed",
+      "error_message": "Runtime trial 0: too many values to unpack (expected 2)",
+      "kill_input_seed": 42,
+      "execution_time_ms": 1.8,
+      "site": {
+        "line_start": 63,
+        "line_end": 63,
+        "original_code": "==",
+        "node_type": "Eq"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim != 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__relop_replace__7",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L65",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.9,
+      "site": {
+        "line_start": 65,
+        "line_end": 65,
+        "original_code": ">",
+        "node_type": "Gt"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim >= 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (relop_boundary_hit,boundary_last_element,structured_ramp...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the condition from `x.ndim > 2` to `x.ndim >= 2`, causing 2D tensors to be unnecessarily reshaped via `.view(-1, x.shape[-1])`.",
+          "reasoning": "For a 2D input tensor, the original code skips the reshape (since `2 > 2` is false) and proceeds directly, while the mutant executes `x.view(-1, x.shape[-1])` (since `2 >= 2` is true). While for contiguous 2D tensors this view operation is typically a no-op, for non-contiguous 2D tensors (e.g., transposed tensors), `.view()` will raise a RuntimeError because view requires contiguous memory. Thus, a valid 2D non-contiguous input would cause different behavior (error in mutant vs. success in original).",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P8__relop_replace__8",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L71",
+      "status": "strict_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.8,
+      "site": {
+        "line_start": 71,
+        "line_end": 71,
+        "original_code": ">=",
+        "node_type": "cuda_GtE"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 > n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "strict",
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation only changed a comment from '# Block size must be a power of 2 >= n_cols' to '# Block size must be a power of 2 > n_cols', without modifying any actual code.",
+          "reasoning": "The diff shows only a modification to a comment on line 70, changing '>=' to '>' in the descriptive text. The actual code that computes BLOCK_SIZE using triton.next_power_of_2(n_cols) remains unchanged. Since comments have no effect on program execution, this mutation cannot produce any observable difference in output for any valid input.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "strict_equivalent",
+      "post_stress_status": "equivalent_strict"
+    },
+    {
+      "id": "L0_P8__const_perturb__0",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L65",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.9,
+      "site": {
+        "line_start": 65,
+        "line_end": 65,
+        "original_code": "2",
+        "node_type": "const:int+1"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 3:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (near_zero,boundary_last_element,sparse...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the condition for flattening high-dimensional tensors from `x.ndim > 2` to `x.ndim > 3`, meaning 3D tensors will no longer be flattened to 2D.",
+          "reasoning": "For a 3D input tensor (e.g., shape [2, 3, 4]), the original code flattens it to 2D via `x.view(-1, x.shape[-1])` before processing. The mutant skips this flattening for 3D tensors, so when `n_rows, n_cols = x.shape` executes on a 3D tensor, it will fail or produce incorrect unpacking. Even if it doesn't error, the kernel would process incorrect dimensions, producing wrong results. Any 3D input tensor would expose this difference.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P8__const_perturb__1",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L65",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.8,
+      "site": {
+        "line_start": 65,
+        "line_end": 65,
+        "original_code": "2",
+        "node_type": "const:int-1"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 1:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (near_zero,boundary_last_element,sparse...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the condition from `x.ndim > 2` to `x.ndim > 1`, causing 2D tensors to be unnecessarily reshaped with `view(-1, x.shape[-1])`.",
+          "reasoning": "For a 2D input tensor, the original code skips the reshape (since `2 > 2` is false), but the mutant executes `x = x.view(-1, x.shape[-1])` (since `2 > 1` is true). While `view(-1, x.shape[-1])` on a 2D tensor typically produces the same shape, this changes the tensor object and importantly changes `x.stride(0)`. If the original 2D tensor has non-contiguous strides (e.g., from a transpose or slice), `view()` will fail or produce different stride values, leading to incorrect memory access patterns in the kernel and different outputs.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P8__const_perturb__2",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L71",
+      "status": "strict_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.6,
+      "site": {
+        "line_start": 71,
+        "line_end": 71,
+        "original_code": "2",
+        "node_type": "const:int+1"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 3 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "strict",
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation changed only a comment string from 'power of 2' to 'power of 3' without modifying any executable code.",
+          "reasoning": "The diff shows that only the comment text on line 70 was changed from '# Block size must be a power of 2 >= n_cols' to '# Block size must be a power of 3 >= n_cols'. The actual code `BLOCK_SIZE = triton.next_power_of_2(n_cols)` remains unchanged. Since comments have no effect on program execution, this mutation cannot produce any observable difference in output for any valid input.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "strict_equivalent",
+      "post_stress_status": "equivalent_strict"
+    },
+    {
+      "id": "L0_P8__const_perturb__3",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L71",
+      "status": "strict_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 4.6,
+      "site": {
+        "line_start": 71,
+        "line_end": 71,
+        "original_code": "2",
+        "node_type": "const:int-1"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 1 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "strict",
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation changed a comment from 'power of 2' to 'power of 1', which has no effect on the executed code.",
+          "reasoning": "The diff shows only a change in a comment string on line 70 (from '# Block size must be a power of 2 >= n_cols' to '# Block size must be a power of 1 >= n_cols'). Comments are not executed and have no effect on program behavior. The actual code calling `triton.next_power_of_2(n_cols)` remains unchanged, so the kernel produces identical outputs for all valid inputs.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "strict_equivalent",
+      "post_stress_status": "equivalent_strict"
+    },
+    {
+      "id": "L0_P8__index_replace__0",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L29",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 92.2,
+      "site": {
+        "line_start": 29,
+        "line_end": 29,
+        "original_code": "tl.program_id(0)",
+        "node_type": "triton_pi|1"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(1)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__index_replace__1",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L29",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 89.0,
+      "site": {
+        "line_start": 29,
+        "line_end": 29,
+        "original_code": "tl.program_id(0)",
+        "node_type": "triton_pi|2"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(2)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__stab_remove__0",
+      "operator_name": "stab_remove",
+      "operator_category": "C",
+      "description": "Remove max-subtraction numerical stabilization (overflow on large inputs) @ L42",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 26:16:\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n",
+      "kill_input_seed": 42,
+      "execution_time_ms": 8.1,
+      "site": {
+        "line_start": 42,
+        "line_end": 42,
+        "original_code": "row - row_max",
+        "node_type": "stab:cuda_minus_max"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__reduction_reorder__0",
+      "operator_name": "reduction_reorder",
+      "operator_category": "C",
+      "description": "Reorder reduction inputs to expose non-associative FP accumulation @ L48",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 29:25:\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axi",
+      "kill_input_seed": 42,
+      "execution_time_ms": 7.4,
+      "site": {
+        "line_start": 48,
+        "line_end": 48,
+        "original_code": "tl.sum(numerator, axis=0)",
+        "node_type": "redtl:numerator:axis:0"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator[::-1], axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P8__init_modify__0",
+      "operator_name": "init_modify",
+      "operator_category": "C",
+      "description": "Weaken min/max reduction initializers (inf / -inf) @ L38",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 101.0,
+      "site": {
+        "line_start": 38,
+        "line_end": 38,
+        "original_code": "float(\"-inf\")",
+        "node_type": "init:neginf:-1e10"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float('-1e10'))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (init_sensitive,all_negative,all_positive...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the fill value for out-of-bounds elements from -inf to -1e10 when loading row data for the max reduction.",
+          "reasoning": "When all valid elements in a row have values less than -1e10 (e.g., a row containing only -1e11), the original kernel correctly computes row_max as the actual maximum of valid elements, while the mutant incorrectly computes row_max as -1e10 (from the masked positions). This causes wrong subtraction, wrong exponentials, and ultimately incorrect softmax output. For example, with input [-1e11], original gives row_max=-1e11 and output=[1.0], but mutant gives row_max=-1e10 and produces exp(-1e11-(-1e10))=exp(-9e10)≈0, leading to 0/0=NaN or incorrect results.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P8__init_modify__1",
+      "operator_name": "init_modify",
+      "operator_category": "C",
+      "description": "Weaken min/max reduction initializers (inf / -inf) @ L38",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 100.5,
+      "site": {
+        "line_start": 38,
+        "line_end": 38,
+        "original_code": "float(\"-inf\")",
+        "node_type": "init:neginf:0"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=0.0)\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (init_sensitive,all_negative,all_positive...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changed the `other` value in `tl.load` from `float(\"-inf\")` to `0.0`, which affects the padding value for masked-out elements when computing the row maximum.",
+          "reasoning": "When BLOCK_SIZE > n_cols, the masked-out positions are filled with the `other` value. The original uses `-inf` so these positions don't affect the max computation. With `0.0`, if all actual data values are negative (e.g., row = [-5, -3, -2] with n_cols=3 and BLOCK_SIZE=4), the max will incorrectly be 0.0 instead of -2, causing wrong softmax output. For example, with input [-1.0], original gives [1.0] but mutant gives [exp(-1)/(exp(-1)+exp(0))] ≈ [0.269].",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P8__broadcast_unsafe__0",
+      "operator_name": "broadcast_unsafe",
+      "operator_category": "D",
+      "description": "Remove explicit broadcast/expand to simulate LLM shape-alignment omission @ L64",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.5,
+      "site": {
+        "line_start": 64,
+        "line_end": 64,
+        "original_code": ".unsqueeze(0)",
+        "node_type": "d1:unsqueeze"
+      },
+      "original_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x.unsqueeze(0)\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel -- Softmax kernel.\n\nCurrent kernel: Online Softmax (row-parallel)\nTarget metric: throughput (higher is better)\nSecondary: correctness must ALWAYS pass\n\nEach program instance handles one row of the input tensor.\nUses numerically stable approach: max -> subtract -> exp -> sum -> divide.\n\"\"\"\n\nKERNEL_TYPE = \"softmax\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef softmax_kernel(\n    input_ptr,\n    output_ptr,\n    n_cols,\n    stride_input_row,\n    stride_output_row,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel online softmax. One program per row.\"\"\"\n    row_idx = tl.program_id(0)\n\n    row_start_input = input_ptr + row_idx * stride_input_row\n    row_start_output = output_ptr + row_idx * stride_output_row\n\n    col_offsets = tl.arange(0, BLOCK_SIZE)\n    mask = col_offsets < n_cols\n\n    # Load row\n    row = tl.load(row_start_input + col_offsets, mask=mask, other=float(\"-inf\"))\n\n    # Numerically stable softmax: subtract max\n    row_max = tl.max(row, axis=0)\n    row = row - row_max\n\n    # Exponentiate\n    numerator = tl.exp(row)\n\n    # Sum\n    denominator = tl.sum(numerator, axis=0)\n\n    # Divide\n    result = numerator / denominator\n\n    # Store\n    tl.store(row_start_output + col_offsets, result, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.softmax_ref signature.\"\"\"\n    assert x.is_cuda\n\n    # Flatten to 2D for row-parallel processing\n    orig_shape = x.shape\n    if x.ndim == 1:\n        x = x\n    elif x.ndim > 2:\n        x = x.view(-1, x.shape[-1])\n\n    n_rows, n_cols = x.shape\n    output = torch.empty_like(x)\n\n    # Block size must be a power of 2 >= n_cols\n    BLOCK_SIZE = triton.next_power_of_2(n_cols)\n\n    grid = (n_rows,)\n    softmax_kernel[grid](\n        x, output,\n        n_cols,\n        x.stride(0),\n        output.stride(0),\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n\n    return output.view(orig_shape)\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (large_magnitude,sparse,mixed_extremes...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation removes the `unsqueeze(0)` operation that converts 1D input tensors to 2D tensors with shape (1, n_cols).",
+          "reasoning": "For a 1D input tensor with shape (n,), the original code converts it to shape (1, n) before processing. The mutant leaves it as 1D, causing `n_rows, n_cols = x.shape` to fail with a ValueError since unpacking expects exactly 2 values but gets 1. Any 1D input tensor would cause the mutant to crash while the original works correctly.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    }
+  ]
+}

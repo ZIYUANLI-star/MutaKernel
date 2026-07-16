@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-security:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install linting tools
+      run: |
+        pip install flake8 bandit
+
+    - name: Code style check (flake8)
+      run: |
+        flake8 src/ scripts/ agent_bench/*.py agent_bench/methods/ agent_bench/tools/ \
+          --max-line-length=120 \
+          --select=E9,F63,F7 \
+          --ignore=F821 \
+          --exclude=__pycache__,sota_agents
+
+    - name: Security check (bandit)
+      run: |
+        bandit -r src/ scripts/ agent_bench/*.py agent_bench/methods/ agent_bench/tools/ \
+          --severity-level high \
+          --confidence-level high \
+          --exclude=./sota_agents \
+          -q || true
+
+    - name: Check for secrets
+      run: |
+        # Check for hardcoded API keys, tokens, passwords
+        if grep -rn --include="*.py" --include="*.yaml" --include="*.sh" \
+          -E "(api_key|token|password|secret)\s*=\s*['\"][^'\"]{10,}" \
+          src/ scripts/ agent_bench/ 2>/dev/null | \
+          grep -v "example\|placeholder\|your_\|dummy\|EMPTY\|environ" ; then
+          echo "ERROR: Potential hardcoded secrets detected!"
+          exit 1
+        fi
+        echo "No hardcoded secrets found."
+
+    - name: Syntax check (py_compile)
+      run: |
+        find src/ scripts/ agent_bench/ -name "*.py" -not -path "*/sota_agents/*" \
+          -not -path "*/__pycache__/*" \
+          -exec python -m py_compile {} \;
+        echo "All Python files compile successfully."

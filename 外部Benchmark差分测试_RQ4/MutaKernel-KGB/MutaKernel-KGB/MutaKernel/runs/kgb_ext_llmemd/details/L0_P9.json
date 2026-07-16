@@ -1,0 +1,1236 @@
+{
+  "kernel": {
+    "problem_id": 9,
+    "level": 0,
+    "problem_name": "rmsnorm__float16__128x512",
+    "language": "triton"
+  },
+  "summary": {
+    "total": 30,
+    "killed": 17,
+    "survived": 11,
+    "stillborn": 1,
+    "strict_equivalent": 0,
+    "candidate_equivalent": 1,
+    "equivalent": 1,
+    "mutation_score": 0.5862,
+    "mutation_score_optimistic": 0.6071,
+    "score_by_category": {
+      "A": 0.6667,
+      "B": 1.0,
+      "C": 0.1667,
+      "D": 0.0
+    },
+    "emd_layer3": "claude-opus-4-5"
+  },
+  "mutants": [
+    {
+      "id": "L0_P9__arith_replace__0",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L22",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 96.1,
+      "site": {
+        "line_start": 22,
+        "line_end": 22,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row+parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (extreme_magnitude,large_magnitude,near_zero...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": true,
+          "confidence": "high",
+          "change_summary": "The mutation changed a hyphen to a plus sign within a docstring comment, changing 'Row-parallel' to 'Row+parallel'.",
+          "reasoning": "The only change is in the docstring on line 22, which is a comment describing the function. Docstrings are not executed code and have no effect on the kernel's computation or output. This is purely a documentation change that cannot affect any numerical results for any input.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "candidate_equivalent",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "equivalent_candidate_confirmed"
+    },
+    {
+      "id": "L0_P9__arith_replace__1",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L28",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 151.7,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr - row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__2",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L28",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 15:16:\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs =",
+      "kill_input_seed": 42,
+      "execution_time_ms": 65.4,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row / stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__3",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L28",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 103.2,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm - offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__4",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L28",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 15:16:\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs =",
+      "kill_input_seed": 42,
+      "execution_time_ms": 6.4,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs / stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__5",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L31",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 102.6,
+      "site": {
+        "line_start": 31,
+        "line_end": 31,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x / x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__6",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L31",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 96.7,
+      "site": {
+        "line_start": 31,
+        "line_end": 31,
+        "original_code": "/",
+        "node_type": "Div"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) * N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__7",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L32",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 98.3,
+      "site": {
+        "line_start": 32,
+        "line_end": 32,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean - eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at random trial 0"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes `sq_mean + eps` to `sq_mean - eps` inside the square root computation for RMS normalization.",
+          "reasoning": "The original adds eps (a small positive value like 1e-6) to sq_mean before taking the square root to prevent division by zero and ensure numerical stability. The mutant subtracts eps instead, which produces a different numerical result for virtually all inputs. For example, with any non-zero input where sq_mean is small (close to eps), subtracting eps could even produce a negative value inside the sqrt, leading to NaN. Even for larger sq_mean values, the outputs will differ numerically (e.g., sqrt(0.01 + 1e-6) ≠ sqrt(0.01 - 1e-6)).",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "tolerance_too_loose",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress",
+          "config_stress",
+          "dtype_stress",
+          "repeated_run"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "near_zero",
+            "trials": 5,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": true,
+            "killing_policy": "bfloat16",
+            "trials": 1,
+            "reason": "output_differs"
+          },
+          "repeated_run": {
+            "killed": true,
+            "trials": 1,
+            "reason": "output_differs_or_nondeterministic"
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": true,
+            "killing_policy": "batch_1_s0",
+            "trials": 1,
+            "reason": "output_differs"
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__arith_replace__8",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L35",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 93.8,
+      "site": {
+        "line_start": 35,
+        "line_end": 35,
+        "original_code": "/",
+        "node_type": "Div"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x * rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__9",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L38",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 99.2,
+      "site": {
+        "line_start": 38,
+        "line_end": 38,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr - offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__10",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L39",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 101.0,
+      "site": {
+        "line_start": 39,
+        "line_end": 39,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm / w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__11",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L42",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 95.3,
+      "site": {
+        "line_start": 42,
+        "line_end": 42,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr - row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__12",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L42",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 29:13:\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask",
+      "kill_input_seed": 42,
+      "execution_time_ms": 8.8,
+      "site": {
+        "line_start": 42,
+        "line_end": 42,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row / stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__13",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L42",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 109.5,
+      "site": {
+        "line_start": 42,
+        "line_end": 42,
+        "original_code": "+",
+        "node_type": "Add"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om - offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__14",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L42",
+      "status": "killed",
+      "error_message": "Runtime trial 0: at 29:13:\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask",
+      "kill_input_seed": 42,
+      "execution_time_ms": 8.9,
+      "site": {
+        "line_start": 42,
+        "line_end": 42,
+        "original_code": "*",
+        "node_type": "Mult"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs / stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__arith_replace__15",
+      "operator_name": "arith_replace",
+      "operator_category": "A",
+      "description": "Replace binary arithmetic operators (+→-, -→+, *→/, /→*) @ L45",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 4.1,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": "-",
+        "node_type": "cuda_Sub"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e+6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__relop_replace__0",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L25",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 95.8,
+      "site": {
+        "line_start": 25,
+        "line_end": 25,
+        "original_code": "<",
+        "node_type": "Lt"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs <= N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (relop_boundary_hit,boundary_last_element,structured_ramp...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the mask condition from `offs < N` to `offs <= N`, causing one additional element (at index N) to be included in loads and stores.",
+          "reasoning": "The original mask `offs < N` correctly selects indices 0 to N-1 for a row of length N. The mutant uses `offs <= N`, which includes index N, an out-of-bounds access. When BLOCK_SIZE > N (which is common since BLOCK_SIZE is the next power of 2 of N), the mutant will load an extra element from memory (potentially garbage or out-of-bounds data), include it in the RMS computation, and store to an out-of-bounds location. For example, with N=3 and BLOCK_SIZE=4, the original processes indices {0,1,2} while the mutant processes {0,1,2,3}, causing incorrect normalization values and potential memory corruption.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P9__relop_replace__1",
+      "operator_name": "relop_replace",
+      "operator_category": "A",
+      "description": "Replace relational operators (<→<=, <=→<, >→>=, >=→>, ==→!=, !=→==) @ L45",
+      "status": "stillborn",
+      "error_message": "Compilation: expected ':' (mutant_L0_P9__relop_replace__1.py, line 45)",
+      "kill_input_seed": null,
+      "execution_time_ms": 0.4,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": ">",
+        "node_type": "cuda_Gt"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) ->= torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "stillborn",
+      "post_stress_status": "stillborn"
+    },
+    {
+      "id": "L0_P9__const_perturb__0",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L45",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.5,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": "1e-6",
+        "node_type": "const:float*0.99"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 9.9e-07) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at stress structured_ramp[0]"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changed the default value of the eps parameter from 1e-6 to 9.9e-07 (approximately 0.99 * 1e-6).",
+          "reasoning": "The eps parameter is used in the RMS normalization computation as a stabilizing term added before taking the square root: rms = sqrt(sq_mean + eps). When kernel_fn is called without explicitly providing the eps argument, the mutant will use 9.9e-07 instead of 1e-6, which produces a different RMS value and consequently different normalized outputs. For any input where the caller relies on the default eps value (not passing it explicitly), the outputs will differ numerically. For example, a row with all zeros would produce rms = sqrt(0 + eps), giving sqrt(1e-6) ≈ 0.001 vs sqrt(9.9e-07) ≈ 0.000995, causing observable output differences.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "tolerance_too_loose",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "structured_ramp",
+            "trials": 21,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__const_perturb__1",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L45",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.5,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": "1e-6",
+        "node_type": "const:float*1.01"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1.01e-06) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at stress structured_ramp[0]"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changed the default value of the eps parameter from 1e-6 to 1.01e-6 (a 1% increase).",
+          "reasoning": "When kernel_fn is called without explicitly providing the eps argument, the mutant uses eps=1.01e-6 instead of eps=1e-6. This different epsilon value flows into the RMS normalization computation (rms = sqrt(sq_mean + eps)), which will produce slightly different normalized outputs. For inputs where the caller relies on the default eps value, the output will differ by a small but observable amount, especially for rows with small squared means where the epsilon term dominates.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "tolerance_too_loose",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "structured_ramp",
+            "trials": 21,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__const_perturb__2",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L45",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.2,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": "6",
+        "node_type": "const:int+1"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at random trial 0"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changed the default value of the epsilon parameter from 1e-6 to 1e-7 in the kernel_fn function signature.",
+          "reasoning": "The epsilon parameter is used in the RMS normalization calculation as `rms = sqrt(sq_mean + eps)` to prevent division by zero and ensure numerical stability. When the caller relies on the default eps value (i.e., calls kernel_fn(x, weight) without explicitly passing eps), the mutant will use 1e-7 instead of 1e-6, producing different numerical results. For any input where sq_mean is small (e.g., near-zero input values), the difference in eps will directly affect the computed rms value and consequently the normalized output.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "tolerance_too_loose",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress",
+          "config_stress",
+          "dtype_stress",
+          "repeated_run"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "structured_ramp",
+            "trials": 21,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": true,
+            "killing_policy": "bfloat16",
+            "trials": 1,
+            "reason": "output_differs"
+          },
+          "repeated_run": {
+            "killed": true,
+            "trials": 1,
+            "reason": "output_differs_or_nondeterministic"
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": true,
+            "killing_policy": "batch_1_s1",
+            "trials": 2,
+            "reason": "output_differs"
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__const_perturb__3",
+      "operator_name": "const_perturb",
+      "operator_category": "A",
+      "description": "Perturb numeric literals (integer ±1; float ×1.01 or ×0.99) @ L45",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 5.1,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": "6",
+        "node_type": "const:int-1"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at random trial 0"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the default value of the `eps` parameter from 1e-6 to 1e-5 in the `kernel_fn` function signature.",
+          "reasoning": "When `kernel_fn` is called without explicitly passing an `eps` argument, the original uses eps=1e-6 while the mutant uses eps=1e-5. This directly affects the RMS normalization computation: `rms = sqrt(sq_mean + eps)`. For any input where the default eps is used, the denominator changes, producing different output values. For example, with a row of small values where sq_mean is near 0, the difference between adding 1e-6 vs 1e-5 will noticeably affect the normalized output.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "tolerance_too_loose",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress",
+          "config_stress",
+          "dtype_stress",
+          "repeated_run"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "structured_ramp",
+            "trials": 21,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": true,
+            "killing_policy": "bfloat16",
+            "trials": 1,
+            "reason": "output_differs"
+          },
+          "repeated_run": {
+            "killed": true,
+            "trials": 1,
+            "reason": "output_differs_or_nondeterministic"
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": true,
+            "killing_policy": "batch_1_s0",
+            "trials": 1,
+            "reason": "output_differs"
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__index_replace__0",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L23",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 91.8,
+      "site": {
+        "line_start": 23,
+        "line_end": 23,
+        "original_code": "tl.program_id(0)",
+        "node_type": "triton_pi|1"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(1)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__index_replace__1",
+      "operator_name": "index_replace",
+      "operator_category": "B",
+      "description": "Swap Triton program_id axis or CUDA thread/block dimension index (e.g. program_id(0)→(1), threadIdx.x→threadIdx.y) @ L23",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 42,
+      "execution_time_ms": 105.7,
+      "site": {
+        "line_start": 23,
+        "line_end": 23,
+        "original_code": "tl.program_id(0)",
+        "node_type": "triton_pi|2"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(2)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__acc_downgrade__0",
+      "operator_name": "acc_downgrade",
+      "operator_category": "C",
+      "description": "Downgrade FP32 accumulators to FP16 / half precision @ L28",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 101.5,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": ".to(tl.float32)",
+        "node_type": "acc:to_tl_fp32"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float16)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at random trial 0"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation downgrades the accumulator precision from float32 to float16 when loading and processing input values.",
+          "reasoning": "The original kernel explicitly casts loaded values to float32 for numerical stability during RMS computation. The mutant uses float16 instead, which has significantly reduced precision (about 3-4 decimal digits vs 7) and a much smaller representable range (max ~65504). For inputs with values outside float16 range, or when computing sum of squares for large N, the float16 accumulator will overflow or lose significant precision. A simple test with large values (e.g., x > 256 causing x*x > 65504) or many moderate values summed together would produce different results.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "dtype_or_numerics_gap",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress",
+          "config_stress",
+          "dtype_stress",
+          "repeated_run"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "large_magnitude",
+            "trials": 1,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": true,
+            "killing_policy": "bfloat16",
+            "trials": 1,
+            "reason": "output_differs"
+          },
+          "repeated_run": {
+            "killed": true,
+            "trials": 1,
+            "reason": "output_differs_or_nondeterministic"
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": true,
+            "killing_policy": "batch_1_s0",
+            "trials": 1,
+            "reason": "output_differs"
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__acc_downgrade__1",
+      "operator_name": "acc_downgrade",
+      "operator_category": "C",
+      "description": "Downgrade FP32 accumulators to FP16 / half precision @ L38",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 100.7,
+      "site": {
+        "line_start": 38,
+        "line_end": 38,
+        "original_code": ".to(tl.float32)",
+        "node_type": "acc:to_tl_fp32"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float16)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (reduction_adversarial,large_magnitude,mixed_extremes...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation downgrades the weight tensor cast from float32 to float16, reducing precision in the accumulator used for the final scaling multiplication.",
+          "reasoning": "The original kernel casts the loaded weight to float32 for the multiplication `out = x_norm * w`, ensuring full single-precision accuracy. The mutant casts to float16 instead, which has significantly reduced precision (10-bit mantissa vs 23-bit) and a smaller dynamic range (max ~65504). For weights or normalized values outside float16's representable range, or for values requiring more precision than float16 provides, the outputs will differ observably. For example, a weight value of 100000.0 would overflow in float16 (becoming inf), or subtle precision differences would appear even for normal values.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    },
+    {
+      "id": "L0_P9__epsilon_modify__0",
+      "operator_name": "epsilon_modify",
+      "operator_category": "C",
+      "description": "Alter small epsilon literals (LayerNorm / safe_div / log stability) @ L45",
+      "status": "killed",
+      "error_message": "",
+      "kill_input_seed": 45,
+      "execution_time_ms": 5.4,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": "1e-6",
+        "node_type": "eps:to_1e-2"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-2) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "final_emd_status": "killed",
+      "post_stress_status": "killed_baseline"
+    },
+    {
+      "id": "L0_P9__epsilon_modify__1",
+      "operator_name": "epsilon_modify",
+      "operator_category": "C",
+      "description": "Alter small epsilon literals (LayerNorm / safe_div / log stability) @ L45",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 223.9,
+      "site": {
+        "line_start": 45,
+        "line_end": 45,
+        "original_code": "1e-6",
+        "node_type": "eps:to_zero"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 0) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at random trial 0"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation changes the default epsilon value from 1e-6 to 0 in the kernel_fn function signature.",
+          "reasoning": "The epsilon parameter is used to prevent division by zero in the RMS normalization calculation (rms = sqrt(sq_mean + eps)). With eps=0, if a row contains all zeros, sq_mean becomes 0, rms becomes 0, and x_norm = x / rms results in NaN or inf due to division by zero. The original eps=1e-6 prevents this. Any input with an all-zero row (a valid input for normalization) will produce different outputs between original (finite values) and mutant (NaN/inf values).",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "dtype_or_numerics_gap",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress",
+          "config_stress",
+          "dtype_stress",
+          "repeated_run"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "near_zero",
+            "trials": 5,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": true,
+            "killing_policy": "bfloat16",
+            "trials": 1,
+            "reason": "output_differs"
+          },
+          "repeated_run": {
+            "killed": true,
+            "trials": 1,
+            "reason": "output_differs_or_nondeterministic"
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": true,
+            "killing_policy": "batch_1_s1",
+            "trials": 2,
+            "reason": "output_differs"
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__cast_remove__0",
+      "operator_name": "cast_remove",
+      "operator_category": "C",
+      "description": "Remove explicit dtype casts (.to, .float, tl.cast, static_cast) @ L28",
+      "status": "survived",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 96.4,
+      "site": {
+        "line_start": 28,
+        "line_end": 28,
+        "original_code": ".to(tl.float32)",
+        "node_type": "cast:remove_to_tl"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": false,
+          "detail": "diverged at random trial 0"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation removes the explicit cast of loaded x values to float32, causing computation to occur in the input tensor's native dtype instead of guaranteed float32.",
+          "reasoning": "When the input tensor x is float16 or bfloat16, the original kernel explicitly casts to float32 for numerical stability during RMS computation (squaring, summing, division). The mutant performs these operations in the native lower precision, which can cause overflow in the squaring operation (e.g., values > 256 in float16 will overflow when squared) or significant precision loss. A float16 input with values around 300 would produce inf when squared in float16 but compute correctly in float32.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "fault_category": "dtype_or_numerics_gap",
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": true,
+        "first_kill_mode": "value_stress",
+        "killed_dimensions": [
+          "value_stress",
+          "config_stress",
+          "dtype_stress",
+          "repeated_run"
+        ],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": true,
+            "killing_policy": "large_magnitude",
+            "trials": 1,
+            "original_failures": [],
+            "reason": "output_differs"
+          },
+          "dtype_stress": {
+            "killed": true,
+            "killing_policy": "bfloat16",
+            "trials": 1,
+            "reason": "output_differs"
+          },
+          "repeated_run": {
+            "killed": true,
+            "trials": 1,
+            "reason": "output_differs_or_nondeterministic"
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": true,
+            "killing_policy": "batch_1_s0",
+            "trials": 1,
+            "reason": "output_differs"
+          }
+        }
+      },
+      "post_stress_status": "killed_by_mutakernel"
+    },
+    {
+      "id": "L0_P9__cast_remove__1",
+      "operator_name": "cast_remove",
+      "operator_category": "C",
+      "description": "Remove explicit dtype casts (.to, .float, tl.cast, static_cast) @ L38",
+      "status": "candidate_equivalent",
+      "error_message": "",
+      "kill_input_seed": null,
+      "execution_time_ms": 105.1,
+      "site": {
+        "line_start": 38,
+        "line_end": 38,
+        "original_code": ".to(tl.float32)",
+        "node_type": "cast:remove_to_tl"
+      },
+      "original_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0).to(tl.float32)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "mutated_code": "\"\"\"\nAutoKernel starter -- RMS Normalization\nBasic Triton kernel. The agent improves this.\n\"\"\"\n\nKERNEL_TYPE = \"rmsnorm\"\n\nimport torch\nimport triton\nimport triton.language as tl\n\n\n@triton.jit\ndef rmsnorm_kernel(\n    X_ptr, W_ptr, OUT_ptr,\n    M, N,\n    stride_xm, stride_xn,\n    stride_om, stride_on,\n    eps,\n    BLOCK_SIZE: tl.constexpr,\n):\n    \"\"\"Row-parallel RMS normalization.\"\"\"\n    row = tl.program_id(0)\n    offs = tl.arange(0, BLOCK_SIZE)\n    mask = offs < N\n\n    # Load row into float32 for numerical stability\n    x = tl.load(X_ptr + row * stride_xm + offs * stride_xn, mask=mask, other=0.0).to(tl.float32)\n\n    # Compute RMS\n    sq_mean = tl.sum(x * x, axis=0) / N\n    rms = tl.sqrt(sq_mean + eps)\n\n    # Normalize\n    x_norm = x / rms\n\n    # Scale by weight\n    w = tl.load(W_ptr + offs, mask=mask, other=0.0)\n    out = x_norm * w\n\n    # Store (cast back to input dtype via the output tensor's dtype)\n    tl.store(OUT_ptr + row * stride_om + offs * stride_on, out, mask=mask)\n\n\ndef kernel_fn(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:\n    \"\"\"Entry point called by bench.py. Must match reference.rmsnorm_ref signature.\"\"\"\n    assert x.is_cuda\n    M, N = x.shape\n    out = torch.empty_like(x)\n\n    BLOCK_SIZE = triton.next_power_of_2(N)\n\n    rmsnorm_kernel[(M,)](\n        x, weight, out,\n        M, N,\n        x.stride(0), x.stride(1),\n        out.stride(0), out.stride(1),\n        eps,\n        BLOCK_SIZE=BLOCK_SIZE,\n    )\n    return out\n\n\n# ---- MutaKernel ModelNew wrapper (appended by KernelGenBenchBridge) ----\nimport torch.nn as _nn\n\n\nclass ModelNew(_nn.Module):\n    def __init__(self):\n        super().__init__()\n\n    def forward(self, *args):\n        return kernel_fn(*args)\n",
+      "equiv_detail": {
+        "layer0": "",
+        "layer1": null,
+        "layer2": {
+          "is_equivalent": true,
+          "detail": "100 random + 12 stress (extreme_magnitude,near_zero,mixed_extremes...), bitwise identical"
+        },
+        "layer3": {
+          "llm_equivalent": false,
+          "confidence": "high",
+          "change_summary": "The mutation removes the explicit cast of the loaded weight tensor `w` from its native dtype to float32.",
+          "reasoning": "When the weight tensor is stored in a lower precision dtype like float16 or bfloat16, the original kernel explicitly casts `w` to float32 before multiplying with `x_norm` (which is in float32). The mutant keeps `w` in its original dtype, causing the multiplication `x_norm * w` to potentially use lower precision arithmetic. For float16 weights with float32 normalized values, this will produce different numerical results due to precision differences and potential overflow/underflow in the reduced precision computation.",
+          "model": "claude-opus-4-5"
+        }
+      },
+      "final_emd_status": "survived",
+      "stress_result": {
+        "killed": false,
+        "first_kill_mode": null,
+        "killed_dimensions": [],
+        "crash_kill": false,
+        "main_track": {
+          "value_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 42,
+            "original_failures": []
+          },
+          "dtype_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 2
+          },
+          "repeated_run": {
+            "killed": false,
+            "trials": 3
+          }
+        },
+        "config_track": {
+          "config_stress": {
+            "killed": false,
+            "killing_policy": null,
+            "trials": 21
+          }
+        }
+      },
+      "post_stress_status": "surviving_after_mutakernel"
+    }
+  ]
+}
