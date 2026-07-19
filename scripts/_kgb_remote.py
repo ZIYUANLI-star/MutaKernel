@@ -1,30 +1,64 @@
-"""Helper: run a command on the remote GPU server over SSH (password auth).
+"""Helper: run a command on a remote GPU server over SSH.
 
 Usage:
     python scripts/_kgb_remote.py "command to run"
     python scripts/_kgb_remote.py --put localfile remotepath
     python scripts/_kgb_remote.py --get remotepath localfile
 
-Connection params are for the user's own rented GPU box.
+Connection parameters are read from the environment.  No credentials should
+ever be committed to the repository.
+
+Required environment variables:
+
+    MUTAKERNEL_SSH_HOST
+    MUTAKERNEL_SSH_USER
+
+Optional environment variables:
+
+    MUTAKERNEL_SSH_PORT          (default: 22)
+    MUTAKERNEL_SSH_KEY           (private-key path)
+    MUTAKERNEL_SSH_PASSWORD      (prefer a key; never persist this value)
+    MUTAKERNEL_SSH_KNOWN_HOSTS   (additional known-hosts file)
 """
 from __future__ import annotations
 
+import os
+import shlex
 import sys
+import uuid
+
 import paramiko
 
-HOST = "connect.nma1.seetacloud.com"
-PORT = 22841
-USER = "root"
-PASS = "TIdIHhvPb0cT"
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        raise RuntimeError(f"required environment variable is not set: {name}")
+    return value
 
 
 def _client() -> paramiko.SSHClient:
+    host = _required_env("MUTAKERNEL_SSH_HOST")
+    user = _required_env("MUTAKERNEL_SSH_USER")
+    port = int(os.environ.get("MUTAKERNEL_SSH_PORT", "22"))
+    key_filename = os.environ.get("MUTAKERNEL_SSH_KEY") or None
+    password = os.environ.get("MUTAKERNEL_SSH_PASSWORD") or None
+
     c = paramiko.SSHClient()
-    c.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    c.load_system_host_keys()
+    known_hosts = os.environ.get("MUTAKERNEL_SSH_KNOWN_HOSTS")
+    if known_hosts:
+        c.load_host_keys(os.path.expanduser(known_hosts))
+    c.set_missing_host_key_policy(paramiko.RejectPolicy())
     c.connect(
-        HOST, port=PORT, username=USER, password=PASS,
+        host,
+        port=port,
+        username=user,
+        password=password,
+        key_filename=os.path.expanduser(key_filename) if key_filename else None,
         timeout=30, banner_timeout=30, auth_timeout=30,
-        look_for_keys=False, allow_agent=False,
+        look_for_keys=key_filename is None and password is None,
+        allow_agent=key_filename is None and password is None,
     )
     return c
 
@@ -72,15 +106,14 @@ def get(remote: str, local: str) -> int:
 
 def run_script(local_path: str, timeout: int = 3600) -> int:
     """Upload a local shell script to /tmp and run it with bash."""
-    import os
     c = _client()
+    remote = f"/tmp/mutakernel-{uuid.uuid4().hex}.sh"
     try:
         sftp = c.open_sftp()
-        remote = "/tmp/_kgb_remote_script.sh"
         sftp.put(local_path, remote)
         sftp.close()
         stdin, stdout, stderr = c.exec_command(
-            f"bash {remote}", timeout=timeout, get_pty=False)
+            f"bash {shlex.quote(remote)}", timeout=timeout, get_pty=False)
         out = stdout.read().decode("utf-8", "replace")
         err = stderr.read().decode("utf-8", "replace")
         rc = stdout.channel.recv_exit_status()
@@ -91,6 +124,10 @@ def run_script(local_path: str, timeout: int = 3600) -> int:
         sys.stdout.write(f"\n[EXIT {rc}]\n")
         return rc
     finally:
+        try:
+            c.exec_command(f"rm -f -- {shlex.quote(remote)}", timeout=30)
+        except Exception:
+            pass
         c.close()
 
 
