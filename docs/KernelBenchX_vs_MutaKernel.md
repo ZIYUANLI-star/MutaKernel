@@ -1,5 +1,11 @@
 # KernelBenchX vs. MutaKernel：对比与互补性分析
 
+> **Historical pre-FSE design/result note.** This file documents an obsolete
+> pilot protocol. Its numeric, equivalence, LLM-audit, novelty, and effectiveness
+> claims are not current evidence. Use `FSE_CODE_REMEDIATION.md`,
+> `LEGACY_RESULT_VALIDITY.md`, and `FSE_EXPERIMENT_RUNBOOK.md` as the canonical
+> sources.
+
 > **对象**：KernelBenchX (Wang, Zhang et al., arXiv:2605.04956v2, 2026-05) vs. MutaKernel (本项目, EuroSys 投稿)
 >
 > **目的**：为 EuroSys 论文 Related Work / Threats to Validity / Future Work 提供素材；

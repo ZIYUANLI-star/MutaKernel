@@ -1,5 +1,11 @@
 # Mutation-Guided Diagnosis and Augmentation of GPU Kernel Test Suites
 
+> **Historical pre-FSE design/result note.** This file documents an obsolete
+> pilot protocol. Its numeric, equivalence, LLM-audit, novelty, and effectiveness
+> claims are not current evidence. Use `FSE_CODE_REMEDIATION.md`,
+> `LEGACY_RESULT_VALIDITY.md`, and `FSE_EXPERIMENT_RUNBOOK.md` as the canonical
+> sources.
+
 > **目标会议**: ICSE 2027
 >
 > **项目代号**: MutaKernel

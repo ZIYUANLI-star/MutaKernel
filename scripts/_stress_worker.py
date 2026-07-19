@@ -14,6 +14,7 @@ For a given (original_kernel, mutant_kernel, stress_policy):
   5. Write results to JSON
 """
 import hashlib
+import functools
 import json
 import os
 import sys
@@ -26,11 +27,174 @@ def _code_hash(code: str) -> str:
     """Short hash of kernel code for stable CUDA extension naming."""
     return hashlib.md5(code.encode()).hexdigest()[:10]
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+_INFRASTRUCTURE_TERMS = (
+    "out of memory",
+    "cuda oom",
+    "timed out",
+    "timeout",
+    "gpu_preflight_fail",
+    "workercrash",
+)
+
+_SETUP_TERMS = (
+    "unknown policy",
+    "build:",
+    "orig compile",
+    "get_inputs_error",
+    "rebatch_error",
+    "dtype_unsupported",
+    "unsupported dtype",
+    "llm_code_exec",
+    "llm_generate",
+    "missing generate_inputs",
+    "state_dict keys differ",
+    "state synchronization",
+)
+
+
+def _collect_error_messages(value, path="result", limit=20):
+    """Collect JSON-safe diagnostics without treating outputs as exceptions."""
+    found = []
+
+    def visit(item, item_path):
+        if len(found) >= limit:
+            return
+        if isinstance(item, dict):
+            for key, child in item.items():
+                child_path = f"{item_path}.{key}"
+                if key in {"error", "mut_error"} and child:
+                    found.append({
+                        "phase": child_path,
+                        "type": "ExecutionError",
+                        "message": str(child)[:500],
+                    })
+                elif key in {"status", "reason"} and isinstance(child, str) and any(
+                    token in child.lower()
+                    for token in ("crash", "error", "diverge", "unsupported", "nan_inf")
+                ):
+                    found.append({
+                        "phase": child_path,
+                        "type": "ValidationDiagnostic",
+                        "message": child[:500],
+                    })
+                else:
+                    visit(child, child_path)
+        elif isinstance(item, (list, tuple)):
+            for index, child in enumerate(item):
+                visit(child, f"{item_path}[{index}]")
+
+    visit(value, path)
+    return found
+
+
+def _normalize_validation_result(result):
+    """Add three-valued semantics while preserving legacy JSON fields.
+
+    Legacy consumers infer a kill from ``original_ok and not mutant_ok``.  For
+    inconclusive runs we conservatively clear those booleans as well as
+    ``killed`` so an infrastructure or oracle failure cannot become a kill.
+    """
+    if not isinstance(result, dict):
+        result = {"error": f"worker returned {type(result).__name__}, expected dict"}
+    result = dict(result)
+    if "bitwise_orig_mut_eq" in result:
+        # Bitwise determinism is not part of the default numerical correctness
+        # contract.  Older orchestrators treat False as an unconditional kill,
+        # so retain the observation separately and neutralize that legacy path.
+        result.setdefault(
+            "observed_bitwise_orig_mut_eq",
+            bool(result["bitwise_orig_mut_eq"]),
+        )
+        result["bitwise_orig_mut_eq"] = True
+    errors = list(result.get("errors") or [])
+    errors.extend(_collect_error_messages(result))
+
+    def contains_invalid_baseline(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                if key in {"ref_ok", "orig_ok", "original_ok"} and child is False:
+                    return True
+                if contains_invalid_baseline(child):
+                    return True
+        elif isinstance(value, (list, tuple)):
+            return any(contains_invalid_baseline(child) for child in value)
+        return False
+
+    text = " ".join(str(error.get("message", "")) for error in errors).lower()
+    explicit_status = result.get("validation_status")
+    # Infrastructure and invalid-baseline evidence always override a stale or
+    # optimistic status supplied by a caller.
+    if any(term in text for term in _INFRASTRUCTURE_TERMS):
+        status = "inconclusive"
+    elif contains_invalid_baseline(result):
+        status = "inconclusive"
+    elif any(term in text for term in _SETUP_TERMS):
+        status = "inconclusive"
+    elif explicit_status in {"pass", "fail", "inconclusive"}:
+        status = explicit_status
+    elif result.get("killed") is True:
+        status = "fail"
+    elif (
+        result.get("ref_ok") is True
+        and result.get("original_ok") is True
+        and result.get("mutant_ok") is False
+    ):
+        status = "fail"
+    elif errors:
+        status = "inconclusive"
+    else:
+        status = "pass"
+
+    existing_reason = result.get("reason")
+    if status == "pass":
+        reason = existing_reason or "all valid reference/original/candidate comparisons passed"
+    elif status == "fail":
+        reason = existing_reason or "candidate crashed or diverged under a valid reference/original comparison"
+        result["killed"] = True
+    else:
+        reason = existing_reason or (
+            errors[0]["message"] if errors else "validation could not make a sound comparison"
+        )
+        # Preserve any observed values separately, then encode the conservative
+        # legacy state so older aggregation scripts cannot count a false kill.
+        result.setdefault("observed_ref_ok", result.get("ref_ok"))
+        result.setdefault("observed_original_ok", result.get("original_ok"))
+        result.setdefault("observed_mutant_ok", result.get("mutant_ok"))
+        result["ref_ok"] = False
+        result["original_ok"] = False
+        result["mutant_ok"] = False
+        result["killed"] = False
+
+    result["validation_status"] = status
+    result["reason"] = reason
+    result["errors"] = errors
+    return result
+
+
+def _sound_mode_result(function):
+    """Make every mode return the shared legacy-compatible three-value schema."""
+    @functools.wraps(function)
+    def wrapped(*args, **kwargs):
+        try:
+            return _normalize_validation_result(function(*args, **kwargs))
+        except Exception as exc:
+            return _normalize_validation_result({
+                "ref_ok": False,
+                "original_ok": False,
+                "mutant_ok": False,
+                "killed": False,
+                "error": f"validator setup failed: {type(exc).__name__}: {str(exc)[:500]}",
+                "validation_status": "inconclusive",
+                "time_ms": 0.0,
+            })
+
+    return wrapped
 
 
 def _has_nan_inf(out):
@@ -44,15 +208,38 @@ def _has_nan_inf(out):
 
 def _allclose(a, b, atol, rtol):
     import torch
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        if a.shape != b.shape:
-            return False
-        return torch.allclose(a.float().cpu(), b.float().cpu(), atol=atol, rtol=rtol)
-    if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
-        if len(a) != len(b):
-            return False
-        return all(_allclose(x, y, atol, rtol) for x, y in zip(a, b))
-    return a == b
+    from src.validation import OracleConfig, Tolerance, ValidationStatus, compare_outputs
+
+    tolerance = Tolerance(rtol=float(rtol), atol=float(atol))
+    configured_dtypes = {
+        torch.float16: tolerance,
+        torch.bfloat16: tolerance,
+        torch.float32: tolerance,
+        torch.float64: tolerance,
+        torch.complex64: tolerance,
+        torch.complex128: tolerance,
+    }
+    comparison = compare_outputs(
+        a,
+        b,
+        OracleConfig(
+            default_tolerance=tolerance,
+            dtype_tolerances=configured_dtypes,
+            equal_nan=True,
+            require_dtype=True,
+            require_device=True,
+            require_layout=True,
+        ),
+    )
+    return comparison.status is ValidationStatus.PASS
+
+
+def _call_isolated(model, inputs):
+    """Invoke a model with a recursively cloned input tree."""
+    from src.validation import clone_call_inputs
+
+    args, kwargs = clone_call_inputs(tuple(inputs), {})
+    return model(*args, **kwargs)
 
 
 def _compute_diff_summary(ref_out, orig_out):
@@ -84,34 +271,13 @@ def _compute_diff_summary(ref_out, orig_out):
 
 
 def _sync_weights(src_model, dst_model):
-    """Copy weights from src to dst by matching parameter shapes in order.
+    """Synchronize state by exact keys; failures are never guessed or hidden."""
+    from src.validation import strict_sync_state_dict
 
-    Handles cases where parameter names differ (e.g. nn.Linear vs FusedDense)
-    but shapes and order are the same.
-    """
-    import torch
-    try:
-        dst_model.load_state_dict(src_model.state_dict())
-        return True
-    except Exception:
-        pass
-    try:
-        src_vals = list(src_model.state_dict().values())
-        dst_sd = dst_model.state_dict()
-        dst_keys = list(dst_sd.keys())
-        if len(src_vals) != len(dst_keys):
-            return False
-        for i, key in enumerate(dst_keys):
-            if src_vals[i].shape == dst_sd[key].shape:
-                dst_sd[key] = src_vals[i].clone()
-            else:
-                return False
-        dst_model.load_state_dict(dst_sd)
-        return True
-    except Exception:
-        return False
+    return strict_sync_state_dict(src_model, dst_model)
 
 
+@_sound_mode_result
 def run_stress(cfg):
     import torch
     from src.mutengine.mutant_runner import _load_module_from_source, CompilationError
@@ -158,7 +324,7 @@ def run_stress(cfg):
     ref_model = ref_model.to(device).eval()
     with torch.no_grad():
         try:
-            ref_out = ref_model(*stress_on_device)
+            ref_out = _call_isolated(ref_model, stress_on_device)
         except Exception as e:
             return {"ref_ok": False, "original_ok": False, "mutant_ok": False,
                     "error": f"ref crash: {str(e)[:200]}",
@@ -181,20 +347,14 @@ def run_stress(cfg):
     orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
                   else orig_cls())
     orig_model = orig_model.to(device).eval()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, orig_model)
+    _sync_weights(ref_model, orig_model)
 
     original_ok = False
     orig_out = None
     with torch.no_grad():
         try:
-            orig_out = orig_model(*stress_on_device)
-            if ref_nan:
-                original_ok = not _has_nan_inf(orig_out)
-            else:
-                original_ok = _allclose(ref_out, orig_out, atol, rtol)
-                if _has_nan_inf(orig_out):
-                    original_ok = False
+            orig_out = _call_isolated(orig_model, stress_on_device)
+            original_ok = _allclose(ref_out, orig_out, atol, rtol)
         except Exception:
             original_ok = False
 
@@ -204,12 +364,13 @@ def run_stress(cfg):
                 "error": "ref NaN/Inf and original also invalid",
                 "time_ms": (time.time() - t0) * 1000}
 
-    compare_target = orig_out if ref_nan else ref_out
+    compare_target = ref_out
 
     if is_same_code:
         mutant_ok = original_ok
         bitwise_orig_mut_eq = True
         mut_out = orig_out
+        mut_error = ""
     else:
         try:
             mut_mod = _load_module_from_source(
@@ -225,18 +386,17 @@ def run_stress(cfg):
         mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
                       else mut_cls())
         mut_model = mut_model.to(device).eval()
-        if cfg.get("sync_weights"):
-            _sync_weights(ref_model, mut_model)
+        _sync_weights(ref_model, mut_model)
 
         mutant_ok = False
+        mut_error = ""
         with torch.no_grad():
             try:
-                mut_out = mut_model(*stress_on_device)
+                mut_out = _call_isolated(mut_model, stress_on_device)
                 mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
-                if _has_nan_inf(mut_out):
-                    mutant_ok = False
-            except Exception:
+            except Exception as e:
                 mutant_ok = False
+                mut_error = f"mutant crash: {str(e)[:200]}"
 
         bitwise_orig_mut_eq = False
         if orig_out is not None and mutant_ok is not None:
@@ -259,6 +419,7 @@ def run_stress(cfg):
         "mutant_ok": mutant_ok,
         "bitwise_orig_mut_eq": bitwise_orig_mut_eq,
         "diff_summary": diff_summary,
+        "error": mut_error,
         "time_ms": (time.time() - t0) * 1000,
     }
 
@@ -292,8 +453,7 @@ def _build_models(cfg, seed_suffix, device):
     orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
                   else orig_cls())
     orig_model = orig_model.to(device).eval()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, orig_model)
+    _sync_weights(ref_model, orig_model)
 
     if is_same_code:
         mut_model = orig_model
@@ -304,12 +464,12 @@ def _build_models(cfg, seed_suffix, device):
         mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
                      else mut_cls())
         mut_model = mut_model.to(device).eval()
-        if cfg.get("sync_weights"):
-            _sync_weights(ref_model, mut_model)
+        _sync_weights(ref_model, mut_model)
 
     return ref_model, orig_model, mut_model, get_inputs, init_args, tmp_dir
 
 
+@_sound_mode_result
 def run_training_stress(cfg):
     """Training-Mode Augmentation: re-run stress policies with models in .train() mode.
 
@@ -366,7 +526,7 @@ def run_training_stress(cfg):
     ref_model = ref_model.to(device).train()
     with torch.no_grad():
         try:
-            ref_out = ref_model(*stress_on_device)
+            ref_out = _call_isolated(ref_model, stress_on_device)
         except Exception as e:
             return {"ref_ok": False, "original_ok": False, "mutant_ok": False,
                     "error": f"ref crash (train): {str(e)[:200]}",
@@ -388,20 +548,14 @@ def run_training_stress(cfg):
     orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
                   else orig_cls())
     orig_model = orig_model.to(device).train()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, orig_model)
+    _sync_weights(ref_model, orig_model)
 
     original_ok = False
     orig_out = None
     with torch.no_grad():
         try:
-            orig_out = orig_model(*stress_on_device)
-            if ref_nan:
-                original_ok = not _has_nan_inf(orig_out)
-            else:
-                original_ok = _allclose(ref_out, orig_out, atol, rtol)
-                if _has_nan_inf(orig_out):
-                    original_ok = False
+            orig_out = _call_isolated(orig_model, stress_on_device)
+            original_ok = _allclose(ref_out, orig_out, atol, rtol)
         except Exception:
             original_ok = False
 
@@ -411,10 +565,11 @@ def run_training_stress(cfg):
                 "error": "ref NaN/Inf and original also invalid (train)",
                 "time_ms": (time.time() - t0) * 1000}
 
-    compare_target = orig_out if ref_nan else ref_out
+    compare_target = ref_out
 
     if is_same_code:
         mutant_ok = original_ok
+        mut_error = ""
     else:
         try:
             mut_mod = _load_module_from_source(
@@ -429,18 +584,17 @@ def run_training_stress(cfg):
         mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
                      else mut_cls())
         mut_model = mut_model.to(device).train()
-        if cfg.get("sync_weights"):
-            _sync_weights(ref_model, mut_model)
+        _sync_weights(ref_model, mut_model)
 
         mutant_ok = False
+        mut_error = ""
         with torch.no_grad():
             try:
-                mut_out = mut_model(*stress_on_device)
+                mut_out = _call_isolated(mut_model, stress_on_device)
                 mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
-                if _has_nan_inf(mut_out):
-                    mutant_ok = False
-            except Exception:
+            except Exception as e:
                 mutant_ok = False
+                mut_error = f"mutant crash: {str(e)[:200]}"
 
     diff_summary = ""
     if not original_ok and orig_out is not None and not ref_nan:
@@ -455,10 +609,12 @@ def run_training_stress(cfg):
         "original_ok": original_ok,
         "mutant_ok": mutant_ok,
         "diff_summary": diff_summary,
+        "error": mut_error,
         "time_ms": (time.time() - t0) * 1000,
     }
 
 
+@_sound_mode_result
 def run_dtype_stress(cfg):
     """Configuration Augmentation: re-run with float16 / bfloat16 inputs.
 
@@ -505,25 +661,53 @@ def run_dtype_stress(cfg):
             mut_m = mut_model.to(dt)
 
             with torch.no_grad():
-                ref_out = ref_m(*cast_inputs)
+                try:
+                    ref_out = _call_isolated(ref_m, cast_inputs)
+                except Exception as e:
+                    results_per_dtype[dname] = {
+                        "ref_ok": False,
+                        "error": f"reference crash: {str(e)[:300]}",
+                    }
+                    continue
                 ref_nan = _has_nan_inf(ref_out)
 
-                orig_out = orig_m(*cast_inputs)
-                if ref_nan:
-                    orig_ok = not _has_nan_inf(orig_out)
-                    if not orig_ok:
-                        results_per_dtype[dname] = {
-                            "ref_ok": False, "ref_nan_fallback": True,
-                            "reason": "ref and orig both NaN/Inf",
-                        }
-                        continue
-                    compare_target = orig_out
-                else:
-                    orig_ok = _allclose(ref_out, orig_out, atol, rtol) and not _has_nan_inf(orig_out)
-                    compare_target = ref_out
+                try:
+                    orig_out = _call_isolated(orig_m, cast_inputs)
+                except Exception as e:
+                    results_per_dtype[dname] = {
+                        "ref_ok": True,
+                        "orig_ok": False,
+                        "error": f"original crash: {str(e)[:300]}",
+                    }
+                    continue
+                orig_ok = _allclose(ref_out, orig_out, atol, rtol)
+                if not orig_ok:
+                    results_per_dtype[dname] = {
+                        "ref_ok": True,
+                        "orig_ok": False,
+                        "ref_nan_fallback": ref_nan,
+                        "reason": "original diverges from reference",
+                    }
+                    continue
 
-                mut_out = mut_m(*cast_inputs)
-                mut_ok = _allclose(compare_target, mut_out, atol, rtol) and not _has_nan_inf(mut_out)
+                try:
+                    mut_out = _call_isolated(mut_m, cast_inputs)
+                except Exception as e:
+                    results_per_dtype[dname] = {
+                        "ref_ok": True,
+                        "orig_ok": True,
+                        "mut_ok": False,
+                        "error": f"candidate crash: {str(e)[:300]}",
+                    }
+                    return {
+                        "killed": True,
+                        "killing_dtype": dname,
+                        "kill_type": "candidate_crash",
+                        "results_per_dtype": results_per_dtype,
+                        "error": f"candidate crash: {str(e)[:300]}",
+                        "time_ms": (time.time() - t0) * 1000,
+                    }
+                mut_ok = _allclose(ref_out, mut_out, atol, rtol)
 
             results_per_dtype[dname] = {
                 "orig_ok": orig_ok, "mut_ok": mut_ok,
@@ -561,6 +745,7 @@ def run_dtype_stress(cfg):
     }
 
 
+@_sound_mode_result
 def run_repeated(cfg):
     """Execution Augmentation: run the same input N times, any-divergence detection.
 
@@ -593,22 +778,36 @@ def run_repeated(cfg):
 
     with torch.no_grad():
         try:
-            ref_out = ref_model(*inputs_on_device)
+            ref_out = _call_isolated(ref_model, inputs_on_device)
         except Exception as e:
-            return {"killed": False, "error": f"ref crash: {str(e)[:200]}",
-                    "time_ms": (time.time() - t0) * 1000}
-
-        if _has_nan_inf(ref_out):
-            try:
-                orig_out = orig_model(*inputs_on_device)
-            except Exception as e:
-                return {"killed": False, "error": f"ref NaN + orig crash: {str(e)[:200]}",
-                        "time_ms": (time.time() - t0) * 1000}
-            if _has_nan_inf(orig_out):
-                return {"killed": False, "error": "ref and orig both NaN/Inf",
-                        "ref_nan_fallback": True,
-                        "time_ms": (time.time() - t0) * 1000}
-            ref_out = orig_out
+            return {
+                "killed": False,
+                "ref_ok": False,
+                "original_ok": False,
+                "mutant_ok": False,
+                "error": f"ref crash: {str(e)[:200]}",
+                "time_ms": (time.time() - t0) * 1000,
+            }
+        try:
+            orig_out = _call_isolated(orig_model, inputs_on_device)
+        except Exception as e:
+            return {
+                "killed": False,
+                "ref_ok": True,
+                "original_ok": False,
+                "mutant_ok": False,
+                "error": f"original crash: {str(e)[:200]}",
+                "time_ms": (time.time() - t0) * 1000,
+            }
+        if not _allclose(ref_out, orig_out, atol, rtol):
+            return {
+                "killed": False,
+                "ref_ok": True,
+                "original_ok": False,
+                "mutant_ok": False,
+                "error": "original diverges from reference",
+                "time_ms": (time.time() - t0) * 1000,
+            }
 
     mut_outputs = []
     divergent_trial = None
@@ -617,22 +816,26 @@ def run_repeated(cfg):
     for trial_i in range(n_trials):
         with torch.no_grad():
             try:
-                mut_out = mut_model(*inputs_on_device)
-            except Exception:
+                mut_out = _call_isolated(mut_model, inputs_on_device)
+            except Exception as e:
                 return {
                     "killed": True,
+                    "ref_ok": True,
+                    "original_ok": True,
+                    "mutant_ok": False,
                     "divergent_trial": trial_i,
                     "self_inconsistent": False,
                     "reason": "mutant_crash",
+                    "error": f"candidate crash: {str(e)[:200]}",
                     "time_ms": (time.time() - t0) * 1000,
                 }
 
-        if not _allclose(ref_out, mut_out, atol, rtol) or _has_nan_inf(mut_out):
+        if not _allclose(ref_out, mut_out, atol, rtol):
             if divergent_trial is None:
                 divergent_trial = trial_i
 
         if isinstance(mut_out, torch.Tensor):
-            mut_outputs.append(mut_out.float().cpu().clone())
+            mut_outputs.append(mut_out.detach().cpu().clone())
 
     if divergent_trial is not None:
         return {
@@ -666,6 +869,7 @@ def run_repeated(cfg):
     }
 
 
+@_sound_mode_result
 def run_llm_verify(cfg):
     """Verify an LLM-suggested input against original and mutant kernels.
 
@@ -737,7 +941,7 @@ def run_llm_verify(cfg):
 
     with torch.no_grad():
         try:
-            ref_out = ref_model(*llm_inputs)
+            ref_out = _call_isolated(ref_model, llm_inputs)
         except Exception as e:
             return {"ref_ok": False, "original_ok": False, "mutant_ok": False,
                     "error": f"ref crash: {str(e)[:200]}",
@@ -759,20 +963,18 @@ def run_llm_verify(cfg):
     orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
                   else orig_cls())
     orig_model = orig_model.to(device).eval()
+    _sync_weights(ref_model, orig_model)
 
     original_ok = False
     orig_out = None
+    orig_error = ""
     with torch.no_grad():
         try:
-            orig_out = orig_model(*llm_inputs)
-            if ref_nan:
-                original_ok = not _has_nan_inf(orig_out)
-            else:
-                original_ok = _allclose(ref_out, orig_out, atol, rtol)
-                if _has_nan_inf(orig_out):
-                    original_ok = False
-        except Exception:
+            orig_out = _call_isolated(orig_model, llm_inputs)
+            original_ok = _allclose(ref_out, orig_out, atol, rtol)
+        except Exception as e:
             original_ok = False
+            orig_error = f"original crash: {str(e)[:200]}"
 
     if ref_nan and not original_ok:
         return {"ref_ok": False, "original_ok": False, "mutant_ok": False,
@@ -781,7 +983,7 @@ def run_llm_verify(cfg):
                 "error": "ref NaN/Inf and original also invalid on LLM input",
                 "time_ms": (time.time() - t0) * 1000}
 
-    compare_target = orig_out if ref_nan else ref_out
+    compare_target = ref_out
 
     if is_same_code:
         mutant_ok = original_ok
@@ -802,17 +1004,15 @@ def run_llm_verify(cfg):
         mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
                      else mut_cls())
         mut_model = mut_model.to(device).eval()
+        _sync_weights(ref_model, mut_model)
 
         mutant_ok = False
         mut_out = None
         mut_error = ""
         with torch.no_grad():
             try:
-                mut_out = mut_model(*llm_inputs)
+                mut_out = _call_isolated(mut_model, llm_inputs)
                 mutant_ok = _allclose(compare_target, mut_out, atol, rtol)
-                if _has_nan_inf(mut_out):
-                    mutant_ok = False
-                    mut_error = "mutant output NaN/Inf"
             except Exception as e:
                 mutant_ok = False
                 mut_error = str(e)[:200]
@@ -843,6 +1043,7 @@ def run_llm_verify(cfg):
         "killed": killed,
         "diff_summary": diff_summary,
         "mut_error": mut_error,
+        "error": orig_error or mut_error,
         "time_ms": (time.time() - t0) * 1000,
     }
 
@@ -894,6 +1095,7 @@ def _bitwise_eq(a, b):
     return a == b
 
 
+@_sound_mode_result
 def run_config_stress(cfg):
     """Configuration-Stress Track: vary batch_size while keeping all other dims fixed.
 
@@ -943,8 +1145,7 @@ def run_config_stress(cfg):
     orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
                   else orig_cls())
     orig_model = orig_model.to(device).eval()
-    if cfg.get("sync_weights"):
-        _sync_weights(ref_model, orig_model)
+    _sync_weights(ref_model, orig_model)
 
     if is_same_code:
         mut_model = orig_model
@@ -959,8 +1160,7 @@ def run_config_stress(cfg):
         mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
                      else mut_cls())
         mut_model = mut_model.to(device).eval()
-        if cfg.get("sync_weights"):
-            _sync_weights(ref_model, mut_model)
+        _sync_weights(ref_model, mut_model)
 
     results_per_batch = {}
 
@@ -986,7 +1186,7 @@ def run_config_stress(cfg):
 
             with torch.no_grad():
                 try:
-                    ref_out = ref_model(*on_device)
+                    ref_out = _call_isolated(ref_model, on_device)
                 except Exception as e:
                     bs_result["seeds_tested"].append(
                         {"seed": seed, "status": "ref_crash", "error": str(e)[:100]})
@@ -995,7 +1195,7 @@ def run_config_stress(cfg):
                 ref_nan = _has_nan_inf(ref_out)
 
                 try:
-                    orig_out = orig_model(*on_device)
+                    orig_out = _call_isolated(orig_model, on_device)
                 except Exception:
                     bs_result["seeds_tested"].append(
                         {"seed": seed, "status": "orig_crash"})
@@ -1004,22 +1204,14 @@ def run_config_stress(cfg):
                 cfg_atol = cfg.get("atol", 1e-2)
                 cfg_rtol = cfg.get("rtol", 1e-2)
 
-                if ref_nan:
-                    if _has_nan_inf(orig_out):
-                        bs_result["seeds_tested"].append(
-                            {"seed": seed, "status": "ref_and_orig_nan_inf"})
-                        continue
-                else:
-                    orig_ok = _allclose(ref_out, orig_out, cfg_atol, cfg_rtol)
-                    if _has_nan_inf(orig_out):
-                        orig_ok = False
-                    if not orig_ok:
-                        bs_result["seeds_tested"].append(
-                            {"seed": seed, "status": "orig_diverges_from_ref"})
-                        continue
+                orig_ok = _allclose(ref_out, orig_out, cfg_atol, cfg_rtol)
+                if not orig_ok:
+                    bs_result["seeds_tested"].append(
+                        {"seed": seed, "status": "orig_diverges_from_ref"})
+                    continue
 
                 try:
-                    mut_out = mut_model(*on_device)
+                    mut_out = _call_isolated(mut_model, on_device)
                 except Exception as e:
                     results_per_batch[str(bs)] = {
                         "status": "killed_by_crash",
@@ -1037,8 +1229,6 @@ def run_config_stress(cfg):
                     }
 
                 mut_ok = _allclose(ref_out, mut_out, cfg_atol, cfg_rtol)
-                if _has_nan_inf(mut_out):
-                    mut_ok = False
                 if not mut_ok:
                     results_per_batch[str(bs)] = {
                         "status": "killed_by_divergence",
@@ -1100,12 +1290,14 @@ def main():
 
     gpu_err = _gpu_preflight()
     if gpu_err:
-        result = {
+        result = _normalize_validation_result({
             "ref_ok": False,
             "original_ok": False,
             "mutant_ok": False,
+            "killed": False,
             "error": f"GPU_PREFLIGHT_FAIL: {gpu_err}",
-        }
+            "validation_status": "inconclusive",
+        })
         with open(res_path, "w") as f:
             json.dump(result, f)
         return
@@ -1124,12 +1316,14 @@ def main():
         else:
             result = run_stress(cfg)
     except Exception as e:
-        result = {
+        result = _normalize_validation_result({
             "ref_ok": False,
             "original_ok": False,
             "mutant_ok": False,
+            "killed": False,
             "error": f"WorkerCrash: {str(e)[:300]}",
-        }
+            "validation_status": "inconclusive",
+        })
 
     with open(res_path, "w") as f:
         json.dump(result, f)

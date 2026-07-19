@@ -17,10 +17,14 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 
-os.environ["TORCH_CUDA_ARCH_LIST"] = "8.9"
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from config import (
+    KERNELBENCH_ROOT as CONFIGURED_KERNELBENCH_ROOT,
+    KERNELBENCH_RUNS,
+    RESULTS_DIR,
+)
 from src.bridge.eval_bridge import KernelBenchBridge
 from src.mutengine.mutant_runner import MutantRunner
 from src.mutengine.report import MutationReporter
@@ -32,8 +36,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("L1_experiment")
 
-KERNELBENCH_ROOT = "/home/kbuser/projects/KernelBench-0"
-OUTPUT_DIR = Path(__file__).parent.parent / "runs" / "rq1_l1_formal"
+KERNELBENCH_ROOT = CONFIGURED_KERNELBENCH_ROOT
+OUTPUT_DIR = RESULTS_DIR / "rq1_l1_formal"
 
 
 def print_progress(results: list[MutationTestResult], elapsed: float, total_kernels: int):
@@ -88,7 +92,7 @@ def main():
     output_dir = OUTPUT_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    bridge = KernelBenchBridge(KERNELBENCH_ROOT)
+    bridge = KernelBenchBridge(KERNELBENCH_ROOT, runs_root=KERNELBENCH_RUNS)
     kernels = bridge.load_all_correct_kernels(levels=[1])
     logger.info(f"L1: {len(kernels)} correct kernels loaded")
 

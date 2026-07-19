@@ -34,7 +34,6 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -42,12 +41,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
+from config import (
+    KERNELBENCH_ROOT as CONFIGURED_KERNELBENCH_ROOT,
+    KERNELBENCH_RUNS,
+)
+from src.experiments.kernel_registry import scan_kernel_registry_file
 from src.models import KernelInfo, Mutant, MutantStatus, MutationTestResult
 from src.mutengine.mutant_runner import MutantRunner
 from src.mutengine.report import MutationReporter
 from src.bridge.eval_bridge import _load_module_from_path
 
-KB_ROOT = Path("/home/kbuser/projects/KernelBench-0")
+KB_ROOT = CONFIGURED_KERNELBENCH_ROOT
 BEST_KERNELS_FILE = PROJECT_ROOT / "best_kernels.json"
 PROBLEM_DIRS = {
     "L1": KB_ROOT / "KernelBench" / "level1",
@@ -74,7 +78,9 @@ LLM_API_BASE = os.environ.get("LLM_API_BASE", "https://api.deepseek.com")
 LLM_MODEL = os.environ.get("LLM_MODEL", "deepseek-chat")
 LLM_TEMPERATURE = 0.0
 LLM_MAX_TOKENS = 4096
-LLM_EQUIV_VERIFY = bool(LLM_API_KEY)  # auto-enable if API key is set
+LLM_EQUIV_VERIFY = (
+    os.environ.get("MUTAKERNEL_ENABLE_LLM_TRIAGE") == "1" and bool(LLM_API_KEY)
+)
 
 RESULT_DIR = PROJECT_ROOT / "第二次实验汇总" / "full_block12_results"
 OUTPUT_LOG = PROJECT_ROOT / "第二次实验汇总" / "full_block12_output.txt"
@@ -335,7 +341,14 @@ def check_equiv_isolated(mutant: Mutant, kernel: KernelInfo) -> dict:
     data = _run_worker(cfg, timeout=EQUIV_TIMEOUT)
 
     if data is None:
-        return {"is_equivalent": False, "error": "worker_timeout_or_crash"}
+        return {
+            "is_equivalent": None,
+            "validation_status": "inconclusive",
+            "reason": "equivalence worker timed out or crashed",
+            "error": "worker_timeout_or_crash",
+            "trials": [],
+            "errors": [],
+        }
     return data
 
 
@@ -450,18 +463,19 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                 mutation_domain = "both" if not cuda_eq and not py_eq else "unknown"
 
             detail["layer0"] = {
+                "exact_program_text_equal": m.original_code == m.mutated_code,
                 "cuda_strings_equal": cuda_eq,
                 "python_host_equal": py_eq,
                 "cuda_extracted": bool(cuda_orig) and bool(cuda_mut),
                 "mutation_domain": mutation_domain,
-                "cuda_norm_hash_orig": hashlib.md5(
-                    cuda_norm_orig.encode()).hexdigest()[:16] if cuda_norm_orig else None,
-                "cuda_norm_hash_mut": hashlib.md5(
-                    cuda_norm_mut.encode()).hexdigest()[:16] if cuda_norm_mut else None,
-                "py_norm_hash_orig": hashlib.md5(
-                    py_norm_orig.encode()).hexdigest()[:16],
-                "py_norm_hash_mut": hashlib.md5(
-                    py_norm_mut.encode()).hexdigest()[:16],
+                "cuda_norm_hash_orig": hashlib.sha256(
+                    cuda_norm_orig.encode()).hexdigest() if cuda_norm_orig else None,
+                "cuda_norm_hash_mut": hashlib.sha256(
+                    cuda_norm_mut.encode()).hexdigest() if cuda_norm_mut else None,
+                "py_norm_hash_orig": hashlib.sha256(
+                    py_norm_orig.encode()).hexdigest(),
+                "py_norm_hash_mut": hashlib.sha256(
+                    py_norm_mut.encode()).hexdigest(),
                 "mutation_site_line": m.site.line_start,
                 "original_fragment": m.site.original_code[:200] if m.site.original_code else "",
             }
@@ -500,7 +514,7 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                     f"  {tag}   L0: cuda_eq={cuda_eq}, py_eq={py_eq}")
 
             decided = False
-            if cuda_eq and py_eq:
+            if m.original_code == m.mutated_code:
                 detail["layer0"]["verdict"] = "STRICT_EQUIVALENT"
                 detail["decided_at"] = "layer0"
                 m.status = MutantStatus.STRICT_EQUIVALENT
@@ -508,8 +522,14 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                     "Textually equivalent (full program normalization)")
                 m.equiv_detail = detail
                 lines.append(
-                    f"  {tag}   => STRICT_EQUIVALENT (textual, L0)")
+                    f"  {tag}   => STRICT_EQUIVALENT (exact source identity, L0)")
                 decided = True
+
+            elif cuda_eq and py_eq:
+                detail["layer0"]["verdict"] = "NORMALIZED_TEXT_IDENTICAL_TRIAGE"
+                lines.append(
+                    f"  {tag}   L0: normalized text matches; this is triage, "
+                    "not a proof -> continue to L1/L2")
 
             elif cuda_eq and not py_eq:
                 # IMPORTANT: do NOT short-circuit here. CUDA identical
@@ -578,16 +598,11 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                 }
                 if rule_hit:
                     detail["layer1"]["verdict"] = (
-                        f"STRICT_EQUIVALENT ({rule_hit})")
-                    detail["decided_at"] = "layer1"
-                    m.status = MutantStatus.STRICT_EQUIVALENT
-                    m.error_message = f"Static rule: {rule_hit}"
-                    m.equiv_detail = detail
+                        f"HEURISTIC_EQUIVALENCE_TRIAGE ({rule_hit})")
                     lines.append(
                         f"  {tag}   L1: rule={rule_hit}")
                     lines.append(
-                        f"  {tag}   => STRICT_EQUIVALENT ({rule_hit}, L1)")
-                    decided = True
+                        f"  {tag}   => heuristic triage only; continue to L2")
                 else:
                     detail["layer1"]["verdict"] = "no_rule_hit"
                     lines.append(f"  {tag}   L1: no rule hit -> pass")
@@ -601,10 +616,17 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                 t_l2 = time.time()
                 l2_result = check_equiv_isolated(m, kernel)
                 l2_ms = (time.time() - t_l2) * 1000
-                is_equiv = l2_result.get("is_equivalent", False)
+                validation_status = l2_result.get(
+                    "validation_status", "inconclusive"
+                )
+                if validation_status not in {"pass", "fail", "inconclusive"}:
+                    validation_status = "inconclusive"
+                is_equiv = l2_result.get("is_equivalent")
 
                 detail["layer2"] = {
                     "is_equivalent": is_equiv,
+                    "validation_status": validation_status,
+                    "reason": l2_result.get("reason", ""),
                     "equiv_runs": EQUIV_RUNS,
                     "operator_name": m.operator_name,
                     "time_ms": round(l2_ms),
@@ -618,17 +640,20 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                         "first_input_summary"),
                     "last_input_summary": l2_result.get(
                         "last_input_summary"),
+                    "valid_rounds": l2_result.get("valid_rounds", 0),
+                    "trials": l2_result.get("trials", []),
+                    "errors": l2_result.get("errors", []),
                 }
                 l2_error = l2_result.get("error")
                 if l2_error:
                     detail["layer2"]["error"] = l2_error
 
-                if not is_equiv:
+                if validation_status == "fail":
                     div = l2_result.get("divergence", {})
                     detail["layer2"]["divergence"] = div
 
-                if is_equiv:
-                    detail["layer2"]["verdict"] = "CANDIDATE_EQUIVALENT"
+                if validation_status == "pass" and is_equiv is True:
+                    detail["layer2"]["verdict"] = "NO_DIVERGENCE_OBSERVED"
                     detail["decided_at"] = "layer2"
                     m.status = MutantStatus.CANDIDATE_EQUIVALENT
                     n_rounds = l2_result.get("total_rounds", EQUIV_RUNS)
@@ -637,13 +662,15 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                     if cuda_eq:
                         evidence_parts.append("CUDA strings identical")
                     m.error_message = (
-                        f"Candidate equivalent ({', '.join(evidence_parts)})")
+                        "No divergence observed; equivalence is not proven "
+                        f"({', '.join(evidence_parts)})")
                     m.equiv_detail = detail
                     lines.append(
-                        f"  {tag}   L2: bitwise identical ({l2_ms:.0f}ms)")
+                        f"  {tag}   L2: all valid comparisons agreed "
+                        f"({l2_ms:.0f}ms)")
                     lines.append(
                         f"  {tag}   => CANDIDATE_EQUIVALENT (L2)")
-                else:
+                elif validation_status == "fail" and is_equiv is False:
                     div = l2_result.get("divergence", {})
                     div_desc = ""
                     if div:
@@ -664,6 +691,18 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                         + (f" [{div_desc}]" if div_desc else ""))
                     lines.append(
                         f"  {tag}   => SURVIVED (not equivalent)")
+                else:
+                    detail["layer2"]["verdict"] = "INCONCLUSIVE"
+                    detail["decided_at"] = "layer2"
+                    m.status = MutantStatus.UNKNOWN
+                    m.error_message = (
+                        "Dynamic equivalence check was inconclusive: "
+                        + str(l2_result.get("reason", "unknown reason"))[:300]
+                    )
+                    m.equiv_detail = detail
+                    lines.append(
+                        f"  {tag}   L2: inconclusive ({l2_ms:.0f}ms)")
+                    lines.append(f"  {tag}   => UNKNOWN")
 
             P("\n".join(lines))
 
@@ -673,10 +712,9 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                                          MutantStatus.CANDIDATE_EQUIVALENT)]
         if equiv_mutants and llm_caller is not None:
             from src.stress.llm_analyzer import verify_equivalent_with_llm
-            P(f"  [{kname}][Layer3:LLM] Verifying {len(equiv_mutants)} "
-              f"equiv mutants with {LLM_MODEL}...")
+            P(f"  [{kname}][Layer3:LLM] Triaging {len(equiv_mutants)} "
+              f"mutants with {LLM_MODEL} (no label changes)...")
             P(f"  [{kname}][Layer3:LLM] Input spec:\n{actual_input_spec}")
-            llm_reverted = 0
             for m in equiv_mutants:
                 tag = f"[{kname}][{m.operator_name}@L{m.site.line_start}]"
                 P(f"  {tag} LLM reviewing ...")
@@ -720,30 +758,14 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                     "equiv_evidence_sent_to_llm": layer_evidence_text[:3000],
                 }
 
-                if verdict == "possibly_killable" and confidence > 0.7:
-                    old_status = m.status.value
-                    l3_detail["action"] = (
-                        f"reverted to SURVIVED (was {old_status})")
-                    m.equiv_detail["layer3"] = l3_detail
-                    m.equiv_detail["decided_at"] = "layer3"
-                    m.status = MutantStatus.SURVIVED
-                    m.error_message = (
-                        f"LLM rejected equiv (was {old_status}, "
-                        f"conf={confidence:.2f}): {reasoning[:200]}")
-                    P(f"  {tag}   L3: {verdict} (conf={confidence:.2f})")
-                    P(f"  {tag}   L3: {reasoning[:120]}")
-                    P(f"  {tag}   => SURVIVED (LLM rejected equiv)")
-                    llm_reverted += 1
-                else:
-                    l3_detail["action"] = "confirmed"
-                    m.equiv_detail["layer3"] = l3_detail
-                    P(f"  {tag}   L3: {verdict} (conf={confidence:.2f})")
-                    P(f"  {tag}   L3: {reasoning[:120]}")
-                    P(f"  {tag}   => LLM confirmed equiv")
+                # LLM output is triage/search assistance only.  It is never a
+                # correctness or equivalence label and cannot change status.
+                l3_detail["action"] = "triage_only_no_status_change"
+                m.equiv_detail["layer3"] = l3_detail
+                P(f"  {tag}   L3 triage: {verdict} (conf={confidence:.2f})")
+                P(f"  {tag}   L3 triage: {reasoning[:120]}")
 
-            if llm_reverted:
-                P(f"  [{kname}] LLM rejected {llm_reverted} "
-                  f"equiv -> SURVIVED")
+            P(f"  [{kname}] LLM triage completed; no statuses changed")
         elif equiv_mutants and llm_caller is None:
             P(f"  [{kname}][Layer3:LLM] Skipped (no API key)")
             for m in equiv_mutants:
@@ -756,16 +778,13 @@ def _process_one_kernel(runner, reporter, kernel, all_results,
                        if m.status == MutantStatus.STRICT_EQUIVALENT)
         n_cand = sum(1 for m in survived
                      if m.status == MutantStatus.CANDIDATE_EQUIVALENT)
-        n_llm_rejected = sum(
-            1 for m in survived
-            if (m.status == MutantStatus.SURVIVED
-                and m.equiv_detail.get("layer3", {}).get("action", "")
-                .startswith("reverted")))
+        n_unknown = sum(1 for m in survived
+                        if m.status == MutantStatus.UNKNOWN)
         n_truly = sum(1 for m in survived
                       if m.status == MutantStatus.SURVIVED)
         P(f"  [{kname}] Equiv summary: "
           f"strict_eq={n_strict}, candidate_eq={n_cand}, "
-          f"llm_rejected={n_llm_rejected}, survived={n_truly}")
+          f"unknown={n_unknown}, survived={n_truly}")
     else:
         P(f"  [Block2:Equiv] No survived mutants")
 
@@ -796,8 +815,15 @@ def main():
     if OUTPUT_LOG.exists():
         OUTPUT_LOG.unlink()
 
-    with open(BEST_KERNELS_FILE) as f:
-        best_kernels = json.load(f)
+    registry_scan = scan_kernel_registry_file(
+        BEST_KERNELS_FILE,
+        KERNELBENCH_RUNS,
+    )
+    best_kernels = registry_scan.migrated_registry
+    kernel_paths = {
+        key: resolution.absolute_path
+        for key, resolution in registry_scan.resolutions.items()
+    }
 
     all_keys = sorted(best_kernels.keys())
     n_l1 = sum(1 for k in all_keys if k.startswith("L1"))
@@ -815,8 +841,8 @@ def main():
     P(f"  Seed           : {SEED}")
     P(f"  Mutant timeout : {MUTANT_TIMEOUT}s")
     P(f"  Equiv timeout  : {EQUIV_TIMEOUT}s")
-    P(f"  Equiv pipeline : Layer0(CUDA-norm) → Layer1(static) → Layer2(dynamic) → Layer3(LLM)")
-    P(f"  LLM verify     : {'enabled (' + LLM_MODEL + ')' if LLM_EQUIV_VERIFY else 'disabled (no API key)'}")
+    P(f"  Equiv pipeline : Layer0(CUDA-norm) → Layer1(static) → Layer2(dynamic); Layer3 is triage only")
+    P(f"  LLM triage     : {'enabled (' + LLM_MODEL + ')' if LLM_EQUIV_VERIFY else 'disabled unless explicitly enabled'}")
     P(f"  Max kernels    : {MAX_KERNELS if MAX_KERNELS > 0 else 'unlimited'}")
     P(f"  Output         : {RESULT_DIR}")
     P("")
@@ -859,7 +885,7 @@ def main():
         info = best_kernels[key]
         level_str = info["level"]
         pid = info["problem_id"]
-        kpath = Path(info["kernel_path"])
+        kpath = kernel_paths[key]
         speedup = info.get("speedup", 0)
         turn = info.get("turn", "?")
 

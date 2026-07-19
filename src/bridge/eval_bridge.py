@@ -64,17 +64,21 @@ class KernelBenchBridge:
         self,
         kernelbench_root: str | Path,
         run_name: str = "iter_full_l{level}_caesar_paper_v2",
+        runs_root: str | Path | None = None,
     ):
         self.root = Path(kernelbench_root)
         self.run_name_template = run_name
         self.problems_root = self.root / "KernelBench"
+        self.runs_root = (
+            Path(runs_root) if runs_root is not None else self.root / "runs"
+        )
 
     def get_problem_dir(self, level: int) -> Path:
         return self.problems_root / f"level{level}"
 
     def get_run_dir(self, level: int) -> Path:
         run_name = self.run_name_template.format(level=level)
-        return self.root / "runs" / run_name
+        return self.runs_root / run_name
 
     def load_eval_results(self, level: int) -> Dict[str, Any]:
         """加载 eval_results.json。"""

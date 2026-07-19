@@ -14,18 +14,27 @@ import importlib
 import importlib.util
 import logging
 import os
+import random
 import re
 import sys
 import tempfile
 import time
-import traceback
-from pathlib import Path
-from typing import List, Optional, Tuple, Any, Dict
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 
 from ..models import Mutant, MutantStatus, KernelInfo, MutationTestResult
-from .operators.base import MutationOperator, get_all_operators, get_operators_by_category
+from ..validation import (
+    ExecutionConfig,
+    OracleConfig,
+    RNGSnapshot,
+    Tolerance,
+    ValidationStatus,
+    clone_tree,
+    compare_outputs,
+    validate_pair,
+)
+from .operators.base import MutationOperator, get_operators_by_category
 
 logger = logging.getLogger(__name__)
 
@@ -125,30 +134,83 @@ def _run_model(model: torch.nn.Module, inputs: List[torch.Tensor],
 
 def _compare_outputs(ref_output: Any, mut_output: Any,
                      atol: float, rtol: float) -> bool:
-    """比较参考输出和变异体输出。返回 True 表示输出一致（变异体存活）。"""
-    if isinstance(ref_output, torch.Tensor) and isinstance(mut_output, torch.Tensor):
-        if ref_output.shape != mut_output.shape:
-            return False
-        if ref_output.dtype != mut_output.dtype:
-            mut_output = mut_output.to(ref_output.dtype)
-        try:
-            return torch.allclose(
-                ref_output.float().cpu(),
-                mut_output.float().cpu(),
-                atol=atol, rtol=rtol,
-            )
-        except RuntimeError:
-            return False
+    """Backward-compatible boolean wrapper around the strict output oracle.
 
-    if isinstance(ref_output, (tuple, list)) and isinstance(mut_output, (tuple, list)):
-        if len(ref_output) != len(mut_output):
-            return False
-        return all(
-            _compare_outputs(r, m, atol, rtol)
-            for r, m in zip(ref_output, mut_output)
+    Unlike the historical implementation, this function never casts away a
+    dtype mismatch and never converts integer, boolean, or complex outputs to
+    ``float32``.  New code should call :func:`compare_outputs` directly so it
+    can preserve the ``INCONCLUSIVE`` outcome.
+    """
+
+    tolerance = Tolerance(rtol=rtol, atol=atol)
+    oracle = compare_outputs(
+        ref_output,
+        mut_output,
+        OracleConfig(
+            default_tolerance=tolerance,
+            dtype_tolerances={
+                dtype: tolerance
+                for dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                    torch.complex64,
+                    torch.complex128,
+                )
+            },
+        ),
+    )
+    return oracle.status is ValidationStatus.PASS
+
+
+def _seed_all(seed: int) -> None:
+    """Seed every RNG used by KernelBench input/model factories."""
+
+    random.seed(seed)
+    try:
+        import numpy as np
+    except ImportError:  # pragma: no cover - NumPy is optional.
+        np = None
+    if np is not None:
+        np.random.seed(seed % (2 ** 32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _move_tree_to_device(value: Any, device: str, memo: Optional[Dict[int, Any]] = None) -> Any:
+    """Move tensors recursively while retaining aliases inside one input tree."""
+
+    if memo is None:
+        memo = {}
+    object_id = id(value)
+    if object_id in memo:
+        return memo[object_id]
+    if isinstance(value, torch.Tensor):
+        moved = value.to(device)
+        memo[object_id] = moved
+        return moved
+    if isinstance(value, list):
+        moved_list: List[Any] = []
+        memo[object_id] = moved_list
+        moved_list.extend(_move_tree_to_device(item, device, memo) for item in value)
+        return moved_list
+    if isinstance(value, tuple):
+        moved_tuple = type(value)(
+            *(_move_tree_to_device(item, device, memo) for item in value)
+        ) if hasattr(value, "_fields") else tuple(
+            _move_tree_to_device(item, device, memo) for item in value
         )
-
-    return ref_output == mut_output
+        memo[object_id] = moved_tuple
+        return moved_tuple
+    if isinstance(value, Mapping):
+        moved_mapping = type(value)()
+        memo[object_id] = moved_mapping
+        for key, item in value.items():
+            moved_mapping[key] = _move_tree_to_device(item, device, memo)
+        return moved_mapping
+    return value
 
 
 class MutantRunner:
@@ -229,7 +291,10 @@ class MutantRunner:
         Returns:
             更新了状态的 Mutant 对象
         """
-        start_time = time.time()
+        start_time = time.perf_counter()
+        mutant.error_message = ""
+        mutant.kill_input_seed = None
+        validation_trials: List[Dict[str, Any]] = []
 
         try:
             mut_module = _load_module_from_source(
@@ -240,42 +305,122 @@ class MutantRunner:
         except CompilationError as e:
             mutant.status = MutantStatus.STILLBORN
             mutant.error_message = f"Compilation: {str(e)[:300]}"
-            mutant.execution_time_ms = (time.time() - start_time) * 1000
+            mutant.execution_time_ms = (time.perf_counter() - start_time) * 1000
             return mutant
 
+        caller_rng = RNGSnapshot.capture(include_cuda=True)
         try:
-            ref_model = self._instantiate_model(ref_module, "Model", get_init_inputs_fn)
-            mut_model = self._instantiate_model(mut_module, "ModelNew", get_init_inputs_fn)
+            _seed_all(self.seed)
+            init_inputs = get_init_inputs_fn()
+            constructor_rng = RNGSnapshot.capture(include_cuda=True)
+
+            constructor_rng.restore()
+            ref_model = self._instantiate_model(
+                ref_module,
+                "Model",
+                init_inputs=clone_tree(init_inputs),
+            )
+            constructor_rng.restore()
+            mut_model = self._instantiate_model(
+                mut_module,
+                "ModelNew",
+                init_inputs=clone_tree(init_inputs),
+            )
+            ref_model = ref_model.to(self.device).eval()
+            mut_model = mut_model.to(self.device).eval()
         except Exception as e:
             mutant.status = MutantStatus.STILLBORN
             mutant.error_message = f"Instantiation: {str(e)[:300]}"
-            mutant.execution_time_ms = (time.time() - start_time) * 1000
+            mutant.execution_time_ms = (time.perf_counter() - start_time) * 1000
+            caller_rng.restore()
             return mutant
 
-        killed = False
-        for trial in range(self.num_test_inputs):
-            seed = self.seed + trial
-            torch.manual_seed(seed)
-            try:
-                inputs = get_inputs_fn()
-                ref_output = _run_model(ref_model, inputs, self.device)
+        tolerance = Tolerance(rtol=self.rtol, atol=self.atol)
+        oracle_config = OracleConfig(
+            default_tolerance=tolerance,
+            dtype_tolerances={
+                dtype: tolerance
+                for dtype in (
+                    torch.float16,
+                    torch.bfloat16,
+                    torch.float32,
+                    torch.float64,
+                    torch.complex64,
+                    torch.complex128,
+                )
+            },
+        )
+        execution_config = ExecutionConfig(
+            synchronize_state=True,
+            preserve_module_state=True,
+            preserve_caller_rng=True,
+            include_cuda_rng=True,
+            synchronize_cuda_timing=True,
+            retain_outputs=False,
+        )
 
-                torch.manual_seed(seed)
-                inputs2 = get_inputs_fn()
-                mut_output = _run_model(mut_model, inputs2, self.device)
+        saw_inconclusive = False
+        try:
+            for trial in range(self.num_test_inputs):
+                seed = self.seed + trial
+                try:
+                    _seed_all(seed)
+                    generated_inputs = get_inputs_fn()
+                    if isinstance(generated_inputs, (list, tuple)):
+                        args = tuple(generated_inputs)
+                    else:
+                        args = (generated_inputs,)
+                    args = tuple(_move_tree_to_device(args, self.device))
+                except Exception as exc:
+                    saw_inconclusive = True
+                    validation_trials.append({
+                        "trial": trial,
+                        "seed": seed,
+                        "status": ValidationStatus.INCONCLUSIVE.value,
+                        "reason": (
+                            "input generation failed: "
+                            f"{type(exc).__name__}: {str(exc)[:300]}"
+                        ),
+                    })
+                    continue
 
-                if not _compare_outputs(ref_output, mut_output, self.atol, self.rtol):
-                    killed = True
+                with torch.no_grad():
+                    verdict = validate_pair(
+                        reference=ref_model,
+                        candidate=mut_model,
+                        args=args,
+                        oracle_config=oracle_config,
+                        execution_config=execution_config,
+                    )
+                trial_record = {"trial": trial, "seed": seed, **verdict.to_dict()}
+                validation_trials.append(trial_record)
+
+                if verdict.status is ValidationStatus.FAIL:
+                    mutant.status = MutantStatus.KILLED
                     mutant.kill_input_seed = seed
+                    mutant.error_message = verdict.reason[:300]
                     break
-            except Exception as e:
-                killed = True
-                mutant.error_message = f"Runtime trial {trial}: {str(e)[:200]}"
-                mutant.kill_input_seed = seed
-                break
+                if verdict.status is ValidationStatus.INCONCLUSIVE:
+                    saw_inconclusive = True
+            else:
+                mutant.status = (
+                    MutantStatus.UNKNOWN if saw_inconclusive else MutantStatus.SURVIVED
+                )
+                if saw_inconclusive:
+                    mutant.error_message = (
+                        "One or more trials were inconclusive; no sound kill was observed"
+                    )
+        finally:
+            caller_rng.restore()
 
-        mutant.status = MutantStatus.KILLED if killed else MutantStatus.SURVIVED
-        mutant.execution_time_ms = (time.time() - start_time) * 1000
+        mutant.equiv_detail["phase1_validation"] = {
+            "schema_version": 1,
+            "strict_state_sync": True,
+            "isolated_inputs": True,
+            "three_valued_outcome": True,
+            "trials": validation_trials,
+        }
+        mutant.execution_time_ms = (time.perf_counter() - start_time) * 1000
         return mutant
 
     def run_all_mutants(
@@ -304,8 +449,14 @@ class MutantRunner:
         )
         return result
 
-    def _instantiate_model(self, module: Any, class_name: str,
-                           get_init_inputs_fn: Any) -> torch.nn.Module:
+    def _instantiate_model(
+        self,
+        module: Any,
+        class_name: str,
+        get_init_inputs_fn: Any = None,
+        *,
+        init_inputs: Any = None,
+    ) -> torch.nn.Module:
         """从模块中实例化模型。"""
         cls = getattr(module, class_name, None)
         if cls is None:
@@ -314,7 +465,10 @@ class MutantRunner:
             if cls is None:
                 raise AttributeError(f"Module has no class '{class_name}'")
 
-        init_inputs = get_init_inputs_fn()
+        if get_init_inputs_fn is not None:
+            if init_inputs is not None:
+                raise ValueError("provide get_init_inputs_fn or init_inputs, not both")
+            init_inputs = get_init_inputs_fn()
         if isinstance(init_inputs, (list, tuple)):
             model = cls(*init_inputs)
         else:

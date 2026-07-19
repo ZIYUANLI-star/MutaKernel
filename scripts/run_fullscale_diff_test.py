@@ -23,7 +23,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -84,6 +83,34 @@ def _force_gpu_cleanup():
         P("    [GPU-CLEANUP] nvidia-smi responsive - GPU OK")
     except Exception:
         P("    [GPU-CLEANUP] nvidia-smi NOT responsive - GPU may be hung!")
+
+
+def _maybe_reset_gpu() -> bool:
+    """Reset the GPU only after an explicit operator opt-in.
+
+    ``nvidia-smi --gpu-reset`` disrupts every process sharing the device and
+    must never be an automatic response to one slow candidate.  The normal
+    recovery mechanism is subprocess isolation; a dedicated machine operator
+    may set ``MUTAKERNEL_ALLOW_GPU_RESET=1`` when no other workloads exist.
+    """
+
+    if os.environ.get("MUTAKERNEL_ALLOW_GPU_RESET") != "1":
+        P(
+            "    [GPU-CLEANUP] Automatic device reset is disabled; "
+            "set MUTAKERNEL_ALLOW_GPU_RESET=1 only on an exclusive GPU"
+        )
+        return False
+    completed = subprocess.run(
+        ["nvidia-smi", "--gpu-reset"],
+        timeout=10,
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        P("    [GPU-CLEANUP] Explicit GPU reset request failed")
+        return False
+    P("    [GPU-CLEANUP] GPU reset completed after explicit opt-in")
+    return True
 
 
 def _run_stress_worker(cfg: dict, timeout: int) -> dict | None:
@@ -469,10 +496,9 @@ def run_dataset(dataset_name: str, registry: list[dict], result_dir: Path,
         result["kernel_name"] = entry.get("kernel_name", "")
 
         if elapsed > KERNEL_TIMEOUT:
-            P(f"    WARNING: kernel took {elapsed:.0f}s (>{KERNEL_TIMEOUT}s), forcing GPU cleanup")
+            P(f"    WARNING: kernel took {elapsed:.0f}s (>{KERNEL_TIMEOUT}s); checking reset policy")
             try:
-                subprocess.run(["nvidia-smi", "--gpu-reset"], timeout=10,
-                               capture_output=True)
+                _maybe_reset_gpu()
             except Exception:
                 pass
 

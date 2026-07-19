@@ -18,7 +18,6 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -26,6 +25,11 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
+from config import (
+    KERNELBENCH_ROOT as CONFIGURED_KERNELBENCH_ROOT,
+    KERNELBENCH_RUNS,
+)
+from src.experiments.kernel_registry import scan_kernel_registry_file
 from src.models import (
     KernelInfo, Mutant, MutantStatus, MutationSite, MutationTestResult,
 )
@@ -40,7 +44,7 @@ from src.stress.llm_analyzer import (
     OPERATOR_DESCRIPTIONS,
 )
 
-KB_ROOT = Path("/home/kbuser/projects/KernelBench-0")
+KB_ROOT = CONFIGURED_KERNELBENCH_ROOT
 BEST_KERNELS_FILE = PROJECT_ROOT / "best_kernels.json"
 PROBLEM_DIRS = {
     "L1": KB_ROOT / "KernelBench" / "level1",
@@ -1086,8 +1090,15 @@ def main():
     t_start = time.time()
     STRESS_RESULT_DIR.mkdir(parents=True, exist_ok=True)
 
-    with open(BEST_KERNELS_FILE) as f:
-        best_kernels = json.load(f)
+    registry_scan = scan_kernel_registry_file(
+        BEST_KERNELS_FILE,
+        KERNELBENCH_RUNS,
+    )
+    best_kernels = registry_scan.migrated_registry
+    kernel_paths = {
+        key: resolution.absolute_path
+        for key, resolution in registry_scan.resolutions.items()
+    }
 
     P(f"\n{'='*70}")
     P(f"  Mutation-Guided Diagnosis and Augmentation (Three-Tier Framework)")
@@ -1149,6 +1160,8 @@ def main():
               f"-- already done, skip")
             continue
 
+        mutant_started_at = time.perf_counter()
+
         equiv_detail = mutant_meta.get("equiv_detail", {})
         op_name = mutant_meta["operator_name"]
 
@@ -1172,10 +1185,7 @@ def main():
             P(f"    ERROR: {kernel_name} not in best_kernels.json")
             continue
 
-        kernel_path = Path(bk_info["kernel_path"])
-        if not kernel_path.exists():
-            P(f"    ERROR: kernel file not found: {kernel_path}")
-            continue
+        kernel_path = kernel_paths[kernel_name]
 
         problem_file = find_problem_file(problem_dir, kernel_meta["problem_id"])
         if not problem_file:
@@ -1347,6 +1357,9 @@ def main():
             })
 
         # --- Result tracking ---
+        stress_result.total_time_ms = (
+            time.perf_counter() - mutant_started_at
+        ) * 1000.0
         tier_tested[tier] += 1
         if stress_result.any_killed:
             tier_kills[tier] += 1

@@ -1,5 +1,11 @@
 # Block 2: MutEngine — 变异测试执行引擎
 
+> **Historical pre-FSE design/result note.** This file documents an obsolete
+> pilot protocol. Its numeric, equivalence, LLM-audit, novelty, and effectiveness
+> claims are not current evidence. Use `FSE_CODE_REMEDIATION.md`,
+> `LEGACY_RESULT_VALIDITY.md`, and `FSE_EXPERIMENT_RUNBOOK.md` as the canonical
+> sources.
+
 > **对应文件**: `src/mutengine/mutant_runner.py`, `src/mutengine/equivalent_detector.py`, `src/mutengine/report.py`, `src/mutengine/parser/triton_parser.py`, `src/mutengine/parser/cuda_parser.py`, `src/bridge/eval_bridge.py`
 >
 > **论文位置**: Section 3.1（变异测试基本流程）+ Section 3.4（等价变异体处理）— 核心贡献 1 的执行基础设施

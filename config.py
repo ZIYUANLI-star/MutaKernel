@@ -1,5 +1,11 @@
-"""MutaKernel 全局配置"""
+"""MutaKernel global configuration.
 
+Machine-specific paths must come from environment variables.  Defaults point
+to the vendored project data so a fresh clone does not depend on an author's
+home directory.
+"""
+
+import os
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional
@@ -7,13 +13,25 @@ from typing import Optional
 
 PROJECT_ROOT = Path(__file__).parent
 
-KERNELBENCH_ROOT = Path("/home/kbuser/projects/KernelBench-0")
-KERNELBENCH_PROBLEMS = KERNELBENCH_ROOT / "KernelBench" / "KernelBench"
-KERNELBENCH_RUNS = KERNELBENCH_ROOT / "runs"
+
+def _env_path(name: str, default: Path) -> Path:
+    raw = os.environ.get(name)
+    return Path(raw).expanduser().resolve() if raw else default.resolve()
+
+
+KERNELBENCH_ROOT = _env_path(
+    "MUTAKERNEL_KERNELBENCH_ROOT",
+    PROJECT_ROOT / "KernelBench",
+)
+KERNELBENCH_PROBLEMS = KERNELBENCH_ROOT / "KernelBench"
+KERNELBENCH_RUNS = _env_path(
+    "MUTAKERNEL_KERNELBENCH_RUNS",
+    PROJECT_ROOT / "runs",
+)
 
 DEFAULT_RUN_NAME = "iter_full_l{level}_caesar_paper_v2"
 
-RESULTS_DIR = PROJECT_ROOT / "runs"
+RESULTS_DIR = _env_path("MUTAKERNEL_RESULTS_DIR", PROJECT_ROOT / "runs")
 
 DEFAULT_ATOL = 1e-02
 DEFAULT_RTOL = 1e-02

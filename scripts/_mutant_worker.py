@@ -18,34 +18,10 @@ import tempfile
 import time
 from pathlib import Path
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-
-
-def _bitwise_identical(a, b):
-    """NaN-aware bitwise comparison."""
-    import torch
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        if a.shape != b.shape or a.dtype != b.dtype:
-            return False
-        if a.is_floating_point():
-            nan_a = torch.isnan(a)
-            nan_b = torch.isnan(b)
-            if not torch.equal(nan_a, nan_b):
-                return False
-            finite = ~nan_a
-            if finite.any():
-                return torch.equal(a[finite], b[finite])
-            return True
-        return torch.equal(a, b)
-    if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
-        if len(a) != len(b):
-            return False
-        return all(_bitwise_identical(x, y) for x, y in zip(a, b))
-    return a == b
 
 
 def _run_mode(cfg):
@@ -133,12 +109,17 @@ def _tensor_summary(t):
     """Compact summary of a tensor for reproducibility logs."""
     import torch
     if isinstance(t, torch.Tensor):
+        mean = (
+            float(t.mean().item())
+            if t.numel() > 0 and t.is_floating_point()
+            else None
+        )
         return {
             "shape": list(t.shape),
             "dtype": str(t.dtype),
             "min": float(t.min()) if t.numel() > 0 else None,
             "max": float(t.max()) if t.numel() > 0 else None,
-            "mean": float(t.float().mean()) if t.numel() > 0 else None,
+            "mean": mean,
             "has_nan": bool(t.isnan().any()) if t.is_floating_point() else False,
             "has_inf": bool(t.isinf().any()) if t.is_floating_point() else False,
         }
@@ -146,223 +127,416 @@ def _tensor_summary(t):
 
 
 def _equiv_mode(cfg):
-    """Check if a survived mutant is statistically equivalent.
+    """Dynamically challenge a survived mutant using sound paired execution.
 
-    Returns a rich result dict containing full reproducibility information:
-    - All seeds and policies tested
-    - If divergence found: exact round, seed, policy, input summary
-    - If equivalent: complete list of passed rounds
+    ``is_equivalent`` is retained for legacy consumers, but it is deliberately
+    three-valued: ``True`` means no divergence was observed, ``False`` means a
+    concrete non-equivalence witness was observed, and ``None`` means that the
+    comparison was inconclusive.  Passing tests are evidence, not a proof of
+    semantic equivalence.
+
+    Final labels are derived only from :mod:`src.validation`.  An LLM may be
+    used by an outer workflow to suggest inputs, but no LLM verdict is accepted
+    by this worker as an equivalence label.
     """
+    import hashlib
+    import random
+
     import torch
-    from src.mutengine.mutant_runner import _load_module_from_source, CompilationError
+
     from src.bridge.eval_bridge import _load_module_from_path
+    from src.mutengine.mutant_runner import (
+        CompilationError,
+        _load_module_from_source,
+        _move_tree_to_device,
+    )
     from src.stress.policy_bank import STRESS_POLICIES
+    from src.validation import (
+        ExecutionConfig,
+        OracleConfig,
+        RNGSnapshot,
+        Tolerance,
+        ValidationStatus,
+        clone_tree,
+        validate_pair,
+    )
 
     t0 = time.time()
     device = cfg["device"]
-    equiv_runs = cfg.get("equiv_runs", 20)
-    base_seed = cfg.get("base_seed", 10000)
+    equiv_runs = int(cfg.get("equiv_runs", 20))
+    base_seed = int(cfg.get("base_seed", 10000))
     kernel_code = cfg.get("kernel_code", "")
     operator_name = cfg.get("operator_name", "")
-    stress_policies = OPERATOR_DIRECTED_POLICIES.get(operator_name, EQUIV_STRESS_POLICIES)
+    stress_policies = cfg.get(
+        "stress_policies",
+        OPERATOR_DIRECTED_POLICIES.get(operator_name, EQUIV_STRESS_POLICIES),
+    )
+    stress_repeats = int(cfg.get("stress_repeats", 2))
 
     safe_id = cfg["mutant_id"].replace("-", "_").replace(".", "_")
-    tmp_dir = tempfile.mkdtemp(prefix="equiv_iso_")
-
-    ref_mod = _load_module_from_path(cfg["problem_file"], f"ref_eq_{safe_id}")
-    get_inputs = ref_mod.get_inputs
-    get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
-    init_args = get_init_inputs()
-
-    if kernel_code:
-        try:
-            import hashlib
-            orig_hash = hashlib.md5(kernel_code.encode()).hexdigest()[:10]
-            orig_mod = _load_module_from_source(
-                kernel_code, f"eqo_{orig_hash}", tmp_dir,
-            )
-        except (CompilationError, Exception) as e:
-            return {
-                "is_equivalent": False,
-                "error": f"OrigCompile: {str(e)[:200]}",
-                "time_ms": (time.time() - t0) * 1000,
-            }
-        orig_cls = getattr(orig_mod, "ModelNew", None) or getattr(orig_mod, "Model")
-        orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
-                      else orig_cls())
-        orig_model = orig_model.to(device).eval()
-    else:
-        ref_cls = ref_mod.Model
-        orig_model = (ref_cls(*init_args) if isinstance(init_args, (list, tuple))
-                      else ref_cls())
-        orig_model = orig_model.to(device).eval()
-
-    try:
-        mut_mod = _load_module_from_source(
-            cfg["mutated_code"], f"eqm_{safe_id}", tmp_dir,
-        )
-    except CompilationError as e:
-        return {
-            "is_equivalent": False,
-            "error": f"Compilation: {str(e)[:200]}",
-            "time_ms": (time.time() - t0) * 1000,
-        }
-
-    mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-    mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else mut_cls())
-    mut_model = mut_model.to(device).eval()
-
-    def _run_pair(inputs_on_device):
-        with torch.no_grad():
-            orig_out = orig_model(*inputs_on_device)
-            mut_out = mut_model(*inputs_on_device)
-        return _bitwise_identical(orig_out, mut_out)
-
     tested_random_seeds = []
     tested_policies = []
+    trials = []
+    errors = []
     first_input_summary = None
     last_input_summary = None
+    saw_inconclusive = False
+    valid_rounds = 0
 
-    # --- Random seed rounds ---
-    for i in range(equiv_runs):
-        seed = base_seed + i
+    def _seed_all(seed):
+        random.seed(seed)
+        try:
+            import numpy as np
+        except ImportError:  # pragma: no cover - NumPy is optional.
+            np = None
+        if np is not None:
+            np.random.seed(seed % (2 ** 32))
         torch.manual_seed(seed)
-        inputs = get_inputs()
-        moved = [x.to(device) if isinstance(x, torch.Tensor) else x
-                 for x in inputs]
-        if not _run_pair(moved):
-            return {
-                "is_equivalent": False,
-                "time_ms": (time.time() - t0) * 1000,
-                "divergence": {
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    def _summaries(values):
+        summaries = []
+        for value in values:
+            try:
+                summaries.append(_tensor_summary(value))
+            except Exception as exc:  # Logging must never decide correctness.
+                summaries.append({
+                    "type": type(value).__name__,
+                    "summary_error": f"{type(exc).__name__}: {str(exc)[:160]}",
+                })
+        return summaries
+
+    def _normalise_args(generated):
+        if isinstance(generated, (list, tuple)):
+            args = tuple(generated)
+        else:
+            args = (generated,)
+        return tuple(_move_tree_to_device(args, device))
+
+    def _error(phase, exc, **context):
+        record = {
+            "phase": phase,
+            "exception_type": type(exc).__name__,
+            "message": str(exc)[:300],
+        }
+        record.update(context)
+        errors.append(record)
+        return record
+
+    def _base_result(status, reason, is_equivalent, *, divergence=None):
+        result = {
+            # Legacy fields.
+            "is_equivalent": is_equivalent,
+            "time_ms": (time.time() - t0) * 1000,
+            "tested_random_seeds": tested_random_seeds,
+            "tested_policies": tested_policies,
+            "total_rounds": len(trials),
+            "first_input_summary": first_input_summary,
+            "last_input_summary": last_input_summary,
+            # Sound, three-valued fields.
+            "validation_status": status.value,
+            "reason": reason,
+            "errors": errors,
+            "valid_rounds": valid_rounds,
+            "trials": trials,
+        }
+        if status is ValidationStatus.INCONCLUSIVE:
+            result["error"] = reason[:300]
+        if divergence is not None:
+            result["divergence"] = divergence
+        return result
+
+    def _setup_inconclusive(phase, exc):
+        _error(phase, exc)
+        return _base_result(
+            ValidationStatus.INCONCLUSIVE,
+            f"{phase} failed; equivalence is unknown: "
+            f"{type(exc).__name__}: {str(exc)[:200]}",
+            None,
+        )
+
+    def _validation_errors(verdict, **context):
+        serialised = verdict.to_dict()
+        for entry in serialised["errors"]:
+            enriched = dict(entry)
+            enriched.update(context)
+            errors.append(enriched)
+        return serialised
+
+    def _evaluate(args, metadata, input_summary):
+        nonlocal saw_inconclusive, valid_rounds
+        with torch.no_grad():
+            verdict = validate_pair(
+                reference=orig_model,
+                candidate=mut_model,
+                args=args,
+                oracle_config=oracle_config,
+                execution_config=execution_config,
+            )
+        serialised = _validation_errors(verdict, **metadata)
+        trial = {**metadata, **serialised}
+        trials.append(trial)
+
+        if verdict.status is ValidationStatus.PASS:
+            valid_rounds += 1
+            return None
+        if verdict.status is ValidationStatus.INCONCLUSIVE:
+            saw_inconclusive = True
+            return None
+
+        # FAIL is emitted by ValidationExecutor only after the reference ran
+        # successfully and either the candidate concretely diverged or failed.
+        candidate_crash = any(
+            item.get("phase") == "candidate" for item in serialised["errors"]
+        )
+        divergence = {
+            **metadata,
+            "detail": "candidate_crash" if candidate_crash else "output_diverged",
+            "input_summary": input_summary,
+            "oracle": serialised["oracle"],
+            "errors": serialised["errors"],
+        }
+        return _base_result(
+            ValidationStatus.FAIL,
+            verdict.reason,
+            False,
+            divergence=divergence,
+        )
+
+    caller_rng = RNGSnapshot.capture(include_cuda=True)
+    try:
+        with tempfile.TemporaryDirectory(prefix="equiv_iso_") as tmp_dir:
+            try:
+                ref_mod = _load_module_from_path(
+                    cfg["problem_file"], f"ref_eq_{safe_id}",
+                )
+                get_inputs = ref_mod.get_inputs
+                get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
+            except Exception as exc:
+                return _setup_inconclusive("reference_load", exc)
+
+            try:
+                _seed_all(base_seed)
+                init_args = get_init_inputs()
+            except Exception as exc:
+                return _setup_inconclusive("initial_input_generation", exc)
+
+            if kernel_code:
+                try:
+                    orig_hash = hashlib.md5(kernel_code.encode()).hexdigest()[:10]
+                    orig_mod = _load_module_from_source(
+                        kernel_code, f"eqo_{orig_hash}", tmp_dir,
+                    )
+                    orig_cls = (
+                        getattr(orig_mod, "ModelNew", None)
+                        or getattr(orig_mod, "Model")
+                    )
+                except (CompilationError, Exception) as exc:
+                    return _setup_inconclusive("reference_compile", exc)
+            else:
+                try:
+                    orig_cls = ref_mod.Model
+                except Exception as exc:
+                    return _setup_inconclusive("reference_class", exc)
+
+            try:
+                mut_mod = _load_module_from_source(
+                    cfg["mutated_code"], f"eqm_{safe_id}", tmp_dir,
+                )
+                mut_cls = (
+                    getattr(mut_mod, "ModelNew", None)
+                    or getattr(mut_mod, "Model")
+                )
+            except (CompilationError, Exception) as exc:
+                return _setup_inconclusive("candidate_compile", exc)
+
+            try:
+                _seed_all(base_seed)
+                constructor_rng = RNGSnapshot.capture(include_cuda=True)
+                constructor_rng.restore()
+                orig_model = (
+                    orig_cls(*clone_tree(init_args))
+                    if isinstance(init_args, (list, tuple))
+                    else orig_cls()
+                )
+                constructor_rng.restore()
+                mut_model = (
+                    mut_cls(*clone_tree(init_args))
+                    if isinstance(init_args, (list, tuple))
+                    else mut_cls()
+                )
+                orig_model = orig_model.to(device).eval()
+                mut_model = mut_model.to(device).eval()
+            except Exception as exc:
+                return _setup_inconclusive("model_initialisation", exc)
+
+            tolerance = Tolerance(
+                rtol=float(cfg.get("rtol", 0.0)),
+                atol=float(cfg.get("atol", 0.0)),
+            )
+            oracle_config = OracleConfig(
+                default_tolerance=tolerance,
+                dtype_tolerances={
+                    dtype: tolerance
+                    for dtype in (
+                        torch.float16,
+                        torch.bfloat16,
+                        torch.float32,
+                        torch.float64,
+                        torch.complex64,
+                        torch.complex128,
+                    )
+                },
+                require_dtype=True,
+                require_device=True,
+                require_layout=True,
+            )
+            execution_config = ExecutionConfig(
+                synchronize_state=True,
+                preserve_module_state=True,
+                preserve_caller_rng=True,
+                include_cuda_rng=True,
+                synchronize_cuda_timing=True,
+                retain_outputs=False,
+            )
+
+            # --- Random seed rounds ---
+            for i in range(equiv_runs):
+                seed = base_seed + i
+                tested_random_seeds.append(seed)
+                metadata = {
                     "round_type": "random",
                     "round_index": i,
                     "seed": seed,
                     "policy": None,
-                    "input_summary": [_tensor_summary(x) for x in inputs],
-                },
-                "tested_random_seeds": tested_random_seeds + [seed],
-                "tested_policies": tested_policies,
-            }
-        if i == 0:
-            first_input_summary = {
-                "round": "random_0", "seed": seed,
-                "tensors": [_tensor_summary(x) for x in inputs],
-            }
-        last_input_summary = {
-            "round": f"random_{i}", "seed": seed,
-            "tensors": [_tensor_summary(x) for x in inputs],
-        }
-        tested_random_seeds.append(seed)
-
-    # --- Stress policy rounds ---
-    for policy_name in stress_policies:
-        policy_fn = STRESS_POLICIES.get(policy_name)
-        if policy_fn is None:
-            continue
-        for si in range(2):
-            seed = base_seed + equiv_runs + si
-            torch.manual_seed(seed)
-            try:
-                template = get_inputs()
-                stress_inputs = policy_fn(template, seed)
-            except Exception:
-                tested_policies.append({
-                    "name": policy_name, "sub_index": si,
-                    "seed": seed, "status": "generation_failed"})
-                continue
-            moved = [x.to(device) if isinstance(x, torch.Tensor) else x
-                     for x in stress_inputs]
-
-            orig_exc = mut_exc = None
-            orig_out = mut_out = None
-            try:
-                with torch.no_grad():
-                    orig_out = orig_model(*moved)
-            except Exception as e:
-                orig_exc = e
-            try:
-                with torch.no_grad():
-                    mut_out = mut_model(*moved)
-            except Exception as e:
-                mut_exc = e
-
-            if orig_exc is not None and mut_exc is not None:
-                if type(orig_exc) is type(mut_exc):
-                    tested_policies.append({
-                        "name": policy_name, "sub_index": si,
-                        "seed": seed, "status": "both_exception_same_type"})
+                }
+                try:
+                    _seed_all(seed)
+                    generated = get_inputs()
+                    input_values = (
+                        list(generated)
+                        if isinstance(generated, (list, tuple))
+                        else [generated]
+                    )
+                    input_summary = _summaries(input_values)
+                    args = _normalise_args(generated)
+                except Exception as exc:
+                    saw_inconclusive = True
+                    _error("input_generation", exc, **metadata)
+                    trials.append({
+                        **metadata,
+                        "status": ValidationStatus.INCONCLUSIVE.value,
+                        "reason": (
+                            "input generation failed; equivalence is unknown: "
+                            f"{type(exc).__name__}: {str(exc)[:200]}"
+                        ),
+                        "errors": [errors[-1]],
+                    })
                     continue
-                return {
-                    "is_equivalent": False,
-                    "time_ms": (time.time() - t0) * 1000,
-                    "divergence": {
-                        "round_type": "stress",
-                        "policy": policy_name, "sub_index": si,
-                        "seed": seed,
-                        "detail": "diff_exception",
-                        "input_summary": [_tensor_summary(x)
-                                          for x in stress_inputs],
-                    },
-                    "tested_random_seeds": tested_random_seeds,
-                    "tested_policies": tested_policies,
-                }
-            if orig_exc is not None or mut_exc is not None:
-                oom_msg = str(orig_exc or mut_exc).lower()
-                if "out of memory" in oom_msg:
-                    tested_policies.append({
-                        "name": policy_name, "sub_index": si,
-                        "seed": seed, "status": "oom_skipped"})
-                    continue
-                return {
-                    "is_equivalent": False,
-                    "time_ms": (time.time() - t0) * 1000,
-                    "divergence": {
-                        "round_type": "stress",
-                        "policy": policy_name, "sub_index": si,
-                        "seed": seed,
-                        "detail": "one_side_exception",
-                        "orig_exc": str(orig_exc)[:200] if orig_exc else None,
-                        "mut_exc": str(mut_exc)[:200] if mut_exc else None,
-                        "input_summary": [_tensor_summary(x)
-                                          for x in stress_inputs],
-                    },
-                    "tested_random_seeds": tested_random_seeds,
-                    "tested_policies": tested_policies,
-                }
-            if not _bitwise_identical(orig_out, mut_out):
-                return {
-                    "is_equivalent": False,
-                    "time_ms": (time.time() - t0) * 1000,
-                    "divergence": {
-                        "round_type": "stress",
-                        "policy": policy_name, "sub_index": si,
-                        "seed": seed,
-                        "detail": "output_diverged",
-                        "input_summary": [_tensor_summary(x)
-                                          for x in stress_inputs],
-                    },
-                    "tested_random_seeds": tested_random_seeds,
-                    "tested_policies": tested_policies,
-                }
-            tested_policies.append({
-                "name": policy_name, "sub_index": si,
-                "seed": seed, "status": "passed"})
-            last_input_summary = {
-                "round": f"stress_{policy_name}_{si}", "seed": seed,
-                "tensors": [_tensor_summary(x) for x in stress_inputs],
-            }
 
-    return {
-        "is_equivalent": True,
-        "time_ms": (time.time() - t0) * 1000,
-        "tested_random_seeds": tested_random_seeds,
-        "tested_policies": tested_policies,
-        "total_rounds": len(tested_random_seeds) + len(tested_policies),
-        "first_input_summary": first_input_summary,
-        "last_input_summary": last_input_summary,
-    }
+                if first_input_summary is None:
+                    first_input_summary = {
+                        "round": f"random_{i}",
+                        "seed": seed,
+                        "tensors": input_summary,
+                    }
+                last_input_summary = {
+                    "round": f"random_{i}",
+                    "seed": seed,
+                    "tensors": input_summary,
+                }
+                failure = _evaluate(args, metadata, input_summary)
+                if failure is not None:
+                    return failure
+
+            # --- Stress policy rounds ---
+            for policy_name in stress_policies:
+                policy_fn = STRESS_POLICIES.get(policy_name)
+                if policy_fn is None:
+                    saw_inconclusive = True
+                    missing = KeyError(f"unknown stress policy: {policy_name}")
+                    _error("stress_policy_lookup", missing, policy=policy_name)
+                    tested_policies.append({
+                        "name": policy_name,
+                        "status": "policy_missing",
+                    })
+                    continue
+
+                for si in range(stress_repeats):
+                    seed = base_seed + equiv_runs + si
+                    metadata = {
+                        "round_type": "stress",
+                        "policy": policy_name,
+                        "sub_index": si,
+                        "seed": seed,
+                    }
+                    policy_record = {
+                        "name": policy_name,
+                        "sub_index": si,
+                        "seed": seed,
+                    }
+                    tested_policies.append(policy_record)
+                    try:
+                        _seed_all(seed)
+                        template = get_inputs()
+                        stress_inputs = policy_fn(clone_tree(template), seed)
+                        input_values = (
+                            list(stress_inputs)
+                            if isinstance(stress_inputs, (list, tuple))
+                            else [stress_inputs]
+                        )
+                        input_summary = _summaries(input_values)
+                        args = _normalise_args(stress_inputs)
+                    except Exception as exc:
+                        saw_inconclusive = True
+                        policy_record["status"] = "generation_failed"
+                        _error("stress_input_generation", exc, **metadata)
+                        trials.append({
+                            **metadata,
+                            "status": ValidationStatus.INCONCLUSIVE.value,
+                            "reason": (
+                                "stress input generation failed; equivalence is unknown: "
+                                f"{type(exc).__name__}: {str(exc)[:200]}"
+                            ),
+                            "errors": [errors[-1]],
+                        })
+                        continue
+
+                    failure = _evaluate(args, metadata, input_summary)
+                    policy_record["status"] = (
+                        trials[-1]["status"] if failure is None else "non_equivalent"
+                    )
+                    last_input_summary = {
+                        "round": f"stress_{policy_name}_{si}",
+                        "seed": seed,
+                        "tensors": input_summary,
+                    }
+                    if first_input_summary is None:
+                        first_input_summary = last_input_summary
+                    if failure is not None:
+                        return failure
+
+            if saw_inconclusive or valid_rounds == 0:
+                reason = (
+                    "one or more rounds were inconclusive; no sound "
+                    "non-equivalence witness was observed"
+                    if saw_inconclusive
+                    else "no valid validation round completed; equivalence is unknown"
+                )
+                return _base_result(
+                    ValidationStatus.INCONCLUSIVE,
+                    reason,
+                    None,
+                )
+            return _base_result(
+                ValidationStatus.PASS,
+                "no divergence was observed in the completed validation rounds; "
+                "this is not a proof of semantic equivalence",
+                True,
+            )
+    finally:
+        caller_rng.restore()
 
 
 def main():
@@ -390,8 +564,18 @@ def main():
             }
         else:
             result = {
-                "is_equivalent": False,
+                "is_equivalent": None,
                 "error": f"EquivCrash: {str(e)[:300]}",
+                "validation_status": "inconclusive",
+                "reason": (
+                    "equivalence worker crashed; equivalence is unknown: "
+                    f"{type(e).__name__}: {str(e)[:300]}"
+                ),
+                "errors": [{
+                    "phase": "worker",
+                    "exception_type": type(e).__name__,
+                    "message": str(e)[:300],
+                }],
                 "time_ms": (time.time() - t0) * 1000,
             }
 

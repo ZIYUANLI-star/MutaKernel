@@ -1,5 +1,11 @@
 # Block 5: 诊断驱动的 GPU Kernel 测试增强与 LLM 辅助分析
 
+> **Historical pre-FSE design/result note.** This file documents an obsolete
+> pilot protocol. Its numeric, equivalence, LLM-audit, novelty, and effectiveness
+> claims are not current evidence. Use `FSE_CODE_REMEDIATION.md`,
+> `LEGACY_RESULT_VALIDITY.md`, and `FSE_EXPERIMENT_RUNBOOK.md` as the canonical
+> sources.
+
 > **对应文件**:
 > - Phase 1 (压力测试): `src/stress/policy_bank.py`, `src/stress/differential_tester.py`,
 >   `src/mutrepair/enhanced_inputs.py`, `scripts/run_stress_enhance.py`, `scripts/_stress_worker.py`

@@ -1,5 +1,11 @@
 # 存活变异体分析报告
 
+> **Historical pre-FSE design/result note.** This file documents an obsolete
+> pilot protocol. Its numeric, equivalence, LLM-audit, novelty, and effectiveness
+> claims are not current evidence. Use `FSE_CODE_REMEDIATION.md`,
+> `LEGACY_RESULT_VALIDITY.md`, and `FSE_EXPERIMENT_RUNBOOK.md` as the canonical
+> sources.
+
 > 基于三阶段实验数据（初始变异测试 → 4层增强测试 → LLM迭代分析）的综合分析。
 
 ## 一、三阶段杀伤汇总

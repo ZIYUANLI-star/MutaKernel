@@ -1,5 +1,11 @@
 # Block 3: RealismGuard — 变异体现实性验证
 
+> **Historical pre-FSE design/result note.** This file documents an obsolete
+> pilot protocol. Its numeric, equivalence, LLM-audit, novelty, and effectiveness
+> claims are not current evidence. Use `FSE_CODE_REMEDIATION.md`,
+> `LEGACY_RESULT_VALIDITY.md`, and `FSE_EXPERIMENT_RUNBOOK.md` as the canonical
+> sources.
+
 > **对应文件**: `src/mutengine/realism_validator.py`, `scripts/validate_realism.py`
 >
 > **论文位置**: Section 3.3（Mutant Realism 验证）— 构造效度的关键证据

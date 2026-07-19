@@ -65,13 +65,22 @@ class StressTestResult:
     @property
     def deterministic_killed(self) -> bool:
         """Whether any deterministic dimension (Step 1+2) killed the mutant."""
-        for d in self.main_track.values():
-            if d.get("killed"):
-                return True
-        for d in self.config_track.values():
-            if d.get("killed"):
-                return True
-        return False
+        return self.main_track_killed or self.config_track_killed
+
+    @property
+    def main_track_killed(self) -> bool:
+        """Whether a legacy main-track dimension found a mismatch.
+
+        This is not automatically an in-contract verdict: dtype and module-mode
+        policies may extend a subject's declared contract.  New FSE runs attach
+        an explicit contract scope to every observation.
+        """
+        return any(d.get("killed") for d in self.main_track.values())
+
+    @property
+    def config_track_killed(self) -> bool:
+        """Whether an explicitly extended-configuration test found a mismatch."""
+        return any(d.get("killed") for d in self.config_track.values())
 
     @property
     def llm_killed(self) -> bool:
@@ -91,6 +100,8 @@ class StressTestResult:
         config_killed_by = [k for k, v in self.config_track.items() if v.get("killed")]
         return {
             "deterministic_killed": self.deterministic_killed,
+            "main_track_killed": self.main_track_killed,
+            "config_track_killed": self.config_track_killed,
             "llm_killed": self.llm_killed,
             "main_track_killed_by": main_killed_by,
             "config_track_killed_by": config_killed_by,
@@ -125,6 +136,8 @@ class StressSummary:
     killed_count: int = 0
     survived_count: int = 0
     deterministic_kill_count: int = 0
+    main_track_kill_count: int = 0
+    config_track_kill_count: int = 0
     llm_kill_count: int = 0
     per_dimension_kills: Dict[str, int] = field(default_factory=dict)
     per_policy_kills: Dict[str, int] = field(default_factory=dict)
@@ -143,6 +156,10 @@ class StressSummary:
             self.killed_count += 1
             if r.deterministic_killed:
                 self.deterministic_kill_count += 1
+            if r.main_track_killed:
+                self.main_track_kill_count += 1
+            if r.config_track_killed:
+                self.config_track_kill_count += 1
             if r.llm_killed:
                 self.llm_kill_count += 1
                 kr = ks.get("llm_killing_round", 0)
@@ -170,6 +187,8 @@ class StressSummary:
             "survived_count": self.survived_count,
             "kill_rate": round(self.killed_count / max(1, self.total_tested), 4),
             "deterministic_kill_count": self.deterministic_kill_count,
+            "main_track_kill_count": self.main_track_kill_count,
+            "config_track_kill_count": self.config_track_kill_count,
             "llm_kill_count": self.llm_kill_count,
             "llm_rounds_distribution": self.llm_rounds_distribution,
             "per_dimension_kills": self.per_dimension_kills,

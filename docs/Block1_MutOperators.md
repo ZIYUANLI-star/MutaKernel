@@ -1,5 +1,11 @@
 # Block 1: MutOperators — ML 算子数值语义变异算子族
 
+> **Historical pre-FSE design/result note.** This file documents an obsolete
+> pilot protocol. Its numeric, equivalence, LLM-audit, novelty, and effectiveness
+> claims are not current evidence. Use `FSE_CODE_REMEDIATION.md`,
+> `LEGACY_RESULT_VALIDITY.md`, and `FSE_EXPERIMENT_RUNBOOK.md` as the canonical
+> sources.
+
 > **对应文件**: `src/mutengine/operators/base.py`, `arithmetic.py`, `gpu_parallel.py`, `ml_semantic.py`, `llm_pattern.py`
 >
 > **论文位置**: Section 3.2（变异算子设计）— 核心贡献 1 的智力内核

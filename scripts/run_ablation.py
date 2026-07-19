@@ -31,7 +31,6 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -39,12 +38,17 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
+from config import (
+    KERNELBENCH_ROOT as CONFIGURED_KERNELBENCH_ROOT,
+    KERNELBENCH_RUNS,
+)
+from src.experiments.kernel_registry import scan_kernel_registry_file
 from src.models import KernelInfo
 from src.mutengine.mutant_runner import MutantRunner
 from src.stress.policy_bank import get_all_policy_names
 from src.mutrepair.enhanced_inputs import STRATEGY_MAP
 
-KB_ROOT = Path("/home/kbuser/projects/KernelBench-0")
+KB_ROOT = CONFIGURED_KERNELBENCH_ROOT
 BEST_KERNELS_FILE = PROJECT_ROOT / "best_kernels.json"
 PROBLEM_DIRS = {
     "L1": KB_ROOT / "KernelBench" / "level1",
@@ -172,7 +176,8 @@ def _run_worker(cfg: dict, timeout: int) -> dict | None:
                 pass
 
 
-def _resolve_mutant(kernel_name, kernel_meta, mutant_meta, best_kernels):
+def _resolve_mutant(
+        kernel_name, kernel_meta, mutant_meta, best_kernels, kernel_paths):
     level_key = f"L{kernel_meta['level']}"
     problem_dir = PROBLEM_DIRS.get(level_key)
     if not problem_dir:
@@ -180,8 +185,8 @@ def _resolve_mutant(kernel_name, kernel_meta, mutant_meta, best_kernels):
     bk_info = best_kernels.get(kernel_name)
     if not bk_info:
         return None
-    kernel_path = Path(bk_info["kernel_path"])
-    if not kernel_path.exists():
+    kernel_path = kernel_paths.get(kernel_name)
+    if kernel_path is None:
         return None
     problem_file = find_problem_file(problem_dir, kernel_meta["problem_id"])
     if not problem_file:
@@ -237,7 +242,8 @@ def _test_mutant_with_policies(resolved, policies, mutant_meta):
 # Leave-one-out ablation
 # ---------------------------------------------------------------------------
 
-def run_leave_one_out(survived_list, best_kernels, output_dir: Path):
+def run_leave_one_out(
+        survived_list, best_kernels, kernel_paths, output_dir: Path):
     """For each policy, remove it and measure the kill count drop."""
     P(f"\n{'='*70}")
     P(f"  Ablation: Leave-One-Out")
@@ -261,7 +267,8 @@ def run_leave_one_out(survived_list, best_kernels, output_dir: Path):
 
     for idx, (kn, km, mm) in enumerate(type3_candidates):
         mid = mm["id"]
-        resolved = _resolve_mutant(kn, km, mm, best_kernels)
+        resolved = _resolve_mutant(
+            kn, km, mm, best_kernels, kernel_paths)
         if not resolved:
             continue
 
@@ -290,7 +297,8 @@ def run_leave_one_out(survived_list, best_kernels, output_dir: Path):
 
         for kn, km, mm in type3_candidates:
             mid = mm["id"]
-            resolved = _resolve_mutant(kn, km, mm, best_kernels)
+            resolved = _resolve_mutant(
+                kn, km, mm, best_kernels, kernel_paths)
             if not resolved:
                 continue
 
@@ -332,7 +340,8 @@ def run_leave_one_out(survived_list, best_kernels, output_dir: Path):
 # Strategy count curve
 # ---------------------------------------------------------------------------
 
-def run_strategy_curve(survived_list, best_kernels, output_dir: Path):
+def run_strategy_curve(
+        survived_list, best_kernels, kernel_paths, output_dir: Path):
     """Measure kill rate with {1, 3, 5, 7, 12} random policies."""
     P(f"\n{'='*70}")
     P(f"  Ablation: Strategy Count Curve")
@@ -365,7 +374,8 @@ def run_strategy_curve(survived_list, best_kernels, output_dir: Path):
 
             kills = 0
             for kn, km, mm in type3_candidates:
-                resolved = _resolve_mutant(kn, km, mm, best_kernels)
+                resolved = _resolve_mutant(
+                    kn, km, mm, best_kernels, kernel_paths)
                 if not resolved:
                     continue
                 killed, _ = _test_mutant_with_policies(resolved, chosen, mm)
@@ -408,8 +418,15 @@ def main():
                         help="Which ablation to run")
     args = parser.parse_args()
 
-    with open(BEST_KERNELS_FILE) as f:
-        best_kernels = json.load(f)
+    registry_scan = scan_kernel_registry_file(
+        BEST_KERNELS_FILE,
+        KERNELBENCH_RUNS,
+    )
+    best_kernels = registry_scan.migrated_registry
+    kernel_paths = {
+        key: resolution.absolute_path
+        for key, resolution in registry_scan.resolutions.items()
+    }
 
     survived_list = load_all_survived(BLOCK12_RESULT_DIR)
     P(f"  Loaded {len(survived_list)} survived mutants")
@@ -419,9 +436,11 @@ def main():
     t_start = time.time()
 
     if args.mode == "leave_one_out":
-        run_leave_one_out(survived_list, best_kernels, ABLATION_RESULT_DIR)
+        run_leave_one_out(
+            survived_list, best_kernels, kernel_paths, ABLATION_RESULT_DIR)
     elif args.mode == "strategy_curve":
-        run_strategy_curve(survived_list, best_kernels, ABLATION_RESULT_DIR)
+        run_strategy_curve(
+            survived_list, best_kernels, kernel_paths, ABLATION_RESULT_DIR)
 
     elapsed = time.time() - t_start
     P(f"\n  Total elapsed: {elapsed / 60:.1f} min")

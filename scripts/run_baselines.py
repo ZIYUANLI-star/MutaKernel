@@ -27,7 +27,6 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -35,11 +34,16 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import torch
 
+from config import (
+    KERNELBENCH_ROOT as CONFIGURED_KERNELBENCH_ROOT,
+    KERNELBENCH_RUNS,
+)
+from src.experiments.kernel_registry import scan_kernel_registry_file
 from src.models import KernelInfo
 from src.mutengine.mutant_runner import MutantRunner
 from src.stress.policy_bank import get_all_policy_names
 
-KB_ROOT = Path("/home/kbuser/projects/KernelBench-0")
+KB_ROOT = CONFIGURED_KERNELBENCH_ROOT
 BEST_KERNELS_FILE = PROJECT_ROOT / "best_kernels.json"
 PROBLEM_DIRS = {
     "L1": KB_ROOT / "KernelBench" / "level1",
@@ -167,7 +171,8 @@ def _run_worker(cfg: dict, timeout: int) -> dict | None:
                 pass
 
 
-def _resolve_mutant(kernel_name, kernel_meta, mutant_meta, best_kernels):
+def _resolve_mutant(
+        kernel_name, kernel_meta, mutant_meta, best_kernels, kernel_paths):
     """Resolve kernel paths and mutated code for a survived mutant."""
     level_key = f"L{kernel_meta['level']}"
     problem_dir = PROBLEM_DIRS.get(level_key)
@@ -178,8 +183,8 @@ def _resolve_mutant(kernel_name, kernel_meta, mutant_meta, best_kernels):
     if not bk_info:
         return None
 
-    kernel_path = Path(bk_info["kernel_path"])
-    if not kernel_path.exists():
+    kernel_path = kernel_paths.get(kernel_name)
+    if kernel_path is None:
         return None
 
     problem_file = find_problem_file(problem_dir, kernel_meta["problem_id"])
@@ -214,7 +219,8 @@ def _resolve_mutant(kernel_name, kernel_meta, mutant_meta, best_kernels):
 # Baseline 1: 20x random inputs (standard torch.randn)
 # ---------------------------------------------------------------------------
 
-def run_baseline_random20(survived_list, best_kernels, output_dir: Path):
+def run_baseline_random20(
+        survived_list, best_kernels, kernel_paths, output_dir: Path):
     """For each mutant, test with 20 different random seeds using get_inputs()."""
     P(f"\n{'='*70}")
     P(f"  Baseline 1: Random 20x (torch.randn, seed 42-61)")
@@ -237,7 +243,8 @@ def run_baseline_random20(survived_list, best_kernels, output_dir: Path):
         if mutant_id in completed:
             continue
 
-        resolved = _resolve_mutant(kernel_name, kernel_meta, mutant_meta, best_kernels)
+        resolved = _resolve_mutant(
+            kernel_name, kernel_meta, mutant_meta, best_kernels, kernel_paths)
         if resolved is None:
             P(f"  [{idx+1}] {mutant_id} -- could not resolve, skip")
             continue
@@ -311,7 +318,8 @@ def run_baseline_random20(survived_list, best_kernels, output_dir: Path):
 # Baseline 2: Random stress (unguided, 3 random policies per mutant)
 # ---------------------------------------------------------------------------
 
-def run_baseline_random_stress(survived_list, best_kernels, output_dir: Path):
+def run_baseline_random_stress(
+        survived_list, best_kernels, kernel_paths, output_dir: Path):
     """For each mutant, pick 3 random stress policies and test."""
     P(f"\n{'='*70}")
     P(f"  Baseline 2: Random Stress (3 random policies, unguided)")
@@ -337,7 +345,8 @@ def run_baseline_random_stress(survived_list, best_kernels, output_dir: Path):
         if mutant_id in completed:
             continue
 
-        resolved = _resolve_mutant(kernel_name, kernel_meta, mutant_meta, best_kernels)
+        resolved = _resolve_mutant(
+            kernel_name, kernel_meta, mutant_meta, best_kernels, kernel_paths)
         if resolved is None:
             P(f"  [{idx+1}] {mutant_id} -- could not resolve, skip")
             continue
@@ -431,8 +440,15 @@ def main():
                         help="Which baseline to run")
     args = parser.parse_args()
 
-    with open(BEST_KERNELS_FILE) as f:
-        best_kernels = json.load(f)
+    registry_scan = scan_kernel_registry_file(
+        BEST_KERNELS_FILE,
+        KERNELBENCH_RUNS,
+    )
+    best_kernels = registry_scan.migrated_registry
+    kernel_paths = {
+        key: resolution.absolute_path
+        for key, resolution in registry_scan.resolutions.items()
+    }
 
     survived_list = load_all_survived(BLOCK12_RESULT_DIR)
     P(f"  Loaded {len(survived_list)} survived mutants from Block 1-2 results")
@@ -442,9 +458,11 @@ def main():
     t_start = time.time()
 
     if args.mode == "random20":
-        run_baseline_random20(survived_list, best_kernels, BASELINE_RESULT_DIR)
+        run_baseline_random20(
+            survived_list, best_kernels, kernel_paths, BASELINE_RESULT_DIR)
     elif args.mode == "random_stress":
-        run_baseline_random_stress(survived_list, best_kernels, BASELINE_RESULT_DIR)
+        run_baseline_random_stress(
+            survived_list, best_kernels, kernel_paths, BASELINE_RESULT_DIR)
 
     elapsed = time.time() - t_start
     P(f"\n  Total elapsed: {elapsed / 60:.1f} min")

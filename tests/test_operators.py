@@ -69,9 +69,14 @@ class TestRelOpReplace(unittest.TestCase):
 class TestConstPerturb(unittest.TestCase):
     def test_find_int(self):
         op = ConstPerturb()
-        source = "BLOCK_SIZE = 1024\n"
+        source = "iterations = 7\n"
         sites = op.find_sites(source)
         self.assertGreater(len(sites), 0)
+
+    def test_gpu_configuration_int_is_not_semantic_constant(self):
+        op = ConstPerturb()
+        source = "BLOCK_SIZE = 1024\n"
+        self.assertEqual(op.find_sites(source), [])
 
     def test_find_float(self):
         op = ConstPerturb()
@@ -162,16 +167,21 @@ class TestCastRemove(unittest.TestCase):
 class TestLayoutAssume(unittest.TestCase):
     def test_find(self):
         op = LayoutAssume()
-        source = "x = tensor.contiguous()\n"
+        source = "x = tensor.transpose(0, 1).contiguous()\n"
         sites = op.find_sites(source)
         self.assertGreater(len(sites), 0)
 
     def test_apply(self):
         op = LayoutAssume()
-        source = "x = tensor.contiguous()\n"
+        source = "x = tensor.transpose(0, 1).contiguous()\n"
         sites = op.find_sites(source)
         mutated = op.apply(source, sites[0])
         self.assertNotIn(".contiguous()", mutated)
+
+    def test_redundant_contiguous_is_not_mutated(self):
+        op = LayoutAssume()
+        source = "x = tensor.contiguous()\n"
+        self.assertEqual(op.find_sites(source), [])
 
 
 class TestBroadcastUnsafe(unittest.TestCase):
