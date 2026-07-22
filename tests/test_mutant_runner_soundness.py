@@ -155,7 +155,9 @@ class ModelNew(nn.Module):
     assert result.status is MutantStatus.KILLED
 
 
-def test_state_schema_mismatch_is_inconclusive() -> None:
+def test_renamed_state_schema_is_aligned_and_survives() -> None:
+    # An unambiguous rename (``linear`` -> ``renamed``) is aligned by the
+    # name-normalizing state sync and validated normally.
     candidate = """
 import torch
 from torch import nn
@@ -167,6 +169,29 @@ class ModelNew(nn.Module):
 
     def forward(self, value):
         return self.renamed(value)
+"""
+
+    result = _run(_ReferenceLinear, candidate)
+
+    assert result.status is MutantStatus.SURVIVED
+
+
+def test_ambiguous_state_schema_is_inconclusive() -> None:
+    # Two same-shape buffers with unrelated names cannot be aligned without
+    # guessing; the sync must refuse and the mutant stays UNKNOWN.
+    candidate = """
+import torch
+from torch import nn
+
+class ModelNew(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = nn.Linear(3, 2)
+        self.register_buffer("mystery_one", torch.zeros(4))
+        self.register_buffer("mystery_two", torch.ones(4))
+
+    def forward(self, value):
+        return self.linear(value)
 """
 
     result = _run(_ReferenceLinear, candidate)

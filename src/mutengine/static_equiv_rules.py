@@ -1,19 +1,36 @@
-"""Layer 1 — 算子静态等价规则。
+"""Layer 1 — 算子静态等价规则（版本化，蓝图 Table 10 的 machine-proven 口径）。
 
-三条基于 CUDA 语义的 pattern-matching 规则，可在不执行 kernel
+四条基于 CUDA/Python 语义的 pattern-matching 规则，可在不执行 kernel
 的情况下判定 STRICT_EQUIVALENT：
 
   1. boundary_unreachable: threadIdx 与 blockDim 的隐含上界关系
   2. dead_write: 变异目标是一个被覆写前从未读取的变量
   3. mask_noreach: mask 边界收紧后只影响 padding 线程
+  4. dead_host_constant: 仅被 get_inputs() 使用的宿主常量在固定形状测试下是死代码
+
+蓝图口径（§5.5 Table 10）：machine-proven equivalent 仅保留给两类机器可检
+论证——byte-identical（未归一化源码逐字节相等）或命中下述四条 *版本化*
+静态规则之一；任何更弱的证据至多 LIKELY_EQUIVALENT。每条规则携带独立
+版本号，`STATIC_EQUIV_RULES_VERSION` 是全体规则源码的内容哈希，任何规则
+实现变化都会强制联动版本升级（与 fingerprint_version 同一策略）。
 """
 
 from __future__ import annotations
 
+import hashlib
+import inspect
 import re
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from ..models import Mutant
+
+# Per-rule semantic versions; bump on any behavioural change to that rule.
+RULE_VERSIONS: Dict[str, str] = {
+    "boundary_unreachable": "1.0",
+    "dead_write": "1.0",
+    "mask_noreach": "1.0",
+    "dead_host_constant": "1.0",
+}
 
 # ── Rule 1: boundary_unreachable ──────────────────────────────────────────
 #
@@ -221,6 +238,37 @@ _RULES = [
     ("dead_host_constant", _dead_host_constant),
 ]
 
+assert {name for name, _ in _RULES} == set(RULE_VERSIONS), (
+    "every static rule must carry a version entry"
+)
+
+
+def rules_content_version() -> str:
+    """Content hash over the exact source of every rule (release binding).
+
+    Any edit to a rule implementation changes this hash, so a frozen probe
+    manifest that records it can detect silent rule drift.
+    """
+    hasher = hashlib.sha256()
+    for name, fn in _RULES:
+        hasher.update(name.encode("utf-8"))
+        hasher.update(RULE_VERSIONS[name].encode("utf-8"))
+        try:
+            hasher.update(inspect.getsource(fn).encode("utf-8"))
+        except (OSError, TypeError):  # pragma: no cover - frozen envs
+            hasher.update(b"<source unavailable>")
+    return hasher.hexdigest()[:16]
+
+
+STATIC_EQUIV_RULES_VERSION = None  # computed lazily; see _rules_version()
+
+
+def _rules_version() -> str:
+    global STATIC_EQUIV_RULES_VERSION
+    if STATIC_EQUIV_RULES_VERSION is None:
+        STATIC_EQUIV_RULES_VERSION = rules_content_version()
+    return STATIC_EQUIV_RULES_VERSION
+
 
 def check_all_rules(mutant: Mutant) -> Optional[str]:
     """Run all static rules; return the name of the first match, or None."""
@@ -231,3 +279,29 @@ def check_all_rules(mutant: Mutant) -> Optional[str]:
         except Exception:
             continue
     return None
+
+
+def machine_proof(mutant: Mutant) -> Optional[Dict[str, Any]]:
+    """Return the machine-checkable equivalence proof for a probe, if any.
+
+    Exactly the Table 10 vocabulary: ``byte_identical`` (unnormalized source
+    equality) or one of the versioned static rules.  Returns ``None`` when no
+    machine proof applies — the caller must then fall back to dynamic evidence
+    and can grade at most LIKELY_EQUIVALENT.
+    """
+    if mutant.original_code and mutant.original_code == mutant.mutated_code:
+        return {
+            "proof_kind": "byte_identical",
+            "rule": None,
+            "rule_version": None,
+            "rules_version": _rules_version(),
+        }
+    rule = check_all_rules(mutant)
+    if rule is None:
+        return None
+    return {
+        "proof_kind": "static_rule",
+        "rule": rule,
+        "rule_version": RULE_VERSIONS[rule],
+        "rules_version": _rules_version(),
+    }

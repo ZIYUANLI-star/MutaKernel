@@ -43,16 +43,31 @@ class TestStrictStateSync(unittest.TestCase):
         self.assertEqual(candidate.right.item(), 3.0)
 
     def test_sync_never_falls_back_to_same_shape_positional_matching(self):
-        reference = nn.Linear(2, 2)
-        candidate = nn.Sequential(nn.Linear(2, 2))
+        # Unambiguously renamed keys are now aligned (leaf-name match), but a
+        # genuinely ambiguous key set must still refuse positional guessing.
+        class TwoBuffers(nn.Module):
+            def __init__(self, first_name, second_name):
+                super().__init__()
+                self.register_buffer(first_name, torch.zeros(3))
+                self.register_buffer(second_name, torch.ones(3))
 
         with self.assertRaises(StateSyncError):
-            worker._sync_weights(reference, candidate)
+            worker._sync_weights(
+                TwoBuffers("alpha", "beta"), TwoBuffers("gamma", "delta")
+            )
 
     def test_sync_failure_becomes_inconclusive_when_run_as_a_mode(self):
+        class TwoBuffers(nn.Module):
+            def __init__(self, first_name, second_name):
+                super().__init__()
+                self.register_buffer(first_name, torch.zeros(3))
+                self.register_buffer(second_name, torch.ones(3))
+
         @worker._sound_mode_result
         def invalid_setup():
-            worker._sync_weights(nn.Linear(2, 2), nn.Sequential(nn.Linear(2, 2)))
+            worker._sync_weights(
+                TwoBuffers("alpha", "beta"), TwoBuffers("gamma", "delta")
+            )
             return {"ref_ok": True, "original_ok": True, "mutant_ok": True}
 
         result = invalid_setup()
@@ -106,6 +121,52 @@ class TestStrictStateSync(unittest.TestCase):
         self.assertEqual(candidate.left.item(), 2.0)
         self.assertEqual(candidate.right.item(), 3.0)
         self.assertTrue(all(len(call.args) == 3 for call in source_loader.call_args_list))
+
+    def test_paired_construction_replays_identical_rng_entropy(self):
+        """Construction-time randomness outside the state dict must match.
+
+        Strict state sync only covers parameters/buffers; the RNG replay in
+        ``_instantiate_model`` (方法V2_01 §3.1 double insurance) must align
+        entropy drawn into plain attributes as well.
+        """
+
+        class _ConstructionRandom(nn.Module):
+            def __init__(self):
+                super().__init__()
+                # plain attribute: invisible to state_dict / strict sync
+                self.gain = torch.randn(4)
+
+            def forward(self, value):  # pragma: no cover - not exercised
+                return value * self.gain
+
+        reference_module = SimpleNamespace(
+            Model=_ConstructionRandom,
+            get_inputs=lambda: [torch.ones(4)],
+            get_init_inputs=lambda: [],
+        )
+        original_module = SimpleNamespace(ModelNew=_ConstructionRandom)
+        candidate_module = SimpleNamespace(ModelNew=_ConstructionRandom)
+        cfg = {
+            "kernel_code": "original source",
+            "mutated_code": "candidate source",
+            "problem_file": "reference.py",
+        }
+
+        with mock.patch(
+            "src.bridge.eval_bridge._load_module_from_path",
+            return_value=reference_module,
+        ), mock.patch(
+            "src.mutengine.mutant_runner._load_module_from_source",
+            side_effect=[original_module, candidate_module],
+        ):
+            reference, original, candidate, _, _, _ = worker._build_models(
+                cfg, "cpu_test", "cpu",
+            )
+
+        self.assertTrue(torch.equal(reference.gain, original.gain))
+        self.assertTrue(torch.equal(reference.gain, candidate.gain))
+        # and a fresh unpaired construction would NOT match by chance
+        self.assertFalse(torch.equal(reference.gain, _ConstructionRandom().gain))
 
     def test_run_stress_loader_calls_have_exactly_three_positional_args(self):
         tree = ast.parse(inspect.getsource(inspect.unwrap(worker.run_stress)))

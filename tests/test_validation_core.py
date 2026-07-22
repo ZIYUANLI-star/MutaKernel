@@ -51,11 +51,44 @@ class TestStateAndRNG(unittest.TestCase):
         self.assertEqual(candidate.first.item(), 2.0)
         self.assertEqual(candidate.second.item(), 3.0)
 
-    def test_state_sync_rejects_key_mismatch(self):
+    def test_state_sync_remaps_unambiguous_key_names(self):
+        # Candidate registers the same parameters under different names
+        # (`0.weight` vs `weight`); leaf-name alignment must sync them.
         reference = nn.Linear(2, 2)
         candidate = nn.Sequential(nn.Linear(2, 2))
-        with self.assertRaisesRegex(StateSyncError, "keys differ"):
-            strict_sync_state_dict(reference, candidate)
+
+        report = strict_sync_state_dict(reference, candidate)
+
+        self.assertEqual(report.keys_synced, 2)
+        self.assertEqual(report.remapped_keys, 2)
+        self.assertTrue(torch.equal(candidate[0].weight, reference.weight))
+        self.assertTrue(torch.equal(candidate[0].bias, reference.bias))
+
+    def test_state_sync_rejects_ambiguous_key_mismatch(self):
+        class TwoBuffers(nn.Module):
+            def __init__(self, first_name, second_name):
+                super().__init__()
+                self.register_buffer(first_name, torch.zeros(3))
+                self.register_buffer(second_name, torch.ones(3))
+
+        # No shared keys, no shared leaf names, and both entries share the
+        # same structural signature: any pairing would be a guess.
+        with self.assertRaisesRegex(StateSyncError, "cannot be aligned unambiguously"):
+            strict_sync_state_dict(
+                TwoBuffers("alpha", "beta"),
+                TwoBuffers("gamma", "delta"),
+            )
+
+    def test_state_sync_rejects_non_bijective_state(self):
+        class WithExtra(nn.Module):
+            def __init__(self, extra: bool):
+                super().__init__()
+                self.register_buffer("scale", torch.ones(4))
+                if extra:
+                    self.register_buffer("shift", torch.zeros(2))
+
+        with self.assertRaisesRegex(StateSyncError, "cannot be aligned unambiguously"):
+            strict_sync_state_dict(WithExtra(True), WithExtra(False))
 
     def test_rng_snapshot_replays_python_numpy_and_torch(self):
         caller_state = RNGSnapshot.capture(include_cuda=False)
@@ -334,14 +367,33 @@ class TestValidationExecutor(unittest.TestCase):
         self.assertTrue(torch.equal(candidate.weight, candidate_before))
         self.assertTrue(torch.equal(reference.weight, torch.full_like(reference.weight, 2.0)))
 
-    def test_state_mismatch_is_inconclusive(self):
+    def test_renamed_state_is_synchronized_and_passes(self):
+        # Previously INCONCLUSIVE on the key-name difference alone; the
+        # name-normalizing alignment now syncs and validates normally.
         result = validate_pair(
             nn.Linear(2, 2),
             nn.Sequential(nn.Linear(2, 2)),
             args=(torch.ones(1, 2),),
         )
+        self.assertEqual(result.status, ValidationStatus.PASS)
+
+    def test_ambiguous_state_mismatch_is_inconclusive(self):
+        class TwoBuffers(nn.Module):
+            def __init__(self, first_name, second_name):
+                super().__init__()
+                self.register_buffer(first_name, torch.zeros(3))
+                self.register_buffer(second_name, torch.ones(3))
+
+            def forward(self, x):
+                return x
+
+        result = validate_pair(
+            TwoBuffers("alpha", "beta"),
+            TwoBuffers("gamma", "delta"),
+            args=(torch.ones(1, 2),),
+        )
         self.assertEqual(result.status, ValidationStatus.INCONCLUSIVE)
-        self.assertIn("state_dict keys differ", result.reason)
+        self.assertIn("cannot be aligned unambiguously", result.reason)
         self.assertEqual(result.reference_invocations, 0)
         self.assertEqual(result.candidate_invocations, 0)
 

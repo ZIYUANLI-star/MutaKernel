@@ -234,7 +234,8 @@ def test_candidate_system_exit_during_import_is_an_attributed_failure(tmp_path: 
     assert result["errors"][0]["exception_type"] == "SystemExit"
 
 
-def test_candidate_state_schema_guessing_is_refused(tmp_path: Path) -> None:
+def test_candidate_renamed_state_schema_is_aligned(tmp_path: Path) -> None:
+    # Unambiguous renames are aligned by the name-normalizing state sync.
     worker = _load_worker()
     reference = _write(tmp_path / "reference.py", LINEAR_REFERENCE)
     candidate = _write(
@@ -244,8 +245,27 @@ def test_candidate_state_schema_guessing_is_refused(tmp_path: Path) -> None:
 
     result = worker.execute(_config(reference, candidate))
 
+    assert result["validation_status"] == "pass"
+
+
+def test_candidate_ambiguous_state_schema_is_refused(tmp_path: Path) -> None:
+    # Extra unalignable state must never be guessed into a pairing.
+    worker = _load_worker()
+    reference = _write(tmp_path / "reference.py", LINEAR_REFERENCE)
+    candidate = _write(
+        tmp_path / "candidate.py",
+        LINEAR_CANDIDATE.replace(
+            "self.linear = nn.Linear(3, 2)",
+            "self.linear = nn.Linear(3, 2)\n"
+            "        self.register_buffer('mystery_one', torch.zeros(4))\n"
+            "        self.register_buffer('mystery_two', torch.ones(4))",
+        ),
+    )
+
+    result = worker.execute(_config(reference, candidate))
+
     assert result["validation_status"] == "inconclusive"
-    assert "state_dict keys differ" in result["errors"][0]["message"]
+    assert "cannot be aligned unambiguously" in result["errors"][0]["message"]
 
 
 def test_batch_resize_requires_explicit_argument_contract(tmp_path: Path) -> None:

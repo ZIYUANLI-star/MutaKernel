@@ -25,6 +25,10 @@ class StateSyncError(RuntimeError):
 class StateSyncReport:
     keys_synced: int
     tensor_values_synced: int
+    remapped_keys: int = 0
+    # reference_key -> candidate_key pairs used for the synchronization;
+    # ``None`` when both sides were stateless.
+    key_map: Optional[Tuple[Tuple[str, str], ...]] = None
 
 
 @dataclass
@@ -198,8 +202,118 @@ def restore_state_dict(module: Any, snapshot: Optional[Mapping[str, Any]]) -> No
         )
 
 
+def _state_signature(value: Any) -> Tuple[Any, ...]:
+    """Structural signature used for unambiguous key alignment."""
+
+    if isinstance(value, torch.Tensor):
+        return ("tensor", tuple(value.shape), str(value.dtype), str(value.layout))
+    return ("other", type(value).__name__)
+
+
+def align_state_keys(
+    reference_state: Mapping[str, Any],
+    candidate_state: Mapping[str, Any],
+) -> "OrderedDict[str, str]":
+    """Align reference state keys to candidate state keys by name and structure.
+
+    Returns an ordered mapping ``reference_key -> candidate_key``.  Alignment
+    is accepted only when it is unambiguous:
+
+    1. keys present verbatim on both sides map to themselves;
+    2. remaining keys are matched by their final dotted component (e.g.
+       ``bn.running_mean`` <-> ``running_mean``) when the pairing is unique in
+       both directions and the values are structurally compatible;
+    3. remaining keys are matched by structural signature (kind, shape,
+       dtype, layout) when the signature occurs exactly once on each side.
+
+    Any leftover key on either side, and any ambiguous pairing, raises
+    :class:`StateSyncError` — a wrong synchronization would silently corrupt
+    the differential comparison, so refusal (INCONCLUSIVE upstream) is the
+    only sound fallback.
+    """
+
+    reference_keys = list(reference_state.keys())
+    candidate_keys = list(candidate_state.keys())
+    if set(reference_keys) == set(candidate_keys):
+        return OrderedDict((key, key) for key in reference_keys)
+
+    mapping: "OrderedDict[str, str]" = OrderedDict()
+    shared = set(reference_keys) & set(candidate_keys)
+    for key in reference_keys:
+        if key in shared:
+            mapping[key] = key
+    pending_reference = [key for key in reference_keys if key not in shared]
+    pending_candidate = [key for key in candidate_keys if key not in shared]
+
+    def _leaf(key: str) -> str:
+        return key.rsplit(".", 1)[-1]
+
+    # Stage 2: unique final-component (leaf name) pairing.
+    reference_by_leaf: dict = {}
+    for key in pending_reference:
+        reference_by_leaf.setdefault(_leaf(key), []).append(key)
+    candidate_by_leaf: dict = {}
+    for key in pending_candidate:
+        candidate_by_leaf.setdefault(_leaf(key), []).append(key)
+    matched_reference = set()
+    matched_candidate = set()
+    for leaf, reference_group in reference_by_leaf.items():
+        candidate_group = candidate_by_leaf.get(leaf, [])
+        if len(reference_group) == 1 and len(candidate_group) == 1:
+            ref_key, cand_key = reference_group[0], candidate_group[0]
+            if _state_signature(reference_state[ref_key]) != _state_signature(
+                candidate_state[cand_key]
+            ):
+                raise StateSyncError(
+                    f"state keys {ref_key!r} and {cand_key!r} share the leaf name "
+                    f"{leaf!r} but are structurally incompatible: "
+                    f"reference={_state_signature(reference_state[ref_key])}, "
+                    f"candidate={_state_signature(candidate_state[cand_key])}"
+                )
+            mapping[ref_key] = cand_key
+            matched_reference.add(ref_key)
+            matched_candidate.add(cand_key)
+    pending_reference = [k for k in pending_reference if k not in matched_reference]
+    pending_candidate = [k for k in pending_candidate if k not in matched_candidate]
+
+    # Stage 3: unique structural-signature pairing.
+    reference_by_signature: dict = {}
+    for key in pending_reference:
+        reference_by_signature.setdefault(_state_signature(reference_state[key]), []).append(key)
+    candidate_by_signature: dict = {}
+    for key in pending_candidate:
+        candidate_by_signature.setdefault(_state_signature(candidate_state[key]), []).append(key)
+    for signature, reference_group in reference_by_signature.items():
+        candidate_group = candidate_by_signature.get(signature, [])
+        if len(reference_group) == 1 and len(candidate_group) == 1:
+            mapping[reference_group[0]] = candidate_group[0]
+            matched_reference.add(reference_group[0])
+            matched_candidate.add(candidate_group[0])
+    pending_reference = [k for k in pending_reference if k not in matched_reference]
+    pending_candidate = [k for k in pending_candidate if k not in matched_candidate]
+
+    if pending_reference or pending_candidate:
+        raise StateSyncError(
+            "state_dict keys differ and cannot be aligned unambiguously by "
+            "name normalization (leaf-name and structural matching): "
+            f"unmatched_reference={sorted(pending_reference)}, "
+            f"unmatched_candidate={sorted(pending_candidate)}"
+        )
+
+    # Preserve reference state-dict order for deterministic reporting.
+    ordered = OrderedDict()
+    for key in reference_keys:
+        ordered[key] = mapping[key]
+    return ordered
+
+
 def strict_sync_state_dict(reference: Any, candidate: Any) -> StateSyncReport:
     """Copy state by exact key, never by registration or iteration order.
+
+    When the two state dicts use different (but unambiguously alignable)
+    parameter names — e.g. a candidate kernel registering ``weight`` where
+    the reference registers ``gemm.weight`` — the keys are first aligned by
+    :func:`align_state_keys`; ambiguous alignments still fail explicitly.
 
     Stateless callables are supported when *both* sides are stateless.  If only
     one side exposes the PyTorch state-dict API, the comparison is unsound and
@@ -218,30 +332,29 @@ def strict_sync_state_dict(reference: Any, candidate: Any) -> StateSyncReport:
 
     reference_state = reference.state_dict()
     candidate_state = candidate.state_dict()
-    reference_keys = set(reference_state.keys())
-    candidate_keys = set(candidate_state.keys())
-    if reference_keys != candidate_keys:
-        missing = sorted(reference_keys - candidate_keys)
-        unexpected = sorted(candidate_keys - reference_keys)
-        raise StateSyncError(
-            "state_dict keys differ; refusing positional synchronization: "
-            f"missing_in_candidate={missing}, unexpected_in_candidate={unexpected}"
-        )
+    key_map = align_state_keys(reference_state, candidate_state)
+    remapped = sum(1 for ref_key, cand_key in key_map.items() if ref_key != cand_key)
 
     tensor_count = 0
-    for key in reference_state.keys():
+    for ref_key, cand_key in key_map.items():
+        label = ref_key if ref_key == cand_key else f"{ref_key} -> {cand_key}"
         tensor_count += int(
             _check_state_value_compatibility(
-                key,
-                reference_state[key],
-                candidate_state[key],
+                label,
+                reference_state[ref_key],
+                candidate_state[cand_key],
             )
         )
 
     source = snapshot_state_dict(reference)
     assert source is not None
+    remapped_source = OrderedDict(
+        (key_map[ref_key], source[ref_key]) for ref_key in key_map
+    )
+    if hasattr(source, "_metadata") and remapped == 0:
+        remapped_source._metadata = source._metadata  # type: ignore[attr-defined]
     try:
-        load_result = candidate.load_state_dict(source, strict=True)
+        load_result = candidate.load_state_dict(remapped_source, strict=True)
     except Exception as exc:
         raise StateSyncError(f"strict state_dict load failed: {exc}") from exc
     missing = tuple(getattr(load_result, "missing_keys", ()))
@@ -252,12 +365,15 @@ def strict_sync_state_dict(reference: Any, candidate: Any) -> StateSyncReport:
         )
 
     synchronized = candidate.state_dict()
-    if set(synchronized.keys()) != reference_keys:
+    if set(synchronized.keys()) != set(candidate_state.keys()):
         raise StateSyncError("candidate state_dict keys changed during synchronization")
-    for key in reference_state.keys():
-        _assert_state_values_equal(key, reference_state[key], synchronized[key])
+    for ref_key, cand_key in key_map.items():
+        label = ref_key if ref_key == cand_key else f"{ref_key} -> {cand_key}"
+        _assert_state_values_equal(label, reference_state[ref_key], synchronized[cand_key])
 
     return StateSyncReport(
-        keys_synced=len(reference_state),
+        keys_synced=len(key_map),
         tensor_values_synced=tensor_count,
+        remapped_keys=remapped,
+        key_map=tuple(key_map.items()),
     )

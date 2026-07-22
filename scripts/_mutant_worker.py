@@ -72,11 +72,22 @@ def _run_mode(cfg):
 
     runner.run_mutant(kernel, mutant, ref_mod, get_inputs, get_init_inputs)
 
+    trial_reasons = [
+        {
+            "trial": trial.get("trial"),
+            "status": trial.get("status"),
+            "reason": (trial.get("reason") or "")[:300],
+        }
+        for trial in (mutant.equiv_detail or {})
+        .get("phase1_validation", {})
+        .get("trials", [])
+    ]
     return {
         "status": mutant.status.value,
         "time_ms": mutant.execution_time_ms,
         "error": mutant.error_message or "",
         "kill_seed": mutant.kill_input_seed,
+        "trials": trial_reasons,
     }
 
 
@@ -433,6 +444,11 @@ def _equiv_mode(cfg):
                         ),
                         "errors": [errors[-1]],
                     })
+                    if "out of memory" in str(exc).lower():
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                     continue
 
                 if first_input_summary is None:
@@ -539,11 +555,26 @@ def _equiv_mode(cfg):
         caller_rng.restore()
 
 
+def _apply_gpu_memory_budget():
+    """Per-process VRAM cap so concurrent workers fail with a classified OOM
+    instead of silently starving each other (MK_GPU_MEMORY_FRACTION env)."""
+    fraction = float(os.environ.get("MK_GPU_MEMORY_FRACTION", "0") or 0)
+    if fraction <= 0:
+        return
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(fraction, 0)
+    except Exception:
+        pass
+
+
 def main():
     cfg_path, res_path = sys.argv[1], sys.argv[2]
     with open(cfg_path) as f:
         cfg = json.load(f)
 
+    _apply_gpu_memory_budget()
     t0 = time.time()
     mode = cfg.get("mode", "run")
 

@@ -50,6 +50,11 @@ class OracleConfig:
     require_stride: bool = False
     require_aliasing: bool = False
     max_mismatches: int = 20
+    # Large tensors are compared in chunks of at most this many elements so
+    # the oracle's temporaries stay bounded instead of scaling with the
+    # output size (VRAM amplification caused OOM-INCONCLUSIVE on big
+    # subjects; see the E0 pilot diagnosis).
+    compare_chunk_numel: int = 1 << 24
 
     def tolerance_for(self, dtype: torch.dtype) -> Tolerance:
         return self.dtype_tolerances.get(dtype, self.default_tolerance)
@@ -106,53 +111,122 @@ class _Comparison:
             self.inconclusive = True
 
 
+def _paired_chunks(
+    reference: torch.Tensor,
+    candidate: torch.Tensor,
+    chunk_numel: int,
+):
+    """Yield aligned element-wise views of at most ``chunk_numel`` elements.
+
+    Slicing along the leading dimensions produces views (no data copies) for
+    strided tensors of any contiguity, so the peak extra memory of the oracle
+    is bounded by the per-chunk temporaries instead of the full tensor size.
+    """
+
+    if reference.numel() <= chunk_numel or reference.dim() == 0:
+        yield reference, candidate
+        return
+    if reference.shape[0] == 1:
+        yield from _paired_chunks(reference[0], candidate[0], chunk_numel)
+        return
+    row_numel = reference.numel() // reference.shape[0]
+    rows_per_chunk = max(1, chunk_numel // max(1, row_numel))
+    for start in range(0, reference.shape[0], rows_per_chunk):
+        reference_slice = reference[start : start + rows_per_chunk]
+        candidate_slice = candidate[start : start + rows_per_chunk]
+        if reference_slice.numel() > chunk_numel and rows_per_chunk == 1:
+            yield from _paired_chunks(reference_slice[0], candidate_slice[0], chunk_numel)
+        else:
+            yield reference_slice, candidate_slice
+
+
 def _nonfinite_and_close(
     reference: torch.Tensor,
     candidate: torch.Tensor,
     tolerance: Tolerance,
     equal_nan: bool,
+    chunk_numel: int = 1 << 24,
 ) -> Tuple[bool, str]:
-    """Compare one real floating tensor with explicit NaN/Inf handling."""
+    """Compare one real floating tensor with explicit NaN/Inf handling.
 
-    reference_nan = torch.isnan(reference)
-    candidate_nan = torch.isnan(candidate)
-    if not torch.equal(reference_nan, candidate_nan):
-        count = int(torch.count_nonzero(reference_nan != candidate_nan).item())
-        return False, f"NaN positions differ at {count} element(s)"
-    if torch.any(reference_nan) and not equal_nan:
+    The comparison streams over bounded chunks; verdict priority (NaN
+    positions > equal_nan violation > Inf positions > Inf signs > value
+    tolerance) and reported counts match the whole-tensor semantics.
+    """
+
+    nan_position_diff = 0
+    saw_reference_nan = False
+    inf_position_diff = 0
+    inf_sign_diff = False
+    exceed_count = 0
+    max_error = 0.0
+
+    for reference_chunk, candidate_chunk in _paired_chunks(
+        reference, candidate, max(1, chunk_numel)
+    ):
+        reference_nan = torch.isnan(reference_chunk)
+        candidate_nan = torch.isnan(candidate_chunk)
+        nan_position_diff += int(
+            torch.count_nonzero(reference_nan != candidate_nan).item()
+        )
+        chunk_has_nan = bool(torch.any(reference_nan).item())
+        saw_reference_nan = saw_reference_nan or chunk_has_nan
+
+        reference_inf = torch.isinf(reference_chunk)
+        candidate_inf = torch.isinf(candidate_chunk)
+        inf_position_diff += int(
+            torch.count_nonzero(reference_inf != candidate_inf).item()
+        )
+
+        if nan_position_diff or inf_position_diff:
+            # Position mismatch already decides the verdict; keep counting
+            # positions across the remaining chunks but skip value work.
+            continue
+
+        chunk_has_inf = bool(torch.any(reference_inf).item())
+        if chunk_has_inf and not torch.equal(
+            reference_chunk[reference_inf], candidate_chunk[candidate_inf]
+        ):
+            inf_sign_diff = True
+            continue
+
+        if chunk_has_nan or chunk_has_inf:
+            finite = ~(reference_nan | reference_inf)
+            if not bool(torch.any(finite).item()):
+                continue
+            reference_values = reference_chunk[finite]
+            candidate_values = candidate_chunk[finite]
+        else:
+            reference_values = reference_chunk
+            candidate_values = candidate_chunk
+
+        close = torch.isclose(
+            reference_values,
+            candidate_values,
+            rtol=tolerance.rtol,
+            atol=tolerance.atol,
+            equal_nan=False,
+        )
+        if not bool(torch.all(close).item()):
+            exceed_count += int(torch.count_nonzero(~close).item())
+            absolute_error = torch.abs(reference_values - candidate_values)
+            max_error = max(max_error, float(torch.max(absolute_error).item()))
+
+    if nan_position_diff:
+        return False, f"NaN positions differ at {nan_position_diff} element(s)"
+    if saw_reference_nan and not equal_nan:
         return False, "NaN values are present while equal_nan=False"
-
-    reference_inf = torch.isinf(reference)
-    candidate_inf = torch.isinf(candidate)
-    if not torch.equal(reference_inf, candidate_inf):
-        count = int(torch.count_nonzero(reference_inf != candidate_inf).item())
-        return False, f"Inf positions differ at {count} element(s)"
-    if torch.any(reference_inf):
-        if not torch.equal(reference[reference_inf], candidate[candidate_inf]):
-            return False, "Inf signs differ"
-
-    finite = ~(reference_nan | reference_inf)
-    if not torch.any(finite):
-        return True, ""
-    reference_finite = reference[finite]
-    candidate_finite = candidate[finite]
-    close = torch.isclose(
-        reference_finite,
-        candidate_finite,
-        rtol=tolerance.rtol,
-        atol=tolerance.atol,
-        equal_nan=False,
-    )
-    if bool(torch.all(close).item()):
-        return True, ""
-    count = int(torch.count_nonzero(~close).item())
-    absolute_error = torch.abs(reference_finite - candidate_finite)
-    max_error = float(torch.max(absolute_error).item())
-    return (
-        False,
-        f"{count} value(s) exceed rtol={tolerance.rtol:g}, "
-        f"atol={tolerance.atol:g}; max_abs_error={max_error:g}",
-    )
+    if inf_position_diff:
+        return False, f"Inf positions differ at {inf_position_diff} element(s)"
+    if inf_sign_diff:
+        return False, "Inf signs differ"
+    if exceed_count:
+        return (
+            False,
+            f"{exceed_count} value(s) exceed rtol={tolerance.rtol:g}, "
+            f"atol={tolerance.atol:g}; max_abs_error={max_error:g}",
+        )
+    return True, ""
 
 
 def _compare_tensors(
@@ -220,12 +294,14 @@ def _compare_tensors(
             candidate.real,
             tolerance,
             config.equal_nan,
+            chunk_numel=config.compare_chunk_numel,
         )
         imag_ok, imag_message = _nonfinite_and_close(
             reference.imag,
             candidate.imag,
             tolerance,
             config.equal_nan,
+            chunk_numel=config.compare_chunk_numel,
         )
         if not real_ok or not imag_ok:
             message = "; ".join(
@@ -244,6 +320,7 @@ def _compare_tensors(
         candidate,
         tolerance,
         config.equal_nan,
+        chunk_numel=config.compare_chunk_numel,
     )
     if not matches:
         state.record(path, "value", message, reference, candidate)

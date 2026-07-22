@@ -382,6 +382,11 @@ class MutantRunner:
                             f"{type(exc).__name__}: {str(exc)[:300]}"
                         ),
                     })
+                    if "out of memory" in str(exc).lower():
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
                     continue
 
                 with torch.no_grad():
@@ -411,7 +416,22 @@ class MutantRunner:
                         "One or more trials were inconclusive; no sound kill was observed"
                     )
         finally:
-            caller_rng.restore()
+            # A candidate that corrupts the CUDA context (e.g. an illegal
+            # memory access) poisons every later CUDA call, including this
+            # RNG restore.  The verdict is already decided at this point and
+            # the worker process exits right after, so a cleanup failure must
+            # be recorded — never allowed to overwrite a sound verdict.
+            try:
+                caller_rng.restore()
+            except BaseException as exc:  # noqa: BLE001 - poisoned CUDA context
+                validation_trials.append({
+                    "phase": "caller_rng_restore",
+                    "status": ValidationStatus.INCONCLUSIVE.value,
+                    "reason": (
+                        "caller RNG restore failed after the verdict was "
+                        f"decided: {type(exc).__name__}: {str(exc)[:200]}"
+                    ),
+                })
 
         mutant.equiv_detail["phase1_validation"] = {
             "schema_version": 1,

@@ -277,6 +277,33 @@ def _sync_weights(src_model, dst_model):
     return strict_sync_state_dict(src_model, dst_model)
 
 
+def _capture_init_rng():
+    """Snapshot RNG state before the reference model is constructed."""
+    from src.validation import RNGSnapshot
+
+    return RNGSnapshot.capture()
+
+
+def _instantiate_model(cls, init_args, snapshot=None):
+    """Construct a model, optionally replaying the pre-reference RNG state.
+
+    Replaying the snapshot makes paired constructions draw identical
+    initialization entropy (方法V2_01 §3.1 double insurance).  Strict named
+    state synchronization remains the second layer and still overwrites
+    parameters afterwards; the replay additionally covers construction-time
+    randomness that never reaches the state dict.
+    """
+    from src.validation import replay_rng
+
+    def _make():
+        return cls(*init_args) if isinstance(init_args, (list, tuple)) else cls()
+
+    if snapshot is None:
+        return _make()
+    with replay_rng(snapshot):
+        return _make()
+
+
 @_sound_mode_result
 def run_stress(cfg):
     import torch
@@ -319,8 +346,8 @@ def run_stress(cfg):
 
     init_args = get_init_inputs()
     ref_cls = ref_mod.Model
-    ref_model = (ref_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else ref_cls())
+    init_rng = _capture_init_rng()
+    ref_model = _instantiate_model(ref_cls, init_args)
     ref_model = ref_model.to(device).eval()
     with torch.no_grad():
         try:
@@ -344,8 +371,7 @@ def run_stress(cfg):
                 "time_ms": (time.time() - t0) * 1000}
 
     orig_cls = getattr(orig_mod, "ModelNew", None) or getattr(orig_mod, "Model")
-    orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
-                  else orig_cls())
+    orig_model = _instantiate_model(orig_cls, init_args, init_rng)
     orig_model = orig_model.to(device).eval()
     _sync_weights(ref_model, orig_model)
 
@@ -383,8 +409,7 @@ def run_stress(cfg):
                     "time_ms": (time.time() - t0) * 1000}
 
         mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                      else mut_cls())
+        mut_model = _instantiate_model(mut_cls, init_args, init_rng)
         mut_model = mut_model.to(device).eval()
         _sync_weights(ref_model, mut_model)
 
@@ -441,8 +466,8 @@ def _build_models(cfg, seed_suffix, device):
     get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
     init_args = get_init_inputs()
     ref_cls = ref_mod.Model
-    ref_model = (ref_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else ref_cls())
+    init_rng = _capture_init_rng()
+    ref_model = _instantiate_model(ref_cls, init_args)
     ref_model = ref_model.to(device).eval()
 
     tmp_dir = tempfile.mkdtemp(prefix="stress_")
@@ -450,8 +475,7 @@ def _build_models(cfg, seed_suffix, device):
     orig_mod = _load_module_from_source(
         cfg["kernel_code"], f"ext_orig_{orig_hash}", tmp_dir)
     orig_cls = getattr(orig_mod, "ModelNew", None) or getattr(orig_mod, "Model")
-    orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
-                  else orig_cls())
+    orig_model = _instantiate_model(orig_cls, init_args, init_rng)
     orig_model = orig_model.to(device).eval()
     _sync_weights(ref_model, orig_model)
 
@@ -461,8 +485,7 @@ def _build_models(cfg, seed_suffix, device):
         mut_mod = _load_module_from_source(
             cfg["mutated_code"], f"ext_mut_{mut_hash}", tmp_dir)
         mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                     else mut_cls())
+        mut_model = _instantiate_model(mut_cls, init_args, init_rng)
         mut_model = mut_model.to(device).eval()
         _sync_weights(ref_model, mut_model)
 
@@ -521,8 +544,8 @@ def run_training_stress(cfg):
     init_args = get_init_inputs()
 
     ref_cls = ref_mod.Model
-    ref_model = (ref_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else ref_cls())
+    init_rng = _capture_init_rng()
+    ref_model = _instantiate_model(ref_cls, init_args)
     ref_model = ref_model.to(device).train()
     with torch.no_grad():
         try:
@@ -545,8 +568,7 @@ def run_training_stress(cfg):
                 "time_ms": (time.time() - t0) * 1000}
 
     orig_cls = getattr(orig_mod, "ModelNew", None) or getattr(orig_mod, "Model")
-    orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
-                  else orig_cls())
+    orig_model = _instantiate_model(orig_cls, init_args, init_rng)
     orig_model = orig_model.to(device).train()
     _sync_weights(ref_model, orig_model)
 
@@ -581,8 +603,7 @@ def run_training_stress(cfg):
                     "time_ms": (time.time() - t0) * 1000}
 
         mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                     else mut_cls())
+        mut_model = _instantiate_model(mut_cls, init_args, init_rng)
         mut_model = mut_model.to(device).train()
         _sync_weights(ref_model, mut_model)
 
@@ -921,8 +942,8 @@ def run_llm_verify(cfg):
     get_init_inputs = getattr(ref_mod, "get_init_inputs", lambda: [])
     init_args = get_init_inputs()
     ref_cls = ref_mod.Model
-    ref_model = (ref_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else ref_cls())
+    init_rng = _capture_init_rng()
+    ref_model = _instantiate_model(ref_cls, init_args)
     ref_model = ref_model.to(device).eval()
 
     try:
@@ -960,8 +981,7 @@ def run_llm_verify(cfg):
                 "time_ms": (time.time() - t0) * 1000}
 
     orig_cls = getattr(orig_mod, "ModelNew", None) or getattr(orig_mod, "Model")
-    orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
-                  else orig_cls())
+    orig_model = _instantiate_model(orig_cls, init_args, init_rng)
     orig_model = orig_model.to(device).eval()
     _sync_weights(ref_model, orig_model)
 
@@ -1001,8 +1021,7 @@ def run_llm_verify(cfg):
                     "time_ms": (time.time() - t0) * 1000}
 
         mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                     else mut_cls())
+        mut_model = _instantiate_model(mut_cls, init_args, init_rng)
         mut_model = mut_model.to(device).eval()
         _sync_weights(ref_model, mut_model)
 
@@ -1129,8 +1148,8 @@ def run_config_stress(cfg):
     init_args = get_init_inputs()
 
     ref_cls = ref_mod.Model
-    ref_model = (ref_cls(*init_args) if isinstance(init_args, (list, tuple))
-                 else ref_cls())
+    init_rng = _capture_init_rng()
+    ref_model = _instantiate_model(ref_cls, init_args)
     ref_model = ref_model.to(device).eval()
 
     tmp_dir = tempfile.mkdtemp(prefix="cfg_stress_")
@@ -1142,8 +1161,7 @@ def run_config_stress(cfg):
         return {"killed": False, "error": f"orig compile: {str(e)[:200]}",
                 "time_ms": (time.time() - t0) * 1000}
     orig_cls = getattr(orig_mod, "ModelNew", None) or getattr(orig_mod, "Model")
-    orig_model = (orig_cls(*init_args) if isinstance(init_args, (list, tuple))
-                  else orig_cls())
+    orig_model = _instantiate_model(orig_cls, init_args, init_rng)
     orig_model = orig_model.to(device).eval()
     _sync_weights(ref_model, orig_model)
 
@@ -1157,8 +1175,7 @@ def run_config_stress(cfg):
             return {"killed": False, "error": f"mut compile: {str(e)[:200]}",
                     "time_ms": (time.time() - t0) * 1000}
         mut_cls = getattr(mut_mod, "ModelNew", None) or getattr(mut_mod, "Model")
-        mut_model = (mut_cls(*init_args) if isinstance(init_args, (list, tuple))
-                     else mut_cls())
+        mut_model = _instantiate_model(mut_cls, init_args, init_rng)
         mut_model = mut_model.to(device).eval()
         _sync_weights(ref_model, mut_model)
 
