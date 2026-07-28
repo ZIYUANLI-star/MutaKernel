@@ -27,17 +27,40 @@ Output: JSONL (one ``{"task_id", "contract", "contract_sha256",
 the flagged clauses and re-freezes — amendments are version-controlled by
 contract_id suffix.
 
+C2-C5 extension (E3 readiness, DRAFTS — not frozen):
+  * C2/C3/C5 reuse KernelBench task definitions.  ``--frames`` reads E2
+    collection-frame JSONLs, collects the included rows' ``KB_L*_P*`` task
+    keys and extracts one draft contract per distinct task via the same
+    KernelBench extractor (only the benchmark's own reference module is
+    loaded/executed; no candidate kernel ever runs).
+  * C4 (TritonBench-G) is a Triton-side interface where the corpus file IS
+    the candidate, so nothing may be executed at all:
+    ``--tritonbench-manifest``/``--tritonbench-dir`` produce *static* drafts
+    (schema ``tritonbench-draft-0.1``) by AST-parsing the test section for
+    literal tensor-constructor shapes/dtypes.  These drafts are explicitly
+    marked non-executable-extraction and require human completion.
+
 Usage (remote, CPU-only):
   CUDA_VISIBLE_DEVICES= python scripts/extract_contracts.py \
       --kernelbench-root KernelBench --levels 1 2 \
       --out /root/mk_v2_runs/e2/contracts_kernelbench_v1.jsonl
+  CUDA_VISIBLE_DEVICES= python scripts/extract_contracts.py \
+      --kernelbench-root KernelBench \
+      --frames C2_collection_frame.jsonl C5_collection_frame.jsonl \
+      --out contracts_c2c5_draft.jsonl
+  python scripts/extract_contracts.py \
+      --tritonbench-manifest external/C4_tritonbench/data/TritonBench_G_v1.json \
+      --tritonbench-dir external/C4_tritonbench/data/TritonBench_G_v1 \
+      --out contracts_c4_draft.jsonl
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -171,18 +194,257 @@ def extract_task_contract(problem_file: Path, task_id: str) -> dict:
     return {"contract": normalized, "extraction": extraction}
 
 
+# ---------------------------------------------------------------------------
+# C2/C3/C5: task keys from E2 collection frames -> KernelBench extraction
+# ---------------------------------------------------------------------------
+
+KB_TASK_RE = re.compile(r"^KB_L(\d)_P(\d+)$")
+
+
+def collect_frame_task_keys(frame_paths, only_included=True):
+    """Distinct KB task keys from collection frames, with source corpora."""
+    tasks = {}
+    for frame_path in frame_paths:
+        with open(frame_path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                row = json.loads(line)
+                if only_included and not row.get("included", True):
+                    continue
+                task_key = row.get("task_key", "")
+                if not KB_TASK_RE.match(task_key):
+                    continue
+                tasks.setdefault(task_key, set()).add(row.get("corpus", "?"))
+    return {key: sorted(corpora) for key, corpora in sorted(tasks.items())}
+
+
+def kb_problem_file(kernelbench_root: Path, task_key: str):
+    match = KB_TASK_RE.match(task_key)
+    level, problem = int(match.group(1)), int(match.group(2))
+    level_dir = kernelbench_root / "KernelBench" / f"level{level}"
+    if not level_dir.is_dir():
+        return None, f"level directory missing: {level_dir}"
+    hits = sorted(level_dir.glob(f"{problem}_*.py"))
+    if not hits:
+        return None, f"no problem file {problem}_*.py under {level_dir}"
+    return hits[0], None
+
+
+# ---------------------------------------------------------------------------
+# C4 (TritonBench-G): static AST drafts — never executes the corpus file,
+# which IS the candidate kernel (data-separation red line).
+# ---------------------------------------------------------------------------
+
+TRITON_DRAFT_SCHEMA = "tritonbench-draft-0.1"
+_TENSOR_CTORS = {"randn", "rand", "zeros", "ones", "empty", "full",
+                 "randint", "rand_tensor", "arange", "tensor"}
+
+
+def _literal(node):
+    try:
+        return ast.literal_eval(node)
+    except (ValueError, SyntaxError):
+        return None
+
+
+def _call_name(node: ast.Call):
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return None
+
+
+def extract_triton_tensor_hints(source: str):
+    """Static tensor-constructor hints (shape/dtype/device literals).
+
+    Prefers the test section (functions named ``test_*``); falls back to the
+    whole module when no test function exists.
+    """
+    tree = ast.parse(source)
+    test_functions = [
+        node for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test")
+    ]
+    scopes = test_functions or [tree]
+    hints = []
+    for scope in scopes:
+        for node in ast.walk(scope):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _call_name(node)
+            if name not in _TENSOR_CTORS:
+                continue
+            shape = []
+            for arg in node.args:
+                value = _literal(arg)
+                if isinstance(value, int):
+                    shape.append(value)
+                elif isinstance(value, (tuple, list)) and all(
+                        isinstance(v, int) for v in value):
+                    shape.extend(int(v) for v in value)
+            keywords = {}
+            for kw in node.keywords:
+                if kw.arg in {"dtype", "device", "mode", "low", "high"}:
+                    if isinstance(kw.value, ast.Attribute):
+                        keywords[kw.arg] = kw.value.attr
+                    else:
+                        value = _literal(kw.value)
+                        if value is not None:
+                            keywords[kw.arg] = value
+            hints.append({"constructor": name, "shape": shape, **keywords})
+    return hints, [fn.name for fn in test_functions]
+
+
+def extract_c4_draft(manifest_path: Path, kernels_dir: Path):
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    rows = []
+    failures = []
+    for record in manifest:
+        file_name = record["file"]
+        task_id = f"TBG_{Path(file_name).stem}"
+        kernel_file = kernels_dir / file_name
+        if not kernel_file.is_file():
+            failures.append({"task_id": task_id, "error": "kernel file missing"})
+            continue
+        source = kernel_file.read_text(encoding="utf-8", errors="replace")
+        try:
+            hints, test_functions = extract_triton_tensor_hints(source)
+        except SyntaxError as exc:
+            failures.append({"task_id": task_id,
+                             "error": f"SyntaxError: {exc}"[:200]})
+            continue
+        rows.append({
+            "task_id": task_id,
+            "draft_schema": TRITON_DRAFT_SCHEMA,
+            "language": "triton",
+            "interface": "tritonbench_g",
+            "entry_file": file_name,
+            "source_sha256": hashlib.sha256(
+                source.encode("utf-8")).hexdigest(),
+            "signature": (record.get("func_inputs") or "")[:2000],
+            "tensor_hints": hints,
+            "test_functions": test_functions,
+            "extraction": {
+                "extracted_at": _now(),
+                "method": "static_ast_no_execution",
+                "note": (
+                    "C4 corpus files ARE the candidates; execution is "
+                    "forbidden before the fault-to-stress map freeze.  "
+                    "Shapes/dtypes are literal constructor hints only; "
+                    "human review must complete value domains, tolerances "
+                    "and the Triton call adapter before freezing."),
+            },
+        })
+    return rows, failures
+
+
+def _write_batch(out: Path, rows, failures, draft: bool):
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w", encoding="utf-8") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, sort_keys=True) + "\n")
+    batch_digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    freeze = {
+        "created_at": _now(),
+        "contracts": len(rows),
+        "failures": failures,
+        "batch_sha256": batch_digest,
+        "draft": draft,
+        "note": ("DRAFT batch - do NOT freeze; pending dual human review"
+                 if draft else
+                 "freeze this digest before observing any V2 validator outcome"),
+    }
+    freeze_path = out.with_suffix(".freeze.json")
+    freeze_path.write_text(json.dumps(freeze, indent=2), encoding="utf-8")
+    print(json.dumps({"contracts": len(rows), "failures": len(failures),
+                      "draft": draft, "batch_sha256": batch_digest}, indent=2))
+
+
+def _extract_kb_tasks(task_items, kernelbench_root: Path):
+    """task_items: iterable of (task_id, problem_file, extra_fields)."""
+    rows = []
+    failures = []
+    for task_id, problem_file, extra in task_items:
+        try:
+            result = extract_task_contract(problem_file, task_id)
+        except Exception as exc:
+            failures.append({"task_id": task_id,
+                             "error": f"{type(exc).__name__}: {exc}"[:300]})
+            print(f"[extract] {task_id}: FAILED {type(exc).__name__}: "
+                  f"{str(exc)[:120]}", flush=True)
+            continue
+        contract_json = json.dumps(result["contract"], sort_keys=True,
+                                   separators=(",", ":"))
+        rows.append({
+            "task_id": task_id,
+            **extra,
+            "contract": result["contract"],
+            "contract_sha256": hashlib.sha256(contract_json.encode()).hexdigest(),
+            "extraction": result["extraction"],
+        })
+        print(f"[extract] {task_id}: ok "
+              f"({result['extraction']['observed_tensor_args']} tensor args)",
+              flush=True)
+    return rows, failures
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--kernelbench-root", required=True, type=Path)
-    ap.add_argument("--levels", nargs="+", type=int, default=[1, 2])
+    ap.add_argument("--kernelbench-root", type=Path)
+    ap.add_argument("--levels", nargs="+", type=int, default=None,
+                    help="extract full KernelBench levels (original mode)")
+    ap.add_argument("--frames", nargs="+", type=Path, default=None,
+                    help="E2 collection frames; extract their KB task keys")
+    ap.add_argument("--include-excluded-rows", action="store_true",
+                    help="with --frames: also use rows with included=false")
+    ap.add_argument("--tritonbench-manifest", type=Path, default=None)
+    ap.add_argument("--tritonbench-dir", type=Path, default=None)
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args()
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    rows = []
-    failures = []
-    for level in args.levels:
+    if args.tritonbench_manifest:
+        if not args.tritonbench_dir:
+            ap.error("--tritonbench-manifest requires --tritonbench-dir")
+        rows, failures = extract_c4_draft(args.tritonbench_manifest,
+                                          args.tritonbench_dir)
+        if args.limit:
+            rows = rows[: args.limit]
+        _write_batch(args.out, rows, failures, draft=True)
+        return
+
+    if not args.kernelbench_root:
+        ap.error("--kernelbench-root is required for KernelBench extraction")
+
+    if args.frames:
+        tasks = collect_frame_task_keys(
+            args.frames, only_included=not args.include_excluded_rows)
+        task_items = []
+        failures_pre = []
+        for task_key, corpora in tasks.items():
+            match = KB_TASK_RE.match(task_key)
+            task_id = f"L{match.group(1)}_P{match.group(2)}"
+            problem_file, error = kb_problem_file(args.kernelbench_root, task_key)
+            if error:
+                failures_pre.append({"task_id": task_id, "task_key": task_key,
+                                     "source_corpora": corpora, "error": error})
+                continue
+            task_items.append((task_id, problem_file,
+                               {"task_key": task_key, "source_corpora": corpora}))
+        if args.limit:
+            task_items = task_items[: args.limit]
+        rows, failures = _extract_kb_tasks(task_items, args.kernelbench_root)
+        _write_batch(args.out, rows, failures_pre + failures, draft=True)
+        return
+
+    levels = args.levels or [1, 2]
+    task_items = []
+    for level in levels:
         level_dir = args.kernelbench_root / "KernelBench" / f"level{level}"
         problem_files = sorted(
             level_dir.glob("*.py"),
@@ -192,41 +454,9 @@ def main():
             problem_files = problem_files[: args.limit]
         for problem_file in problem_files:
             task_id = f"L{level}_P{problem_file.name.split('_', 1)[0]}"
-            try:
-                result = extract_task_contract(problem_file, task_id)
-            except Exception as exc:
-                failures.append({"task_id": task_id, "error": f"{type(exc).__name__}: {exc}"[:300]})
-                print(f"[extract] {task_id}: FAILED {type(exc).__name__}: {str(exc)[:120]}",
-                      flush=True)
-                continue
-            contract_json = json.dumps(result["contract"], sort_keys=True,
-                                       separators=(",", ":"))
-            rows.append({
-                "task_id": task_id,
-                "contract": result["contract"],
-                "contract_sha256": hashlib.sha256(contract_json.encode()).hexdigest(),
-                "extraction": result["extraction"],
-            })
-            print(f"[extract] {task_id}: ok "
-                  f"({result['extraction']['observed_tensor_args']} tensor args)",
-                  flush=True)
-
-    with open(args.out, "w", encoding="utf-8") as fh:
-        for row in rows:
-            fh.write(json.dumps(row, sort_keys=True) + "\n")
-
-    batch_digest = hashlib.sha256(args.out.read_bytes()).hexdigest()
-    freeze = {
-        "created_at": _now(),
-        "contracts": len(rows),
-        "failures": failures,
-        "batch_sha256": batch_digest,
-        "note": "freeze this digest before observing any V2 validator outcome",
-    }
-    freeze_path = args.out.with_suffix(".freeze.json")
-    freeze_path.write_text(json.dumps(freeze, indent=2), encoding="utf-8")
-    print(json.dumps({"contracts": len(rows), "failures": len(failures),
-                      "batch_sha256": batch_digest}, indent=2))
+            task_items.append((task_id, problem_file, {}))
+    rows, failures = _extract_kb_tasks(task_items, args.kernelbench_root)
+    _write_batch(args.out, rows, failures, draft=False)
 
 
 if __name__ == "__main__":

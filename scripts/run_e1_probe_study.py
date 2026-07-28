@@ -87,6 +87,14 @@ GENERATION_SEED = 42
 EQUIV_RUNS = 20
 EQUIV_BASE_SEED = 10000
 
+# Partial-evidence grading (timeout fix, 2026-07-24): a probe that ran out of
+# wall-clock budget is graded on its completed rounds instead of having the
+# evidence voided wholesale.  Thresholds: every random round passed plus at
+# least EQUIV_MIN_STRESS_ROUNDS stress rounds passed, with no divergence.
+EQUIV_ROUND_TIMEOUT_S = 90
+EQUIV_STRESS_ROUNDS_PLANNED = 12  # 6 directed policies x 2 repeats
+EQUIV_MIN_STRESS_ROUNDS = 8
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -521,12 +529,152 @@ def phase_baseline(args):
 # Phase: equiv (GPU)
 # ---------------------------------------------------------------------------
 
+def grade_equiv_evidence(result, timed_out, equiv_runs=EQUIV_RUNS,
+                         stress_rounds_planned=EQUIV_STRESS_ROUNDS_PLANNED,
+                         min_stress_rounds=EQUIV_MIN_STRESS_ROUNDS):
+    """Grade one equiv worker outcome into (validation_status, grade, evidence).
+
+    Untouched (fully completed) probes keep the historical semantics:
+    pass -> LIKELY_EQUIVALENT, fail -> WITNESSED_NON_EQUIVALENT, anything
+    else -> INCONCLUSIVE, with ``evidence`` None.
+
+    Partial evidence — a whole-probe timeout (SIGKILLed worker whose partial
+    snapshot survived), or watchdog round timeouts inside a completed worker —
+    is graded on the rounds that did complete:
+
+      * a concrete divergence witnessed before the budget ran out stays
+        WITNESSED_NON_EQUIVALENT;
+      * all ``equiv_runs`` random rounds passed and at least
+        ``min_stress_rounds`` stress rounds passed with no divergence
+        -> LIKELY_EQUIVALENT with ``budget_exhausted``/round accounting in
+        ``evidence`` for downstream evidence stratification;
+      * otherwise INCONCLUSIVE (classified as timeout upstream).
+    """
+    result = result or {}
+    status = result.get("validation_status", "inconclusive")
+    partial = bool(
+        timed_out or result.get("partial") or result.get("round_timeouts"))
+
+    if not partial:
+        if status == "fail":
+            return "fail", "WITNESSED_NON_EQUIVALENT", None
+        if status == "pass":
+            return "pass", "LIKELY_EQUIVALENT", None
+        return "inconclusive", "INCONCLUSIVE", None
+
+    trials = result.get("trials") or []
+
+    def _passes(round_type):
+        return sum(
+            1 for t in trials
+            if t.get("round_type") == round_type
+            and str(t.get("status", "")).lower() == "pass")
+
+    random_passed = _passes("random")
+    stress_passed = _passes("stress")
+    evidence = {
+        "budget_exhausted": bool(timed_out),
+        "partial_result": bool(result.get("partial", False)),
+        "round_timeouts": int(result.get("round_timeouts") or 0),
+        "rounds_completed": random_passed + stress_passed,
+        "rounds_planned": equiv_runs + stress_rounds_planned,
+        "random_rounds_passed": random_passed,
+        "stress_rounds_passed": stress_passed,
+        "grading_threshold": {
+            "random": equiv_runs, "stress": min_stress_rounds},
+    }
+    if status == "fail" or result.get("divergence"):
+        return "fail", "WITNESSED_NON_EQUIVALENT", evidence
+    if random_passed >= equiv_runs and stress_passed >= min_stress_rounds:
+        return "pass", "LIKELY_EQUIVALENT", evidence
+    return "inconclusive", "INCONCLUSIVE", evidence
+
+
+def plan_equiv_lanes(kernel_loads, heavy_kernels, n_lanes=2):
+    """Partition kernels into disjoint lanes for parallel equiv drivers.
+
+    ``kernel_loads`` maps kernel -> estimated remaining seconds.  Every
+    kernel in ``heavy_kernels`` (large-VRAM / slow subjects) is pinned to
+    lane 0, so two heavy probes can never be on the GPU concurrently; the
+    remaining kernels are greedily assigned (heaviest first) to the lane
+    with the smaller running total.  Deterministic; returns
+    ``(lanes, totals)`` with lanes covering every kernel exactly once.
+    """
+    heavy_set = set(heavy_kernels)
+    lanes = [[] for _ in range(n_lanes)]
+    totals = [0.0] * n_lanes
+    for kernel in sorted((k for k in kernel_loads if k in heavy_set),
+                         key=lambda k: (-kernel_loads[k], k)):
+        lanes[0].append(kernel)
+        totals[0] += kernel_loads[kernel]
+    for kernel in sorted((k for k in kernel_loads if k not in heavy_set),
+                         key=lambda k: (-kernel_loads[k], k)):
+        target = min(range(n_lanes), key=lambda i: (totals[i], i))
+        lanes[target].append(kernel)
+        totals[target] += kernel_loads[kernel]
+    assigned = [k for lane in lanes for k in lane]
+    if len(assigned) != len(set(assigned)) or set(assigned) != set(kernel_loads):
+        raise AssertionError("lane plan is not a disjoint cover of the kernels")
+    return lanes, totals
+
+
+def equiv_lane_paths(out, lane, tag=None):
+    """Per-lane output paths; ``lane=None`` keeps the historical serial paths.
+
+    ``tag`` appends a human-readable qualifier (e.g. ``requeue``) while the
+    filenames still match the ``equiv_*_lane*`` monitoring globs.
+    """
+    suffix = "" if lane is None else f"_lane{lane}"
+    if lane is not None and tag:
+        suffix += f"_{tag}"
+    return {
+        "obs": out / f"equiv_observations{suffix}.jsonl",
+        "done": out / f"equiv_completed{suffix}.json",
+        "summary": out / f"equiv_summary{suffix}.json",
+        "manifest": out / f"equiv_run_manifest{suffix}.json",
+    }
+
+
+def load_equiv_skip_set(out, lane, tag=None):
+    """Return ``(own_completed, skip)`` probe-id sets for one driver.
+
+    ``own_completed`` is what this driver checkpoints to its own completed
+    file.  ``skip`` additionally folds in the shared serial-era global
+    checkpoint plus every other lane's completed file (all read-only), so a
+    lane driver never re-runs probes finished before its own start — this
+    covers re-splits where a new lane inherits kernels from a retired lane.
+    Lane kernel sets are mutually exclusive among *live* lanes, so reading a
+    concurrent lane's snapshot is only ever a no-op for the caller.
+    """
+    paths = equiv_lane_paths(out, lane, tag)
+    own = set(
+        json.loads(paths["done"].read_text()) if paths["done"].exists() else [])
+    skip = set(own)
+    if lane is not None:
+        global_done = out / "equiv_completed.json"
+        if global_done.exists():
+            skip |= set(json.loads(global_done.read_text()))
+        for other in sorted(out.glob("equiv_completed_lane*.json")):
+            if other != paths["done"]:
+                skip |= set(json.loads(other.read_text()))
+    return own, skip
+
+
 def phase_equiv(args):
     out = args.out_dir
+    lane = args.lane
+    tag = args.lane_tag
+    lane_kernels = None
+    if lane is not None:
+        if not args.lane_plan:
+            raise SystemExit("--lane requires --lane-plan")
+        plan = json.loads(args.lane_plan.read_text(encoding="utf-8"))
+        lane_kernels = set(plan["lanes"][lane]["kernels"])
+    paths = equiv_lane_paths(out, lane, tag)
     scratch = Path(tempfile.mkdtemp(prefix="e1eq_", dir=str(out)))
-    obs_path = out / "equiv_observations.jsonl"
-    done_path = out / "equiv_completed.json"
-    completed = set(json.loads(done_path.read_text()) if done_path.exists() else [])
+    obs_path = paths["obs"]
+    done_path = paths["done"]
+    completed, skip = load_equiv_skip_set(out, lane, tag)
 
     baseline_obs = {}
     with open(out / "baseline_observations.jsonl", encoding="utf-8") as fh:
@@ -537,29 +685,42 @@ def phase_equiv(args):
     kernel_files = _load_probe_files(out)
     survivors = []
     for kf in kernel_files:
+        if lane_kernels is not None and kf["kernel"]["problem_name"] not in lane_kernels:
+            continue
         for probe in kf["probes"]:
             row = baseline_obs.get(probe["probe_id"])
             if row and row.get("status") == "survived":
                 survivors.append((kf, probe))
-    print(f"[{_now()}] equiv: {len(survivors)} baseline survivors, "
-          f"{len(completed)} already done", flush=True)
+    lane_done = sum(1 for _, p in survivors if p["probe_id"] in skip)
+    lane_tag = "" if lane is None else (
+        f" (lane {lane}{'/' + tag if tag else ''})")
+    print(f"[{_now()}] equiv{lane_tag}: {len(survivors)} baseline survivors, "
+          f"{lane_done} already done", flush=True)
 
     manifest = {
         "phase": "equiv",
         "run_id": f"e1-equiv-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
         "started_at": _now(),
+        "lane": lane,
+        "lane_tag": tag,
+        "lane_kernel_count": len(lane_kernels) if lane_kernels is not None else None,
         "equiv_runs": EQUIV_RUNS,
         "base_seed": EQUIV_BASE_SEED,
         "timeout_s": args.timeout,
+        "round_timeout_s": EQUIV_ROUND_TIMEOUT_S,
+        "partial_evidence_thresholds": {
+            "random_rounds": EQUIV_RUNS,
+            "min_stress_rounds": EQUIV_MIN_STRESS_ROUNDS,
+        },
         "environment": environment_fingerprint(),
     }
-    (out / "equiv_run_manifest.json").write_text(
+    paths["manifest"].write_text(
         json.dumps(manifest, indent=2, default=str), encoding="utf-8")
 
     counter = Counter()
     for kf, probe in survivors:
         probe_id = probe["probe_id"]
-        if probe_id in completed:
+        if probe_id in skip:
             continue
         kernel = kf["kernel"]
         problem_file = _resolve_problem_file(
@@ -576,16 +737,11 @@ def phase_equiv(args):
             "base_seed": EQUIV_BASE_SEED,
             "atol": BASELINE_PROTOCOL["atol"],
             "rtol": BASELINE_PROTOCOL["rtol"],
+            "round_timeout": EQUIV_ROUND_TIMEOUT_S,
         }
         result, timed_out, wall_ms, so, se = run_worker(cfg, args.timeout, scratch)
-        validation_status = "inconclusive" if timed_out else (
-            (result or {}).get("validation_status", "inconclusive"))
-        if validation_status == "fail":
-            grade = "WITNESSED_NON_EQUIVALENT"
-        elif validation_status == "pass":
-            grade = "LIKELY_EQUIVALENT"
-        else:
-            grade = "INCONCLUSIVE"
+        validation_status, grade, partial_evidence = grade_equiv_evidence(
+            result, timed_out)
         record = {
             "probe_id": probe_id,
             "kernel": kernel["problem_name"],
@@ -604,22 +760,26 @@ def phase_equiv(args):
             "timed_out": timed_out,
             "finished_at": _now(),
         }
+        if partial_evidence is not None:
+            record["evidence"] = partial_evidence
         if timed_out or result is None or se.strip():
             _write_worker_log(out, f"{probe_id}_equiv", so, se)
         with open(obs_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
         completed.add(probe_id)
+        skip.add(probe_id)
+        lane_done += 1
         done_path.write_text(json.dumps(sorted(completed)), encoding="utf-8")
         counter[grade] += 1
-        if len(completed) % 10 == 0:
-            print(f"[{_now()}] equiv: {len(completed)}/{len(survivors)} "
+        if lane_done % 10 == 0:
+            print(f"[{_now()}] equiv{lane_tag}: {lane_done}/{len(survivors)} "
                   f"{dict(counter)}", flush=True)
 
-    (out / "equiv_summary.json").write_text(json.dumps({
-        "finished_at": _now(), "completed": len(completed),
+    paths["summary"].write_text(json.dumps({
+        "finished_at": _now(), "lane": lane, "completed": len(completed),
         "grades": dict(counter),
     }, indent=2), encoding="utf-8")
-    print(f"[{_now()}] equiv DONE: {dict(counter)}", flush=True)
+    print(f"[{_now()}] equiv DONE{lane_tag}: {dict(counter)}", flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +891,14 @@ def main():
     ap.add_argument("--kernelbench-root", type=Path,
                     help="KernelBench repo root (baseline/equiv phases)")
     ap.add_argument("--timeout", type=int, default=420)
+    ap.add_argument("--lane", type=int, default=None,
+                    help="equiv phase: run only the kernels of this lane "
+                         "(requires --lane-plan); outputs go to *_lane<N> files")
+    ap.add_argument("--lane-plan", type=Path,
+                    help="lane plan JSON produced by plan_equiv_lanes")
+    ap.add_argument("--lane-tag", default=None,
+                    help="qualifier appended to lane output filenames "
+                         "(e.g. 'requeue'); keeps equiv_*_lane* glob shape")
     ap.add_argument("--map-version", default="e1-map-v1")
     ap.add_argument("--folds", type=int, default=5)
     ap.add_argument("--planned-cases", type=int, default=8)

@@ -13,6 +13,7 @@ or illegal memory accesses cannot affect the parent orchestrator.
 """
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -116,6 +117,18 @@ OPERATOR_DIRECTED_POLICIES = {
 }
 
 
+class _RoundTimeout(BaseException):
+    """Raised by SIGALRM to abort one over-budget validation round.
+
+    Derives from BaseException so the generic ``except Exception`` blocks
+    inside the round body cannot swallow the watchdog.
+    """
+
+
+def _raise_round_timeout(signum, frame):
+    raise _RoundTimeout()
+
+
 def _tensor_summary(t):
     """Compact summary of a tensor for reproducibility logs."""
     import torch
@@ -137,7 +150,7 @@ def _tensor_summary(t):
     return {"type": type(t).__name__, "value": str(t)[:100]}
 
 
-def _equiv_mode(cfg):
+def _equiv_mode(cfg, res_path=None):
     """Dynamically challenge a survived mutant using sound paired execution.
 
     ``is_equivalent`` is retained for legacy consumers, but it is deliberately
@@ -193,6 +206,11 @@ def _equiv_mode(cfg):
     last_input_summary = None
     saw_inconclusive = False
     valid_rounds = 0
+    round_timeouts = 0
+    round_timeout_s = int(cfg.get("round_timeout", 0) or 0)
+    watchdog_enabled = round_timeout_s > 0 and hasattr(signal, "SIGALRM")
+    if watchdog_enabled:
+        signal.signal(signal.SIGALRM, _raise_round_timeout)
 
     def _seed_all(seed):
         random.seed(seed)
@@ -250,6 +268,7 @@ def _equiv_mode(cfg):
             "reason": reason,
             "errors": errors,
             "valid_rounds": valid_rounds,
+            "round_timeouts": round_timeouts,
             "trials": trials,
         }
         if status is ValidationStatus.INCONCLUSIVE:
@@ -257,6 +276,44 @@ def _equiv_mode(cfg):
         if divergence is not None:
             result["divergence"] = divergence
         return result
+
+    def _write_partial_snapshot():
+        """Persist the evidence gathered so far to the result file.
+
+        If the orchestrator later SIGKILLs this worker on whole-probe
+        timeout, the completed rounds survive and can be graded instead of
+        being voided wholesale.  The final result overwrites the snapshot.
+        """
+        if res_path is None:
+            return
+        snapshot = _base_result(
+            ValidationStatus.INCONCLUSIVE,
+            "partial evidence snapshot; worker was still running",
+            None,
+        )
+        snapshot["partial"] = True
+        tmp_path = f"{res_path}.tmp"
+        try:
+            with open(tmp_path, "w") as fh:
+                json.dump(snapshot, fh)
+            os.replace(tmp_path, res_path)
+        except Exception:  # Snapshotting must never decide correctness.
+            pass
+
+    def _record_round_timeout(metadata):
+        trials.append({
+            **metadata,
+            "status": ValidationStatus.INCONCLUSIVE.value,
+            "round_timeout": True,
+            "reason": (
+                f"round timed out after {round_timeout_s}s watchdog; "
+                "skipped to next round"
+            ),
+        })
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
     def _setup_inconclusive(phase, exc):
         _error(phase, exc)
@@ -422,47 +479,60 @@ def _equiv_mode(cfg):
                     "seed": seed,
                     "policy": None,
                 }
+                failure = None
+                if watchdog_enabled:
+                    signal.alarm(round_timeout_s)
                 try:
-                    _seed_all(seed)
-                    generated = get_inputs()
-                    input_values = (
-                        list(generated)
-                        if isinstance(generated, (list, tuple))
-                        else [generated]
-                    )
-                    input_summary = _summaries(input_values)
-                    args = _normalise_args(generated)
-                except Exception as exc:
-                    saw_inconclusive = True
-                    _error("input_generation", exc, **metadata)
-                    trials.append({
-                        **metadata,
-                        "status": ValidationStatus.INCONCLUSIVE.value,
-                        "reason": (
-                            "input generation failed; equivalence is unknown: "
-                            f"{type(exc).__name__}: {str(exc)[:200]}"
-                        ),
-                        "errors": [errors[-1]],
-                    })
-                    if "out of memory" in str(exc).lower():
-                        try:
-                            torch.cuda.empty_cache()
-                        except Exception:
-                            pass
-                    continue
+                    try:
+                        _seed_all(seed)
+                        generated = get_inputs()
+                        input_values = (
+                            list(generated)
+                            if isinstance(generated, (list, tuple))
+                            else [generated]
+                        )
+                        input_summary = _summaries(input_values)
+                        args = _normalise_args(generated)
+                    except Exception as exc:
+                        saw_inconclusive = True
+                        _error("input_generation", exc, **metadata)
+                        trials.append({
+                            **metadata,
+                            "status": ValidationStatus.INCONCLUSIVE.value,
+                            "reason": (
+                                "input generation failed; equivalence is unknown: "
+                                f"{type(exc).__name__}: {str(exc)[:200]}"
+                            ),
+                            "errors": [errors[-1]],
+                        })
+                        if "out of memory" in str(exc).lower():
+                            try:
+                                torch.cuda.empty_cache()
+                            except Exception:
+                                pass
+                        continue
 
-                if first_input_summary is None:
-                    first_input_summary = {
+                    if first_input_summary is None:
+                        first_input_summary = {
+                            "round": f"random_{i}",
+                            "seed": seed,
+                            "tensors": input_summary,
+                        }
+                    last_input_summary = {
                         "round": f"random_{i}",
                         "seed": seed,
                         "tensors": input_summary,
                     }
-                last_input_summary = {
-                    "round": f"random_{i}",
-                    "seed": seed,
-                    "tensors": input_summary,
-                }
-                failure = _evaluate(args, metadata, input_summary)
+                    failure = _evaluate(args, metadata, input_summary)
+                except _RoundTimeout:
+                    round_timeouts += 1
+                    saw_inconclusive = True
+                    _record_round_timeout(metadata)
+                    continue
+                finally:
+                    if watchdog_enabled:
+                        signal.alarm(0)
+                    _write_partial_snapshot()
                 if failure is not None:
                     return failure
 
@@ -493,43 +563,57 @@ def _equiv_mode(cfg):
                         "seed": seed,
                     }
                     tested_policies.append(policy_record)
+                    failure = None
+                    if watchdog_enabled:
+                        signal.alarm(round_timeout_s)
                     try:
-                        _seed_all(seed)
-                        template = get_inputs()
-                        stress_inputs = policy_fn(clone_tree(template), seed)
-                        input_values = (
-                            list(stress_inputs)
-                            if isinstance(stress_inputs, (list, tuple))
-                            else [stress_inputs]
-                        )
-                        input_summary = _summaries(input_values)
-                        args = _normalise_args(stress_inputs)
-                    except Exception as exc:
-                        saw_inconclusive = True
-                        policy_record["status"] = "generation_failed"
-                        _error("stress_input_generation", exc, **metadata)
-                        trials.append({
-                            **metadata,
-                            "status": ValidationStatus.INCONCLUSIVE.value,
-                            "reason": (
-                                "stress input generation failed; equivalence is unknown: "
-                                f"{type(exc).__name__}: {str(exc)[:200]}"
-                            ),
-                            "errors": [errors[-1]],
-                        })
-                        continue
+                        try:
+                            _seed_all(seed)
+                            template = get_inputs()
+                            stress_inputs = policy_fn(clone_tree(template), seed)
+                            input_values = (
+                                list(stress_inputs)
+                                if isinstance(stress_inputs, (list, tuple))
+                                else [stress_inputs]
+                            )
+                            input_summary = _summaries(input_values)
+                            args = _normalise_args(stress_inputs)
+                        except Exception as exc:
+                            saw_inconclusive = True
+                            policy_record["status"] = "generation_failed"
+                            _error("stress_input_generation", exc, **metadata)
+                            trials.append({
+                                **metadata,
+                                "status": ValidationStatus.INCONCLUSIVE.value,
+                                "reason": (
+                                    "stress input generation failed; equivalence is unknown: "
+                                    f"{type(exc).__name__}: {str(exc)[:200]}"
+                                ),
+                                "errors": [errors[-1]],
+                            })
+                            continue
 
-                    failure = _evaluate(args, metadata, input_summary)
-                    policy_record["status"] = (
-                        trials[-1]["status"] if failure is None else "non_equivalent"
-                    )
-                    last_input_summary = {
-                        "round": f"stress_{policy_name}_{si}",
-                        "seed": seed,
-                        "tensors": input_summary,
-                    }
-                    if first_input_summary is None:
-                        first_input_summary = last_input_summary
+                        failure = _evaluate(args, metadata, input_summary)
+                        policy_record["status"] = (
+                            trials[-1]["status"] if failure is None else "non_equivalent"
+                        )
+                        last_input_summary = {
+                            "round": f"stress_{policy_name}_{si}",
+                            "seed": seed,
+                            "tensors": input_summary,
+                        }
+                        if first_input_summary is None:
+                            first_input_summary = last_input_summary
+                    except _RoundTimeout:
+                        round_timeouts += 1
+                        saw_inconclusive = True
+                        policy_record["status"] = "round_timeout"
+                        _record_round_timeout(metadata)
+                        continue
+                    finally:
+                        if watchdog_enabled:
+                            signal.alarm(0)
+                        _write_partial_snapshot()
                     if failure is not None:
                         return failure
 
@@ -582,7 +666,7 @@ def main():
         if mode == "run":
             result = _run_mode(cfg)
         elif mode == "equiv":
-            result = _equiv_mode(cfg)
+            result = _equiv_mode(cfg, res_path)
         else:
             result = {"status": "stillborn", "error": f"Unknown mode: {mode}"}
     except Exception as e:

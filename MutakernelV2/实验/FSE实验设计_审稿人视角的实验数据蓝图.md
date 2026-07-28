@@ -139,7 +139,61 @@
   配置（1）正当 INCONCLUSIVE；
 - §6 Internal 威胁的 "?" 同步填充（3.2% 配对翻转 + 26/50 对照失效）；
 - 次要口径（vs 历史标签，混杂 GPU 更换）：9/62 翻转（6 杀→存，3 存→杀）。
--->
+
+修订记录 v1.9（2026-07-23，E2 对账定稿 + 环境版本落盘）：
+- Table 1 语料计数填充（included/collected，冻结裁剪规则 v1.0：源码非空、
+  任务可定位、规范化去重、语言符合声明）：C2 85/241、C3 227/229（任务级，
+  每任务一个内容寻址 accepted 代表）、C4 184/184、C5 1,720/1,724；
+  表题注改为 included/collected 口径说明；
+- Table 1 后新增 C2 构成说明段：141/156 排除项为纯 PyTorch 级优化
+  （无自定义 CUDA kernel，超出内核验证范围），15 为规范化重复；
+  四语料间规范化源码哈希零交集；
+- §5.1.3 版本号填充：PyTorch 2.1.2、CUDA 12.1、Triton 2.1.0；
+  Table 2 B11 注明 Compute Sanitizer 2023.1.1；
+- 依据：E2 对账定稿报告（补充实验数据/E2_对账定稿报告.md），
+  freeze digest 与逐条排除原因随 artifact 发布。
+
+修订记录 v1.10（2026-07-27，Table 10 Killed 列与 stillborn 脚注填充）：
+- 数据源：E1 基线阶段（已对账关账）baseline_observations.jsonl（1,646 条、
+  probe_id 唯一，远端与本地副本 md5 一致：2ce2e0d542e2e7ae096c7d998595a836）；
+  按 operator_category 分类计数与 Probes 列 757/702/178/9 逐类吻合；
+- Killed 列填充：A 186、B 337、C 13、D 3、Overall 539；脚注 stillborn
+  （compile-failed）填 105（A 56、B 3、C 45、D 1）；
+- 其余列保持 "?"：Machine-proven eq. 待静态证明定版（基线账面现值 9，全部
+  在 A 类，暂不预填）、Witnessed non-eq. 与 INCONCLUSIVE 待 CSE 收官、
+  Detection rate 待人工盲审；分母处理（stillborn 之外尚有
+  excluded_control_failed 441 等排除类）留待 Detection rate 定版时一并定稿。
+
+修订记录 v1.11（2026-07-28，全量数据核实 + equiv 收官分母填充）：
+- 独立复算核实（全部一致，未改动任何已填数字）：
+  - Table 3 及 §5.1.3/§6 E0 叙述：远端 e0_run5_s0/observations.jsonl（153 条）
+    与 e0_run4_s0 复用的 27 个 L1-stateless 配对合并为 180 条，逐格复算
+    49/1、11/0、3/1、63/62/2 及全部 Wilson CI 吻合；对照 26/50（L2 17/21）、
+    15 反驳/7 架构不兼容/4 INCONCLUSIVE、8 个 INCONCLUSIVE 对照细分
+    （7 StateSyncError 非双射 + 1 异步 invalid configuration）、次要口径
+    9/62（6 杀→存、3 存→杀）均与原始数据一致；
+  - Table 10 Killed 列与 stillborn 脚注：远端 e1/baseline_observations.jsonl
+    （1,646 条，md5 与本地副本一致 2ce2e0d5…）按 operator_category 复算，
+    Probes 757/702/178/9、Killed 186/337/13/3=539、stillborn 105
+    （A56/B3/C45/D1）、excluded_control_failed 441、机器证明账面 9（全 A，
+    dead_host_constant 规则）逐项吻合；
+  - Table 1：本地 collection_frames 逐行复算 C2 85/241（141 language_mismatch
+    +15 duplicate）、C3 227/229（候选级 26,970/28,227）、C4 184/184、
+    C5 1,720/1,724，跨语料 stable_id 交集全 0，sha256 与 freeze 一致；
+  - Table 2 与 §5.1.3 版本号：远端实测 PyTorch 2.1.2+cu121 / CUDA 12.1 /
+    Triton 2.1.0 / Compute Sanitizer 2023.1.1 / A800 80GB；E0/E1 协议常量
+    （5 draws、atol=rtol=1e-2、seed 42）与 run manifest 一致；
+  - C1 行 90 内核（L1 63 + L2 27）、≤3/（kernel,operator）对、1,646 探针
+    经 probe_manifest.json 与观测复核。备注：16 算子分类学中
+    reduction_reorder（C 类）在 90 内核上命中 0 位点，观测实例化 15 个算子；
+    正文 "16 operators" 为分类学口径，保留不改。
+- 填充（唯一一处，依赖已收官的 E1 equiv 阶段）：§5.5 反例搜索句的
+  LIKELY_EQUIVALENT 分母 453——来源 e1/equiv_summary.json（merged：
+  global+lane0–3+lane4_requeue，completed 527 = 基线幸存 527，分布
+  LIKELY_EQUIVALENT 453 / WITNESSED_NON_EQUIVALENT 73 / INCONCLUSIVE 1），
+  与 cse_lane_plan.json 输入池一致；被反例证伪计数（现刻 3/453，判级
+  303/453 未收官）保持 "?"。
+- 交叉拟合闭合率 73% 为 interim 下界（CSE 未收官），维持 "?" 不填。
 
 # 5 Experimental Evaluation
 
@@ -176,19 +230,28 @@ Table 1 summarizes the seven corpora. All corpora, task contracts, and
 inclusion rules were frozen—with content-addressed stable IDs—*before* any
 V2 validator outcome was observed.
 
-**Table 1. Subject corpora.** (C4/C5 counts pending stable-ID
-reconciliation of the collection frames; the frozen manifest is released
-with the artifact.)
+**Table 1. Subject corpora.** (Subject counts read "included /
+collected" under the frozen v1.0 inclusion rules—non-empty source,
+resolvable benchmark task, non-duplicate after normalization, language
+as declared; the frozen, content-hashed manifests and per-item exclusion
+reasons are released with the artifact.)
 
 | ID | Corpus | Language | Subjects | Role | Ground truth |
 |----|--------|----------|---------:|------|--------------|
 | C1 | Mutation probes over 90 validator-accepted KernelBench L1/L2 kernels (16 operators, first-order, ≤3 per kernel–operator pair) | CUDA | 1,646 | RQ4, RQ5 | Replayed non-equivalence witnesses + blinded equivalence audit (injected fault class/site known by construction, but not itself a defect label) |
-| C2 | CUDA-L1 [26] public kernels | CUDA | ? / 241 collected | RQ1, RQ2 | Blinded human audit |
-| C3 | AI-CUDA-Engineer [22] archive | CUDA | ? / 229 collected | RQ1, RQ2 | Blinded human audit |
-| C4 | TritonBench-G [25] kernels | Triton | ? / ? collected | RQ1, RQ2 | Blinded human audit |
-| C5 | KernelBench-samples [31] frontier-model generations (official greedy-baseline release) | CUDA | ? / 1,724 collected | RQ1, RQ2 | Blinded human audit |
+| C2 | CUDA-L1 [26] public kernels | CUDA | 85 / 241 collected | RQ1, RQ2 | Blinded human audit |
+| C3 | AI-CUDA-Engineer [22] archive | CUDA | 227 / 229 collected (task-level; one content-addressed accepted representative per task) | RQ1, RQ2 | Blinded human audit |
+| C4 | TritonBench-G [25] kernels | Triton | 184 / 184 collected | RQ1, RQ2 | Blinded human audit |
+| C5 | KernelBench-samples [31] frontier-model generations (official greedy-baseline release) | CUDA | 1,720 / 1,724 collected | RQ1, RQ2 | Blinded human audit |
 | C6 | gpuemu seeded-bug corpus [Sarkar 2026] | Triton/CPU | 26 ops: 16 correct controls + 10 seeded bugs | RQ3 | Public third-party labels |
 | C8 | KernelBench L3 / backward-enabled bounded sample | CUDA | ? (8–10 tasks) | Generalization (appendix) | Same as C1 |
+
+The CUDA-L1 inclusion rate deserves note: 141 of the 156 excluded
+entries contain no custom CUDA kernel at all—they are PyTorch-level
+optimizations (backend flags, autocast, CUDA-graph capture) and thus
+fall outside the scope of kernel validation; the remaining 15 are
+normalized duplicates. Across the four natural corpora, no two included
+subjects share a normalized source hash.
 
 Every task carries a versioned *correctness contract* (schema v1) that
 fixes valid shapes and variable dimensions, supported dtypes, value domain,
@@ -269,7 +332,7 @@ candidate invocations per subject.
 | B8 | KernelBenchX [40] | Standard/outlier/boundary inputs, dtype-aware oracles, 176 Triton tasks | Native + port |
 | B9 | Seeded differential fuzzing [Sarkar 2026] | Op-schema-aware sampling, fp64 CPU reference, per-(op,dtype) calibrated tolerances | Port |
 | B10 | LLM self-review | Frontier-LLM code review, no execution | Separately costed (appendix) |
-| B11 | Compute Sanitizer (NVIDIA) | memcheck/racecheck/synccheck/initcheck instrumentation | Native, alarm types reported separately |
+| B11 | Compute Sanitizer (NVIDIA, 2023.1.1) | memcheck/racecheck/synccheck/initcheck instrumentation | Native, alarm types reported separately |
 | M-full | MutaKernel (full suite) | 21 stress policies + dtype/train/repeat/config dimensions, three-way differential oracle | Ours |
 | M-dir | MutaKernel (site-directed) | Static site fingerprint → fault-to-stress map lookup; 70% directed + 30% general budget | Ours |
 
@@ -306,7 +369,8 @@ failures can therefore never inflate defect counts. Every non-PASS
 observation produces a replay bundle that re-executes in a fresh container;
 every headline counterexample is additionally verified through an
 independent replay of its bundle before being reported. All experiments
-run on NVIDIA A800 (80 GB) GPUs with PyTorch ?, CUDA ?, and Triton ?; run
+run on NVIDIA A800 (80 GB) GPUs with PyTorch 2.1.2, CUDA 12.1, and
+Triton 2.1.0; run
 manifests record
 commits, environment fingerprints, contract/policy/operator versions,
 seeds, and budgets.
@@ -716,13 +780,13 @@ witness, and ? remain INCONCLUSIVE after the blinded equivalence audit
 
 | Operator category | Probes | Killed | Machine-proven eq. | Witnessed non-eq., survived | INCONCLUSIVE | Detection rate (witnessed) |
 |-------------------|-------:|-------:|-------------------:|----------------------------:|-------------:|---------------------------:|
-| A: Arithmetic | 757 | ? | ? | ? | ? | ? % |
-| B: GPU parallel | 702 | ? | ? | ? | ? | ? % |
-| C: ML numerical | 178 | ? | ? | ? | ? | ? % |
-| D: LLM patterns | 9 | ? | ? | ? | ? | ? % |
-| Overall | 1,646* | ? | ? | ? | ? | ? % |
+| A: Arithmetic | 757 | 186 | ? | ? | ? | ? % |
+| B: GPU parallel | 702 | 337 | ? | ? | ? | ? % |
+| C: ML numerical | 178 | 13 | ? | ? | ? | ? % |
+| D: LLM patterns | 9 | 3 | ? | ? | ? | ? % |
+| Overall | 1,646* | 539 | ? | ? | ? | ? % |
 
-*minus ? stillborn (compile-failed) probes excluded from all denominators.
+*minus 105 stillborn (compile-failed) probes excluded from all denominators.
 
 Escape-mechanism classification of the ? confirmed blind spots attributes
 ? % to value-activation failures, ? % to precision masking, ? % to
@@ -730,7 +794,7 @@ mode-reachability, ? % to nondeterminism-observation, and ? % to
 configuration-reachability (Figure ?), grounding the five stress
 dimensions in measured failure modes rather than design intuition.
 Counterexample search additionally falsified the equivalence hypothesis
-for ? of ? probes the evidence pipeline had graded LIKELY_EQUIVALENT
+for ? of 453 probes the evidence pipeline had graded LIKELY_EQUIVALENT
 (? %), quantifying the residual risk of heuristic equivalence detection;
 only specification violations—never tolerance-conforming bitwise
 divergences (? cases, reported separately)—count toward any of these
